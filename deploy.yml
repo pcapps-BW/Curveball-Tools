@@ -16,9 +16,31 @@
         repo: 'https://github.com/pcapps-BW/Curveball-Tools.git'
         dest: /usr/local/scripts/NOEIP/Curveball
         version: main
+        force: yes
 
-    - name: Ensure web server service is running
+    - name: Configure Nginx to serve Curveball directory
+      copy:
+        dest: /etc/nginx/conf.d/curveball.conf
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+              root /usr/local/scripts/NOEIP/Curveball;
+              index index.html index.htm;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+          }
+
+    - name: Ensure default welcome page configuration is disabled
+      file:
+        path: /etc/nginx/default.d/welcome.conf
+        state: absent
+
+    - name: Ensure web server service is running and reloaded
       service:
         name: nginx
-        state: started
+        state: reloaded
         enabled: yes
