@@ -4,10 +4,12 @@
   become: yes
   tasks:
     - name: Install required packages
-      apt:
-        name: [nginx, python3-pip]
+      package:
+        name:
+          - nginx
+          - python3-pip
+          - git
         state: present
-        update_cache: yes
 
     - name: Clone or sync application source code
       git:
@@ -18,4 +20,5 @@
     - name: Ensure web server service is running
       service:
         name: nginx
-        state: restarted
+        state: started
+        enabled: yes
