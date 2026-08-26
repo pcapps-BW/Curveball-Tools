@@ -3,7 +3,7 @@
   hosts: all
   become: yes
   tasks:
-    - name: Install required packages (e.g., Nginx, Python)
+    - name: Install required packages
       apt:
         name: [nginx, python3-pip]
         state: present
@@ -12,7 +12,7 @@
     - name: Clone or sync application source code
       git:
         repo: 'https://github.com/pcapps-BW/Curveball-Tools.git'
-        dest: /var/www/my-tool-suite
+        dest: /usr/local/scripts/NOEIP/Curveball
         version: main
 
     - name: Ensure web server service is running
