@@ -17,6 +17,7 @@
         dest: /usr/local/scripts/NOEIP/Curveball
         version: main
         force: yes
+        accept_hostkey: yes
 
     - name: Configure Nginx to serve Curveball directory
       copy:
