@@ -1,6 +1,6 @@
 ---
 - name: Deploy Local Web Server and Tool Suite
-  hosts: webservers
+  hosts: all
   become: yes
   tasks:
     - name: Install required packages (e.g., Nginx, Python)
