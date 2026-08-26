@@ -1,0 +1,21 @@
+---
+- name: Deploy Local Web Server and Tool Suite
+  hosts: webservers
+  become: yes
+  tasks:
+    - name: Install required packages (e.g., Nginx, Python)
+      apt:
+        name: [nginx, python3-pip]
+        state: present
+        update_cache: yes
+
+    - name: Clone or sync application source code
+      git:
+        repo: 'https://github.com/pcapps-BW/Curveball-Tools.git'
+        dest: /var/www/my-tool-suite
+        version: main
+
+    - name: Ensure web server service is running
+      service:
+        name: nginx
+        state: restarted

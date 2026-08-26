@@ -1,0 +1,20 @@
+# Autotester configuration
+#
+# 1. Copy this file to:   C:\Claude\autotester_config.txt
+# 2. Replace the placeholder values below with your own credentials.
+# 3. Do NOT share a copy that contains your real tokens -- treat them like passwords.
+#
+# Lines beginning with # are comments and are ignored.
+
+# --- Netbox (required for MUX path reconciliation + GSX management-IP lookup) ---
+NETBOX_URL=https://netbox.bandwidth.com
+NETBOX_TOKEN=REPLACE_WITH_YOUR_NETBOX_API_TOKEN
+
+# --- OSPF Stability Monitor (optional -- defaults shown) ---
+# Name filter passed to NetBox device search. Matches any device whose name
+# contains this string (case-insensitive). Default "ces01" matches all 1800 hubs.
+HUB_NAME_FILTER=ces01
+
+# --- JIRA (only required if you use the "Add to JIRA" option) ---
+JIRA_EMAIL=REPLACE_WITH_YOUR_ATLASSIAN_EMAIL
+JIRA_TOKEN=REPLACE_WITH_YOUR_ATLASSIAN_API_TOKEN

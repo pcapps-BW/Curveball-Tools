@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}{{ tool_title }} -- Curveball Tools{% endblock %}
+{% block content %}
+<h1>{{ tool_title }}</h1>
+<div class="sub">{{ tool_desc }}</div>
+
+<div class="panel">
+  <form id="runForm" data-run-url="{{ run_url }}">
+    <label for="ip_1250">1250 IP</label>
+    <input type="text" id="ip_1250" name="ip_1250" placeholder="10.111.131.79" required>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="addJira" name="add_jira">
+      <label for="addJira">Post results to JIRA</label>
+    </div>
+    <div id="jiraTicketWrap" style="display:none;">
+      <label for="jira_ticket">JIRA ticket (NOE-XXXX)</label>
+      <input type="text" id="jira_ticket" name="jira_ticket" placeholder="NOE-1234">
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="openWhenDone" name="open_when_done">
+      <label for="openWhenDone">Open results file when done (Notepad)</label>
+    </div>
+    <div class="hint">Only works when this server is running on your own machine.</div>
+
+    <div class="row">
+      <div>
+        <label for="infra_user">Infrastructure username</label>
+        <input type="text" id="infra_user" name="infra_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="infra_pass">Infrastructure password</label>
+        <input type="password" id="infra_pass" name="infra_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <button type="submit">Run {{ tool_title }}</button>
+    <div class="field-error" id="formError"></div>
+  </form>
+</div>
+
+{% include "_job_panels.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='job.js') }}"></script>
+<script>
+  initJiraToggle('addJira', 'jiraTicketWrap');
+  initJobForm('runForm');
+</script>
+{% endblock %}

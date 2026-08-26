@@ -1,0 +1,1 @@
+1250 connect FAILED: OSError: [Errno 101] Network is unreachable
