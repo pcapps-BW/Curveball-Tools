@@ -199,12 +199,27 @@ class MUX4216Client(BaseDeviceClient):
         # Pull ACR groups once
         raw_acr = self.run("show acr group")
         acr_groups = []
+        # The "Currently Active" column is OPTIONAL. An ACR that is not
+        # currently switched to either leg shows "N/A" there:
+        #
+        #   16   SONET 0/7/0   SONET 0/12/0   N/A   N/A
+        #
+        # The old pattern required three SONET interfaces, so a row like that
+        # failed to match and the ENTIRE ACR group vanished -- working and
+        # protect both invisible, and any circuit on it failing with "not
+        # found in any ACR column" despite being plainly present. Its working
+        # and protect legs are valid and usable; only the active leg is
+        # unknown, and "unknown" is recorded as "" rather than guessed.
+        #
+        # Rows with no interfaces at all (a deleted group, or one showing only
+        # N/A) still do not match, correctly -- there is nothing to record.
         for line in raw_acr.splitlines():
-            m = re.match(r'\s*(\d+)\s+SONET\s+([\d/]+)\s+SONET\s+([\d/]+)\s+SONET\s+([\d/]+)', line)
+            m = re.match(r'\s*(\d+)\s+SONET\s+([\d/]+)\s+SONET\s+([\d/]+)'
+                         r'(?:\s+SONET\s+([\d/]+))?', line)
             if m:
                 acr_groups.append({
                     "acr": m.group(1), "working": m.group(2),
-                    "protect": m.group(3), "active": m.group(4),
+                    "protect": m.group(3), "active": m.group(4) or "",
                 })
         if not acr_groups:
             raise RuntimeError("Could not parse ACR groups from {}".format(mux_name))
@@ -225,6 +240,11 @@ class MUX4216Client(BaseDeviceClient):
 
                 netbox_conflict = None
                 acr_num = cem_group = vtg_num = t1_num = active_sonet = None
+                # Initialised here, not only inside the NetBox branch:
+                # the desc-ACR and legacy paths also reach the SONET-PM
+                # step below, where an unbound name would be a NameError
+                # on exactly the failure paths that matter most.
+                matched_acr = nb_leg = None
 
                 # Ambiguous Netbox match -> treat like a failed lookup (legacy
                 # guess) but say WHY, so it's distinguishable from "not found".
@@ -233,23 +253,60 @@ class MUX4216Client(BaseDeviceClient):
                     netbox_sonet = None
 
                 if netbox_sonet:
-                    matched_acr = None
+                    # Match on EITHER leg. An ACR group is defined by its
+                    # working AND protect interfaces -- both identify the same
+                    # group -- and NetBox may legitimately have recorded either.
+                    #
+                    # Confirmed on DFW1-MUX-04 2026-10-01: NetBox had SONET
+                    # 0/13/1 for oc12-ts1/1, which is ACR 26's PROTECT leg
+                    # (working 0/7/1). Matching the working column only, the
+                    # lookup failed and the whole DS1 was marked FAIL with
+                    # "not found in any ACR working column" -- even though the
+                    # ACR was right there and the circuit was up.
                     for acr in acr_groups:
                         if acr["working"] == netbox_sonet:
-                            matched_acr = acr
+                            matched_acr, nb_leg = acr, "working"
+                            break
+                        if acr["protect"] == netbox_sonet:
+                            matched_acr, nb_leg = acr, "protect"
                             break
                     if not matched_acr:
                         raise RuntimeError(
                             "NETBOX/MUX MISMATCH: Netbox SONET {} not found in any "
-                            "ACR working column on {}. Cannot verify path -- "
-                            "marking FAIL (not guessing).".format(netbox_sonet, mux_name))
+                            "ACR working OR protect column on {}. Cannot verify "
+                            "path -- marking FAIL (not guessing).".format(
+                                netbox_sonet, mux_name))
 
                     acr_num      = matched_acr["acr"]
                     active_sonet = matched_acr["active"]
-                    if matched_acr["active"] != netbox_sonet:
-                        netbox_conflict = (
-                            "CONFLICT: circuit on PROTECT -- Netbox working {}, "
-                            "MUX active {}".format(netbox_sonet, matched_acr["active"]))
+
+                    # "Are we on protection?" is active != WORKING. It is NOT
+                    # "active != whatever NetBox recorded" -- that was the old
+                    # test, and it gets this exact case backwards: NetBox had
+                    # the protect leg and the circuit was running on protect,
+                    # so the two matched and no flag was raised. The device's
+                    # own working/active columns are the only correct basis.
+                    notes = []
+                    if active_sonet and matched_acr["working"] and \
+                            active_sonet != matched_acr["working"]:
+                        notes.append(
+                            "ON PROTECT: ACR {} is running on {} (protect); "
+                            "working leg {} is not carrying the circuit"
+                            .format(acr_num, active_sonet,
+                                    matched_acr["working"]))
+                    if nb_leg == "protect":
+                        # Worth saying: NetBox has the protect interface
+                        # recorded for this OC. Not an error -- the ACR is the
+                        # same either way -- but it means NetBox is describing
+                        # the standby path, which is easy to misread as the
+                        # working one.
+                        notes.append(
+                            "Netbox records SONET {} for this OC, which is "
+                            "ACR {}'s PROTECT leg (working {})".format(
+                                netbox_sonet, acr_num, matched_acr["working"]))
+                    if notes:
+                        netbox_conflict = "; ".join(
+                            ([netbox_conflict] if netbox_conflict else []) + notes)
 
                     raw_sts = self.run(
                         "show run controller SONET-ACR {} | section sts-1 {}".format(acr_num, sts))
@@ -505,6 +562,18 @@ class MUX4216Client(BaseDeviceClient):
                 # specific command's output is long enough that it still
                 # needs it (per live confirmation on jfk1-mux-02).
                 sonet_pm_raw = ""
+                if not active_sonet and acr_num:
+                    _na = ("ACR {} reports no Currently Active leg (working {} "
+                           "/ protect {}) -- SONET PMs not pulled, because "
+                           "there is no active path to pull them from"
+                           .format(acr_num,
+                                   (matched_acr or {}).get("working") or "?",
+                                   (matched_acr or {}).get("protect") or "?")
+                           ) if matched_acr else (
+                           "ACR {} reports no Currently Active leg -- SONET "
+                           "PMs not pulled".format(acr_num))
+                    netbox_conflict = ("{}; {}".format(netbox_conflict, _na)
+                                       if netbox_conflict else _na)
                 if active_sonet:
                     if active_sonet in sonet_pm_cache:
                         sonet_pm_raw = sonet_pm_cache[active_sonet]

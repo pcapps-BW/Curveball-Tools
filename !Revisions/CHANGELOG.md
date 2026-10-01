@@ -15,6 +15,86 @@ that's bitten this project before.
 
 ---
 
+## v2.23 — 2026-10-01
+
+### THE ACTUAL BUG: ACR lookup matched the working leg only
+
+Root cause of the MDLDTXMU542 failure, found after v2.20-v2.22 had chased
+reachability instead. `show acr group | i 0/13/1` on DFW1-MUX-04:
+
+```
+26             SONET 0/7/1    SONET 0/13/1   SONET 0/13/1       N/A
+               working        protect        currently active
+```
+
+NetBox records SONET `0/13/1` for `oc12-ts1/1` -- ACR 26's **protect** leg --
+and the circuit is **currently running on protect**. The lookup was:
+
+```python
+if acr["working"] == netbox_sonet:
+```
+
+working column only. So an ACR that was plainly present, with a circuit that
+was up, failed with "not found in any ACR working column" and the DS1 was
+marked FAIL. An ACR group is defined by BOTH legs; either one identifies it,
+and NetBox may legitimately have recorded either.
+
+Now matches working OR protect, and records which leg NetBox named -- because
+NetBox holding the standby path for an OC is easy to misread as the working
+one.
+
+### Second bug: "are we on protect?" was computed against the wrong thing
+
+```python
+if matched_acr["active"] != netbox_sonet:        # old
+```
+
+That compares the active leg to *whatever NetBox recorded*, and it gets this
+exact case backwards: NetBox had the protect leg, the circuit was on protect,
+the two matched, and **no protection warning was raised**. A circuit silently
+running on its standby path is precisely what should be announced.
+
+The only correct basis is the device's own columns: `active != working`.
+Verified against the real row -- NetBox naming either `0/13/1` or `0/7/1` now
+yields ACR 26 with `ON PROTECT: True`.
+
+### Third bug: ACR rows with no active leg were dropped entirely
+
+The row parser required three SONET interfaces. An ACR not currently switched
+to either leg shows `N/A`:
+
+```
+16             SONET 0/7/0    SONET 0/12/0   N/A                N/A
+```
+
+That failed to match, so the ENTIRE group vanished -- working and protect both
+invisible, and any circuit on it failing with "not found in any ACR column"
+despite being plainly present. The active column is now optional and recorded
+as `""` when absent, never guessed. Rows with no interfaces at all (deleted
+groups) still correctly do not parse -- there is nothing to record.
+
+Where the active leg is unknown the SONET PM pull is skipped, and now says so
+with the ACR's working/protect legs named, rather than skipping silently.
+
+### Also fixed
+
+`matched_acr` / `nb_leg` are initialised per-DS1 alongside the other route
+variables rather than only inside the NetBox branch. The desc-ACR and legacy
+paths also reach the SONET-PM step, where an unbound name would have been a
+NameError on exactly the failure paths that matter most. Checked by AST walk,
+not by eye: first assignment line 247, first use line 273.
+
+### Note on v2.20-v2.22
+
+Three releases of MUX reachability work preceded this, on the assumption that
+`LOC_TO_MUX` was stale. It was not -- the MUX was reachable and correctly
+identified the whole time. v2.20 was the release that mattered: carrying the
+real error text into the report is what made this diagnosable at all, instead
+of "Check Netbox". v2.21 and v2.22 (NetBox fallback, hostname verification, Ge
+port addresses) are sound and worth having, but they were not the fix.
+
+---
+
 ## v2.22 — 2026-10-01
 
 ### MUX: fall back to the Ge ports when the management address is dead

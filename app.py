@@ -60,7 +60,7 @@ app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v2.22"
+APP_VERSION = "v2.23"
 
 
 @app.context_processor
