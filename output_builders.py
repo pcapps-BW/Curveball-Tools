@@ -1834,7 +1834,8 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
 def run_summary_line(ds1, ds1_map, pm_results, oc12_results,
                      hub_results, mux_results, all_oc12_stats, all_t3_stats,
                      peerless, fiber_results=None, evc_results=None,
-                     gsx_pm_results=None, gsx_t3_results=None):
+                     gsx_pm_results=None, gsx_t3_results=None,
+                     errors=None):
     """
     One-liner per DS1: Clean/Dirty per hop, split by direction where a hop
     has two distinct sides:
@@ -1921,16 +1922,32 @@ def run_summary_line(ds1, ds1_map, pm_results, oc12_results,
     # If key route data is missing (netbox not populated), we can't confirm the
     # circuit is healthy -- report "completed with errors" rather than
     # silently passing.
-    missing = []
+    # Name the source that is actually missing, and the recorded reason where
+    # there is one.
+    #
+    # This used to end every incomplete route with "| Check Netbox" regardless
+    # of cause. The MUX is NOT from NetBox -- it comes from LOC_TO_MUX, a
+    # hardcoded dict in autotester_standalone.py -- so an engineer whose MUX
+    # connect had simply failed was sent to look at NetBox, where there was
+    # nothing to find and no hint of the real cause (2026-10-01).
+    missing, netbox_relevant = [], False
     if not oc12:
         missing.append("1800/OC not resolved")
+        netbox_relevant = True
     if not hub.get("hub_ip"):
         missing.append("hub IP unknown")
+        netbox_relevant = True
     if not mux or not mux.get("mux_name") or mux.get("mux_name") == "?":
         missing.append("MUX not found")
     if missing:
-        return "  {}  --  The test completed with errors  |  Route incomplete: {}  |  Check Netbox".format(
-            ds1.upper(), ", ".join(missing))
+        # The per-DS1 error recorded at the point of failure beats any guess
+        # this function could make about why.
+        why = (errors or {}).get(ds1, "")
+        tail = ("  |  {}".format(why) if why
+                else ("  |  Check Netbox" if netbox_relevant
+                      else "  |  reason not recorded -- see the console log"))
+        return "  {}  --  The test completed with errors  |  Route incomplete: {}{}".format(
+            ds1.upper(), ", ".join(missing), tail)
 
     # ---- MUX: 1800-side (facility alarms + connection state) / GSX-side (T3) ----
     t3_iface   = mux.get("gsx_ce_iface", "")

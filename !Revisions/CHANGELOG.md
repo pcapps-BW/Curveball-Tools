@@ -15,6 +15,137 @@ that's bitten this project before.
 
 ---
 
+## v2.21 — 2026-10-01
+
+### MUX resolution: hardcoded map first, then NetBox, exhausting every address
+
+`LOC_TO_MUX` is a hardcoded four-entry dict. When it is stale or the box has
+moved, the run used to stop at "MUX not found" (DFW1-MUX-04 / 10.243.1.17,
+2026-10-01) even though NetBox already knew the answer: `oc_to_sonet()` returns
+the OC's connected endpoint device, which IS the MUX.
+
+The map stays the first choice -- it is fast and usually right. On failure the
+run now falls through to NetBox and tries every management address it holds,
+rather than giving up.
+
+**`netbox_client.device_mgmt_ips(name)`** (new) -- candidate addresses for any
+device in preference order: `primary_ip4` first, then every other IP assigned.
+Generic on purpose; `gsx_mgmt_ips()` stays GSX-specific because it groups by
+`MGMT-<shelf>-<slot>-<port>` naming, which a MUX has no equivalent of. Returns
+`([], [reason])` on failure, never an empty list posing as "no addresses".
+
+**`_mux_candidates()`** -- builds the ordered list, ONE ENTRY PER ADDRESS.
+Where two sources name the same IP differently -- a stale name in the hardcoded
+map against NetBox's current one -- the address is dialled once and BOTH names
+are accepted, letting the device settle it. The first attempt keyed on
+(name, ip) and dialled the same box twice; de-duping on IP alone would have
+thrown away the alternative name and then refused a good connection for "wrong
+hostname". A name disagreement is logged as `MUX NAME CONFLICT` and
+deliberately not resolved in code.
+
+**`_connect_mux()`** -- tries each address in turn and **verifies the
+connection rather than trusting it**. `MUX4216Client` inherits
+`_capture_hostname()` and its prompt ends in `#`, so the MUX reports its own
+name. If the box that answers is not one we were aiming for, the session is
+closed and the attempt recorded as refused. A wrong MUX is worse than no MUX:
+it would produce a complete, plausible, wrong route — the LAXGSX04 failure at
+hop scale. Same authority principle as `hub_registry`: the device gets the
+final word on who it is.
+
+Every attempt is recorded even on success, so a first choice that always fails
+is visible instead of being silently worked around on every run.
+
+**Where the fallback note goes, and why not the obvious place.** It cannot go
+in `mux_errors_all`: `run_summary_line()` only reads that dict when the route
+FAILED, so on a successful fallback the note would have been collected and
+dropped — reporting into the void, the thing v2.20 had just fixed. It is
+prepended to each DS1's `netbox_conflict` instead, an existing per-DS1 channel
+`output_builders` already renders.
+
+Verified without a network across six cases: NetBox agreeing on the name
+(shared IP collapses to one dial), NetBox naming a different MUX (shared IP
+accepts both names, conflict flagged), loc missing from the map (NetBox only),
+no NetBox at all (hardcoded only), a wrong-name box refused with the right one
+accepted on the next address, and every address dead with all attempts
+recorded.
+
+**`LOC_TO_MUX` is deliberately still first and still hardcoded.** It is not
+authoritative any more, just preferred — the same posture `hub_registry` takes
+with its fallback table, except inverted because here the hardcoded value is
+the fast path and NetBox is the safety net.
+
+---
+
+## v2.20 — 2026-10-01
+
+### MUX-stage failures now reach the report, and "Check Netbox" stops misdirecting
+
+A MDLDTXMU542 run reported:
+
+```
+TS1/27  --  The test completed with errors  |  Route incomplete: MUX not found  |  Check Netbox
+```
+
+Three separate problems behind that one line.
+
+**1. MUX-stage errors never reached the report at all.** `run()` built
+`step1_errors_all = dict(step1_errors)` -- 1250-stage errors only. The `errs`
+dict returned by `MUX4216Client.query_batch()` was printed via `progress()` and
+dropped, and `progress()` is console-only by design (noted at the top of
+`run()`). Both pre-`query_batch` `continue` paths -- no `LOC_TO_MUX` entry, and
+MUX connect failure -- did the same. So the only persisted trace of any MUX
+failure was "MUX not found", with the reason existing nowhere retrievable.
+`output_builders` has had a per-DS1 `COLLECTION FAILED:` renderer the whole
+time; it simply never received anything from the MUX stage.
+
+Now collected into `mux_errors_all` with the reason stated at the point of
+failure, including the MUX name, IP, exception, and the loc key involved.
+
+**2. "Check Netbox" was the wrong advice.** The MUX is not resolved from
+NetBox -- it comes from `LOC_TO_MUX`, a hardcoded four-entry dict in
+`autotester_standalone.py`. An engineer whose MUX connect had timed out was
+sent to look at NetBox, where there is nothing to find and no hint of the
+actual cause. `run_summary_line()` now gained an `errors=` parameter and emits,
+in order of preference: the recorded reason; else "Check Netbox" but ONLY when
+something NetBox-sourced is actually missing (OC or hub IP); else "reason not
+recorded -- see the console log".
+
+```
+|  MUX DFW1-MUX-04 (10.243.1.17) connect failed: TimeoutError: timed out
+   -- address is from the hardcoded LOC_TO_MUX map for loc 'dfw', so verify
+   the IP is still correct
+```
+
+**3. A regression caught before release, worth recording.** The obvious fix was
+to merge `mux_errors_all` into `step1_errors_all`. That would have been wrong:
+`build_diagnostic_summary()` treats any DS1 in that dict as a TOTAL collection
+failure -- it prints `COLLECTION FAILED` and `continue`s, replacing the entire
+per-DS1 diagnostic. Correct for a 1250-stage failure where nothing downstream
+was collected; destructive for a MUX-stage one, where the 1250 and 1800 hops
+succeeded and their optics, OSPF/LDP state and PM counters are real data. The
+MDLDTXMU542 report had all of that, and merging the dicts would have deleted a
+working report in order to explain a partial failure.
+
+The two dicts are kept apart: MUX reasons go to `run_summary_line()` only.
+Verified both ways -- a 1250-stage error still collapses to
+`COLLECTION FAILED`, a MUX-stage error leaves the 34-line diagnostic intact.
+
+**Not caused by v2.17.** Checked first, since v2.17 changed the ACR fallback in
+this same area. Everything that changed then lives inside `query_batch()`,
+which is never reached on either of these paths -- both `continue` before it.
+Corroborated by the report itself: the v2.17 branch keeps `cem_group =
+expected_cem`, so it would have shown `CEM 723` for `oc12-ts1/1:7:23`. The
+report showed `CEM ?`, i.e. no `mux_results` entry at all.
+
+**Carried forward:** `LOC_TO_MUX` is a hardcoded map with one MUX per hub site,
+the same shape as the `HUB_IPS` table that had LAX circuits reported as DFW for
+two months before `hub_registry` replaced it. Worth considering whether it
+should be NetBox-backed with the same authority order. Not changed here -- a
+wrong MUX address is worse than a missing one, so that needs its own
+discussion.
+
+---
+
 ## v2.19 — 2026-10-01
 
 ### interface_check.py: LIVE-TESTED at last, plus a VERDICT block

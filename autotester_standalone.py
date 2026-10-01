@@ -46,6 +46,164 @@ LOC_TO_MUX = {
 }
 
 
+# ---------------------------------------------------------------------------
+# MUX resolution: hardcoded map first, then NetBox, exhausting every address.
+#
+# LOC_TO_MUX is a hardcoded four-entry dict. It is fast and usually right, so
+# it stays the first choice -- but when it is stale or the box has moved, the
+# run used to simply stop with "MUX not found" (DFW1-MUX-04 / 10.243.1.17,
+# 2026-10-01). NetBox already knows which MUX an OC lands on: oc_to_sonet()
+# returns the connected endpoint's device name. From that name every management
+# address NetBox holds can be tried in turn.
+#
+# THE CONNECTION IS VERIFIED, NOT TRUSTED. A wrong MUX is worse than no MUX --
+# it would produce a complete, plausible, wrong route. So after connecting to
+# any address, the device's own prompt hostname must match the MUX name we were
+# aiming for; on a mismatch the session is closed and the attempt recorded as a
+# failure. Same authority principle as hub_registry: the device gets the final
+# word on who it is.
+# ---------------------------------------------------------------------------
+
+def _mux_name_matches(expected, actual):
+    """
+    Case-insensitive, domain-insensitive comparison of MUX names.
+
+    'DFW1-MUX-04' and 'dfw1-mux-04.bwnet.us' are the same box written two
+    ways; a false mismatch here would reject a perfectly good connection.
+    """
+    e = (expected or "").strip().lower().split(".")[0]
+    a = (actual or "").strip().lower().split(".")[0]
+    return bool(e) and bool(a) and e == a
+
+
+def _mux_candidates(loc, ds1_oc12_map, hostmap, netbox, progress):
+    """
+    Ordered candidates to try: [{"ip", "names": [...], "source"}].
+
+    1. The LOC_TO_MUX entry, if any.
+    2. Every management address NetBox holds for the MUX name that
+       oc_to_sonet() reports for these DS1s' OC facility.
+
+    ONE ENTRY PER ADDRESS. Where two sources name the same IP differently --
+    a stale name in the hardcoded map against NetBox's current one -- the
+    address is dialled once and BOTH names are accepted, letting the device's
+    own prompt settle which is right. Keyed on name as well would dial the
+    same box twice; de-duping on IP alone would discard the alternative name
+    and then refuse a good connection for "wrong hostname".
+    """
+    order, by_ip = [], {}
+
+    def add(name, ip, source):
+        if not ip:
+            return
+        if ip not in by_ip:
+            by_ip[ip] = {"ip": ip, "names": [], "source": source}
+            order.append(ip)
+        ent = by_ip[ip]
+        if name and name not in ent["names"]:
+            ent["names"].append(name)
+        if source not in ent["source"]:
+            ent["source"] += " + " + source
+
+    hard = LOC_TO_MUX.get(loc)
+    if hard:
+        add(hard["name"], hard["ip"], "LOC_TO_MUX (hardcoded)")
+    else:
+        progress("  [!] no LOC_TO_MUX entry for loc '{}' -- going straight "
+                 "to NetBox".format(loc))
+
+    if netbox is not None:
+        # Any DS1 in the group will do -- they share a location, hence a MUX --
+        # but try a few, since one OC may be missing from NetBox while another
+        # is present.
+        nb_names = []
+        for ds1, oc12 in list(ds1_oc12_map.items())[:4]:
+            host_1800 = hostmap.get(ds1, "")
+            if not host_1800:
+                continue
+            try:
+                _sonet, nb_mux = netbox.oc_to_sonet(
+                    host_1800, (oc12 or "").split(":")[0])
+            except Exception as ex:
+                progress("  [!] NetBox oc_to_sonet failed for {}: {}: {}".format(
+                    ds1, type(ex).__name__, ex))
+                continue
+            if nb_mux and nb_mux not in nb_names:
+                nb_names.append(nb_mux)
+
+        for nb_mux in nb_names:
+            if hard and not _mux_name_matches(hard["name"], nb_mux):
+                # Say it out loud. Not resolved here -- both names are carried
+                # and the device decides.
+                progress("  [!] MUX NAME CONFLICT for loc '{}': LOC_TO_MUX "
+                         "says '{}', NetBox says '{}'".format(
+                             loc, hard["name"], nb_mux))
+            ips, warns = netbox.device_mgmt_ips(nb_mux)
+            for w in warns:
+                progress("  [!] NetBox: {}".format(w))
+            for ip in ips:
+                add(nb_mux, ip, "NetBox ({})".format(nb_mux))
+
+    return [by_ip[ip] for ip in order]
+
+
+def _connect_mux(cands, user, pw, progress):
+    """
+    Try every candidate address until one connects AND identifies itself as a
+    MUX we were aiming for.
+
+    Returns (client, info, attempts). `attempts` is kept even on success, so a
+    first choice that always fails stays visible instead of being silently
+    worked around on every run.
+    """
+    attempts = []
+    for cand in cands:
+        want = cand["names"]
+        c = MUX4216Client(cand["ip"], user, pw)
+        try:
+            c.connect()
+        except CredentialError:
+            raise
+        except Exception as ex:
+            attempts.append("{} ({}): connect failed: {}: {}".format(
+                cand["ip"], cand["source"], type(ex).__name__, ex))
+            progress("  [!] MUX {} ({}) connect failed: {} -- trying next"
+                     .format(cand["ip"], cand["source"], type(ex).__name__))
+            try:
+                c.close()
+            except Exception:
+                pass
+            continue
+
+        actual = (getattr(c, "hostname", "") or "").strip()
+        if want and actual and not any(_mux_name_matches(w, actual)
+                                       for w in want):
+            # Reached A mux, but not one we were aiming for. Refuse: a
+            # complete, plausible route built from the wrong MUX is the worst
+            # outcome available here.
+            attempts.append(
+                "{} ({}): answered as '{}', expected {} -- refused".format(
+                    cand["ip"], cand["source"], actual,
+                    " or ".join("'{}'".format(w) for w in want)))
+            progress("  [!] {} answered as '{}', expected {} -- refusing and "
+                     "trying next".format(
+                         cand["ip"], actual,
+                         " or ".join("'{}'".format(w) for w in want)))
+            try:
+                c.close()
+            except Exception:
+                pass
+            continue
+
+        info = {"name": actual or (want[0] if want else cand["ip"]),
+                "ip": cand["ip"], "source": cand["source"]}
+        if attempts:
+            progress("  MUX reached on {} via {} after {} failed attempt(s)"
+                     .format(cand["ip"], cand["source"], len(attempts)))
+        return c, info, attempts
+    return None, None, attempts
+
+
 # Launcher menu metadata (read by launcher.py auto-discovery).
 TOOL_INFO = {
     'name': 'Autotester',
@@ -341,26 +499,65 @@ def run(params):
 
     mux_results_all = {}
     t3_stats_all    = {}
+    # MUX-stage failures, keyed per DS1, so they reach the REPORT and not just
+    # the console. progress() is deliberately console-only (see the note at the
+    # top of run()), so until 2026-10-01 the only persisted trace of a MUX
+    # failure was the run-summary line "Route incomplete: MUX not found |
+    # Check Netbox" -- which names the wrong source. The MUX comes from
+    # LOC_TO_MUX, a hardcoded four-entry dict, not NetBox. An engineer sent to
+    # check NetBox would find nothing to fix and no hint of the real cause.
+    mux_errors_all = {}
     for loc, ds1_oc12_map in mux_groups.items():
-        mux_info = LOC_TO_MUX.get(loc)
-        if not mux_info:
-            progress("  [!] No MUX mapping for loc '{}'".format(loc))
-            continue
         hostmap = {d: hub_hostnames.get(d, "") for d in ds1_oc12_map}
-        cmux = MUX4216Client(mux_info["ip"], infra_user, infra_pass)
-        try:
-            cmux.connect()
-        except CredentialError:
-            raise
-        except Exception as e:
-            progress("  [!] MUX {} connect failed: {}: {}".format(
-                mux_info["ip"], type(e).__name__, e))
+
+        # Hardcoded map first, then every address NetBox holds for the MUX the
+        # OC actually lands on. Each connection is verified against the
+        # device's own prompt hostname before it is used.
+        cands = _mux_candidates(loc, ds1_oc12_map, hostmap, netbox, progress)
+        if not cands:
+            msg = ("MUX not identified for loc '{}': no LOC_TO_MUX entry "
+                   "(known: {}) and NetBox returned no MUX address either"
+                   .format(loc, ", ".join(sorted(LOC_TO_MUX)) or "none"))
+            progress("  [!] {}".format(msg))
+            for d in ds1_oc12_map:
+                mux_errors_all[d] = msg
             continue
+
+        cmux, mux_info, attempts = _connect_mux(
+            cands, infra_user, infra_pass, progress)
+        if cmux is None:
+            msg = ("MUX unreachable for loc '{}' -- tried {} address(es): {}"
+                   .format(loc, len(attempts), "; ".join(attempts)))
+            progress("  [!] {}".format(msg))
+            for d in ds1_oc12_map:
+                mux_errors_all[d] = msg
+            continue
+
+        # Anything skipped to get here must still reach the REPORT. It cannot
+        # go in mux_errors_all: run_summary_line() only reads that when the
+        # route FAILED, so on a successful fallback the note would be
+        # collected and dropped -- reporting into the void. netbox_conflict is
+        # an existing per-DS1 channel that output_builders already renders
+        # (lines 1712 / 1996), so the note is prepended there after
+        # query_batch returns.
+        fallback_note = ""
+        if attempts:
+            fallback_note = (
+                "MUX FALLBACK: reached {} on {} via {} after {} failed "
+                "attempt(s): {}".format(
+                    mux_info["name"], mux_info["ip"], mux_info["source"],
+                    len(attempts), "; ".join(attempts)))
+            progress("  [!] {}".format(fallback_note))
+
         mux_results, t3_stats, mn, mip, errs = cmux.query_batch(
             mux_info["name"], mux_info["ip"], ds1_oc12_map, hostmap, netbox)
         cmux.close()
 
         for ds1, r in mux_results.items():
+            if fallback_note:
+                r["netbox_conflict"] = (
+                    "{}; {}".format(fallback_note, r["netbox_conflict"])
+                    if r.get("netbox_conflict") else fallback_note)
             mux_results_all[ds1] = r
             progress("  {} -> SONET {} ACR {} CEM {} | GSX {}-{}-{}-{}".format(
                 ds1, r["active_sonet"], r["acr_group"], r["cem_group"],
@@ -372,6 +569,10 @@ def run(params):
                 progress("     FLAG: {}".format(r["gsx_flag"]))
         for ds1, err in errs.items():
             progress("  {} -> ERROR: {}".format(ds1, err))
+            # Also carry it into the report. output_builders already renders
+            # "COLLECTION FAILED: <err>" per DS1; it simply never received
+            # anything from the MUX stage.
+            mux_errors_all[ds1] = err
         for k, v in t3_stats.items():
             t3_stats_all[k] = v
 
@@ -423,6 +624,19 @@ def run(params):
 
     # ---------- STAGE B: POLISHED OUTPUT (SecureCRT order/format) ----------
     step1_errors_all = dict(step1_errors)  # ds1 -> error (1250 no-MUSE etc.)
+    #
+    # mux_errors_all is deliberately NOT merged in here.
+    #
+    # build_diagnostic_summary() treats anything in this dict as a TOTAL
+    # collection failure: it prints "COLLECTION FAILED: <err>" and `continue`s,
+    # replacing the whole per-DS1 diagnostic. That is right for a 1250-stage
+    # failure, where nothing downstream was collected -- and wrong for a
+    # MUX-stage one, where the 1250 and 1800 hops succeeded and their optics,
+    # OSPF/LDP state and PM counters are real data worth reading. Merging the
+    # two would have deleted a working report to explain a partial failure.
+    #
+    # The MUX reason goes to run_summary_line() only, which is where "Route
+    # incomplete: MUX not found" is emitted and where the reason belongs.
 
     # Flatten GSX per-DS1 stats into a single text blob per DS1 for counter
     # review. Built here (before the run summary) so the summary line can also
@@ -440,7 +654,8 @@ def run(params):
             ds1, ds1_map, ds1_pms, oc12_results, hub_results,
             mux_results_all, oc12_stats_all, t3_stats_all, peerless_all,
             fiber_results, evc_results, gsx_pm_results=gsx_pm_results,
-            gsx_t3_results=gsx_t3_results))
+            gsx_t3_results=gsx_t3_results,
+            errors=dict(step1_errors_all, **mux_errors_all)))
     run_summary_block += ["", SEP]
     for ln in run_summary_block:
         emit(ln)

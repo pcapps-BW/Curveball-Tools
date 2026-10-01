@@ -312,6 +312,67 @@ class NetboxClient:
             return "{}.{}".format(gsx_node, suffix)
         return gsx_node
 
+    def device_mgmt_ips(self, device_name):
+        """
+        Candidate management IPs for any device, in preference order.
+
+        Returns (ips, warnings). primary_ip4 first -- that is the address
+        NetBox itself considers canonical -- then every other IP assigned to
+        the device, de-duplicated, order preserved.
+
+        Generic on purpose. gsx_mgmt_ips() below is GSX-specific because it
+        groups by MGMT-<shelf>-<slot>-<port> interface naming; a MUX has no
+        such convention, so this returns a flat ordered list and lets the
+        caller try them in turn.
+
+        ([], [reason]) on failure -- never an empty list presented as "this
+        device has no addresses". A NetBox outage and a device with no IPs
+        must not look the same.
+        """
+        if not self.ok():
+            return [], ["NetBox not configured"]
+        if not device_name:
+            return [], ["no device name"]
+
+        import urllib.parse
+        q = urllib.parse.quote(device_name, safe="")
+        ips, warns = [], []
+
+        # primary_ip4 first.
+        try:
+            r = self.session.get(
+                "{}/api/dcim/devices/?name={}".format(self.base_url, q),
+                timeout=15)
+            r.raise_for_status()
+            for dev in r.json().get("results", []):
+                pip = (dev.get("primary_ip4") or dev.get("primary_ip") or {}) or {}
+                addr = (pip.get("address") or "").split("/")[0].strip()
+                if addr and addr not in ips:
+                    ips.append(addr)
+        except Exception as e:
+            warns.append("device lookup for {} failed: {}: {}".format(
+                device_name, type(e).__name__, e))
+
+        # Then everything else assigned to it.
+        try:
+            r = self.session.get(
+                "{}/api/ipam/ip-addresses/?device={}&limit=200".format(
+                    self.base_url, q),
+                timeout=15)
+            r.raise_for_status()
+            for item in r.json().get("results", []):
+                addr = (item.get("address") or "").split("/")[0].strip()
+                if addr and addr not in ips:
+                    ips.append(addr)
+        except Exception as e:
+            warns.append("IPAM lookup for {} failed: {}: {}".format(
+                device_name, type(e).__name__, e))
+
+        if not ips and not warns:
+            warns.append("NetBox has no IP addresses for device {}".format(
+                device_name))
+        return ips, warns
+
     def gsx_mgmt_ips(self, gsx_device_name):
         """Returns {"1-1":[ips], "1-2":[ips]} (CIDR stripped) or {}."""
         if not self.ok():

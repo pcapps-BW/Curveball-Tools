@@ -61,9 +61,9 @@ SYSTEMS_MEETING_PREP.md
 #
 # Note the DOUBLE prefix: the leading '!' is gitignore negation (re-include),
 # and the '\!' after it is the literal '!' in the folder name.
-!\!Revisions/Curveball Tools v2.17.zip
-!\!Revisions/Curveball Tools v2.18.zip
 !\!Revisions/Curveball Tools v2.19.zip
+!\!Revisions/Curveball Tools v2.20.zip
+!\!Revisions/Curveball Tools v2.21.zip
 
 # --- Re-include things the blanket rules above would wrongly catch ---
 # 'autotester_*.txt' is meant for run reports, but it also matches the example
