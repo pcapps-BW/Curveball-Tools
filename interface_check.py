@@ -332,6 +332,69 @@ def run(params):
             lines.append("")
             lines.append("  [!] NNI / blast-radius check errored: {}".format(e))
 
+        # ---- "does this sub-interface even exist here?" -------------------------
+        #
+        # Confirmed live 2026-10-01: xe-ts13/3.624 was entered against ces01.jfk1,
+        # where that port runs .132 through .978 and has no .624. All five reads
+        # correctly returned nothing -- and the report was five "(no output)"
+        # blocks with no conclusion drawn. That reads like a broken run, and it is
+        # indistinguishable from "the interface exists but every command came back
+        # empty", which is an entirely different problem.
+        #
+        # The two facts together are conclusive, and the tool already had both:
+        # every read empty (with NO command failures, so the reads are trustworthy)
+        # PLUS a parent port that is present and healthy. Say it outright. "Did I
+        # typo the VLAN or is the circuit broken" is the first question a NOC
+        # engineer asks, and the report should answer it rather than imply it.
+        all_empty = all(not (captured.get(cmd) or "").strip()
+                        for _t, cmd in commands)
+        parent_ok = bool(nni_res and nni_res.get("total_on_port"))
+        if all_empty and not failures:
+            lines.append("")
+            lines.append("-" * 76)
+            lines.append("  VERDICT")
+            lines.append("-" * 76)
+            if parent_ok:
+                lines.append(
+                    "  [!] {} is NOT CONFIGURED on {}.".format(iface, c.hostname))
+                lines.append(
+                    "      All five reads returned nothing and none of them "
+                    "failed, while the")
+                lines.append(
+                    "      parent port {} is present and healthy ({} "
+                    "sub-interface(s), {} down).".format(
+                        nni, nni_res.get("total_on_port"),
+                        nni_res.get("down_on_port", 0)))
+                lines.append(
+                    "      Check the VLAN -- did you mean a different "
+                    "sub-interface, or a different hub?")
+            else:
+                # Parent not seen either: could be the wrong hub entirely, or a
+                # port that does not exist. Do NOT claim which.
+                lines.append(
+                    "  [!] {} returned no data, and the parent port {} was not "
+                    "seen either.".format(iface, nni))
+                lines.append(
+                    "      Either this interface is on a different hub, or the "
+                    "port does not exist")
+                lines.append(
+                    "      on {}. Not enough information to say which.".format(
+                        c.hostname))
+        elif all_empty and failures:
+            # Empty AND something errored -> absence proves nothing.
+            lines.append("")
+            lines.append("-" * 76)
+            lines.append("  VERDICT")
+            lines.append("-" * 76)
+            lines.append(
+                "  [!] All reads were empty, but {} command(s) FAILED -- "
+                "absence of data".format(len(failures)))
+            lines.append(
+                "      proves nothing here. Fix the failure above and re-run "
+                "before concluding")
+            lines.append(
+                "      anything about {}.".format(iface))
+
         ping_results = {}   # title -> "4/4 (0% loss)" style string, for the summary
         # Key must match exactly what was stored at capture time (line ~289),
         # including the trailing '| no-more' -- without it this lookup always

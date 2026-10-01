@@ -15,6 +15,60 @@ that's bitten this project before.
 
 ---
 
+## v2.19 — 2026-10-01
+
+### interface_check.py: LIVE-TESTED at last, plus a VERDICT block
+
+`interface_check.py` had been shipped and wired into the web UI since v1.86
+with unit tests only. Tested live on ces01.jfk1 2026-10-01. **Everything that
+was fixed blind at v1.86 works:**
+
+- `| no-more` present on all five commands; `_cmd_failed()` reported nothing
+- No SITE MISMATCH; the device confirmed `ces01.jfk1`
+- Hub IP resolved from NetBox as `10.111.133.255` — the value corrected in
+  v2.14, confirming that fix is live
+- `nni_check` (v1.86, never previously exercised against a device) ran: derived
+  the parent port, counted sub-interfaces, checked alarms, and pulled real
+  traffic — 204829 pps in / 204815 pps out over 2.4 min
+- Entering an IP in the interface field is rejected: *"that is an IP address,
+  not an interface"*. That input used to parse as `nni='10', vlan='111'` and
+  dump ~100 unrelated OSPF neighbours as findings
+
+Independent corroboration worth noting: `nni_check` reported `xe-ts13/3: 17
+sub-interface(s)`, and `circuit_audit.py` independently found exactly 17
+customer sub-interfaces on that port. Two tools, different commands, same
+number.
+
+### The gap the live test exposed
+
+`xe-ts13/3.624` was entered against ces01.jfk1, where that port runs .132
+through .978 and has no .624. All five reads correctly returned nothing — and
+the report was five `(no output)` blocks with **no conclusion drawn**. That
+reads like a broken run, and it is indistinguishable from "the interface exists
+but every command came back empty", which is an entirely different problem.
+
+The tool already held both facts needed to settle it: every read empty *with no
+command failures*, plus a parent port that is present and healthy. It just
+never combined them. A new VERDICT block now does, with three outcomes:
+
+- **Parent healthy, all reads empty, no failures** -> `NOT CONFIGURED on
+  <host>`, naming the parent's sub-interface count and suggesting the VLAN may
+  be wrong or the hub may be wrong
+- **Parent not seen either** -> says the interface may be on a different hub OR
+  the port may not exist, and explicitly that there is **not enough information
+  to say which**. It does not pick one
+- **All reads empty BUT a command failed** -> says absence of data proves
+  nothing and to fix the failure before concluding anything. An empty result
+  from a broken read is not evidence
+
+No verdict block is emitted when any read returned data, so a normal run is
+unchanged.
+
+"Did I typo the VLAN or is the circuit broken" is the first question a NOC
+engineer asks. The report now answers it instead of implying it.
+
+---
+
 ## v2.18 — 2026-10-01
 
 ### CES PMs disabled: a copy/paste MOP, and removal of two half-MOPs
