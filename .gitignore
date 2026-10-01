@@ -48,6 +48,23 @@ C:\\Claude/
 # --- Internal working notes, not for the shared repo ---
 SYSTEMS_MEETING_PREP.md
 
+# --- The three most recent release zips ARE tracked (pcapps, 2026-10-01) ---
+#
+# ⚠ THIS IS A MANUAL STEP AT EVERY RELEASE. Cutting vX.YZ means editing the
+# three lines below: add the new one, drop the oldest. Forget, and the new
+# release is silently untracked -- which looks exactly like a release that
+# was never cut.
+#
+# Gitignore cannot express "keep the newest three", so there is no way to
+# automate this in the file itself. It is listed as a step in the release
+# discipline section of ADDING_A_TOOL.md for that reason.
+#
+# Note the DOUBLE prefix: the leading '!' is gitignore negation (re-include),
+# and the '\!' after it is the literal '!' in the folder name.
+!\!Revisions/Curveball Tools v2.14.zip
+!\!Revisions/Curveball Tools v2.15.zip
+!\!Revisions/Curveball Tools v2.16.zip
+
 # --- Re-include things the blanket rules above would wrongly catch ---
 # 'autotester_*.txt' is meant for run reports, but it also matches the example
 # config template, which DOES belong in the repo. Caught by a check-ignore

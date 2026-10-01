@@ -129,3 +129,36 @@ If your tool uses these standard param keys, cross-tool reuse "just works":
 If the launcher can't load your tool it will print a `[skip] ...` line saying
 why (import error, or missing `collect_inputs`/`run`) and continue — it won't
 break the menu for everyone else.
+
+---
+
+## Cutting a release
+
+Four steps. Miss any one and the version in the UI stops matching what is on
+disk or in the repo — which has happened before (v1.81 showed in the UI with
+no zip on disk).
+
+- [ ] Bump `APP_VERSION` in `app.py`
+- [ ] Add a `## vX.YZ — YYYY-MM-DD` entry to **`!Revisions/CHANGELOG.md`**
+      (that is the canonical one; the root `CHANGELOG.md` is a stub pointer)
+- [ ] Build `!Revisions/Curveball Tools vX.YZ.zip`
+- [ ] **Edit `.gitignore`**: the three most recent zips are tracked by explicit
+      negation. Add the new version, drop the oldest. Gitignore cannot express
+      "keep the newest three", so this is manual — and if you forget, the new
+      release is silently untracked, which looks identical to a release that
+      was never cut.
+
+Then verify before committing:
+
+```
+python ds1_util.py
+python gsx_perfmon.py --self-test
+python circuit_audit.py --self-test
+git check-ignore -v "!Revisions/Curveball Tools vX.YZ.zip"   # must print nothing
+```
+
+The last command is the one that catches the `.gitignore` mistake. `!` starts a
+negation pattern in gitignore, so the literal `!` in `!Revisions` has to be
+escaped as `\!Revisions` — an unescaped rule is a silent no-op, which on
+2026-10-01 pushed every release zip from v1.0 to v2.14 (14.34 MiB) to the
+remote.

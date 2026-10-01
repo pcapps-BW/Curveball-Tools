@@ -321,6 +321,12 @@ def run(params):
         # ── T1 Standard commands ──────────────────────────────────────────────────
         standard = [
             ("STATUS",              "SHOW T1 {} STATUS".format(t1_id)),
+            # ADMIN added 2026-10-01 (pcapps). The T3 block above has had it
+            # all along; the T1 block never did. Shows the CONFIGURED state
+            # (framing, line coding, loopback, admin up/down) as opposed to
+            # the operational state STATUS reports -- the two disagreeing is
+            # itself a finding.
+            ("ADMIN",               "SHOW T1 {} ADMIN".format(t1_id)),
             ("STATISTICS",          "SHOW T1 {} STATISTICS".format(t1_id)),
             ("PERFMON CURRENT DAY", "SHOW T1 {} PERFMON CURRENT DAY".format(t1_id)),
             ("PERFMON THRESHOLDS",  "SHOW T1 {} PERFMON THRESHOLDS".format(t1_id)),

@@ -424,6 +424,7 @@ class GSXClient:
         t3_id = "T3-1-{}-{}".format(slot, port)
         commands = [
             ("STATUS",              "SHOW T3 {} STATUS".format(t3_id)),
+            ("ADMIN",               "SHOW T3 {} ADMIN".format(t3_id)),
             ("STATISTICS",          "SHOW T3 {} STATISTICS".format(t3_id)),
             ("PERFMON CURRENT DAY", "SHOW T3 {} PERFMON CURRENT DAY".format(t3_id)),
             ("PERFMON THRESHOLDS",  "SHOW T3 {} PERFMON THRESHOLDS".format(t3_id)),
@@ -445,6 +446,9 @@ class GSXClient:
         t1_id = "T1-1-{}-{}-{}".format(slot, port, t1)
         commands = [
             ("STATUS",             "SHOW T1 {} STATUS".format(t1_id)),
+            # ADMIN added 2026-10-01. Configured vs operational state; an
+            # admin-down T1 and a faulted T1 look the same in STATUS alone.
+            ("ADMIN",              "SHOW T1 {} ADMIN".format(t1_id)),
             ("STATISTICS",         "SHOW T1 {} STATISTICS".format(t1_id)),
             ("PERFMON 15MIN",      "SHOW T1 {} PERFMON CURRENT FIFTEENMIN".format(t1_id)),
             ("PERFMON DAY",        "SHOW T1 {} PERFMON CURRENT DAY".format(t1_id)),

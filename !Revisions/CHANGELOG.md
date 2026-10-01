@@ -15,6 +15,117 @@ that's bitten this project before.
 
 ---
 
+## v2.16 — 2026-10-01
+
+### `chassis_config.py` (new): read the far-end description off the 1800 itself
+
+MUX identity has come from NetBox alone, via `netbox_client.oc_to_sonet()`.
+That is a single source with no way to be contradicted: it can return a SONET
+path, `"__AMBIGUOUS__"`, or `(None, None)` -- but never "NetBox and the device
+disagree". The 1800's own chassis config names the far end, which makes a
+second, device-sourced opinion available.
+
+Format, from real ces01.atl1 output supplied 2026-10-01:
+
+```
+pcapps@ces01.atl1> show configuration | display-set | grep 3/1
+set chassis slot ts13 data-card dhxe-4 port xe-ts13/1 description "bcr01.atl1 Te0/0/0/34"
+```
+
+`set chassis slot <slot> data-card <card> port <port> description "<text>"`,
+where the text is `<far-end device> <far-end interface>`.
+
+**Functions**
+
+- `port_description_cmd(port)` -- builds the narrowed, `| no-more` command
+- `parse_chassis_ports(raw)` -- `{port: description}`; ports with no
+  description line are absent rather than blank
+- `split_far_end(desc)` -- `('bcr01.atl1', 'Te0/0/0/34')`; the interface half
+  is optional, and free text that is not name-shaped returns `(None, None)`
+  instead of inventing a device
+- `far_end_for_port(raw, port)` -- exact port match only. `xe-ts13/1` and
+  `xe-ts13/10` are different ports; the unanchored-substring version of this
+  mistake is what produced the LAXGSX04 wrong-circuit report
+- `compare_with_netbox(device_far_end, netbox_mux)` -- AGREE / DISAGREE /
+  DEVICE ONLY / NETBOX ONLY / NEITHER
+
+The comparison ignores case and a trailing domain, because `LAX1-MUX-02` and
+`lax1-mux-02.bwnet.us` are the same box written two ways and a false DISAGREE
+would train people to ignore the check. **DISAGREE is deliberately not
+resolved**: neither source is established as authoritative for this field, and
+picking a winner would bury the only fact worth surfacing -- that two records
+of one thing have diverged.
+
+**⚠ Deliberately NOT wired into the autotester's per-DS1 path.**
+`show configuration | display-set` takes ~90-120s to render a full 1800 config
+(already documented in `npt1800_client.py`), and `| grep` does not avoid that --
+the device renders everything before filtering. Calling this once per DS1 in a
+28-DS1 run would add roughly an hour. It is built for a single targeted lookup
+or a deliberate cross-check, and the cost is recorded in the module docstring
+so nobody wires it into a loop by accident.
+
+17 self-tests (`python chassis_config.py`), including the verbatim atl1 line,
+the ts13/1-vs-ts13/10 collision, and a non-chassis `set interfaces ...
+description` line that must not match.
+
+### Release discipline
+
+`ADDING_A_TOOL.md` gained a "Cutting a release" checklist. The fourth step is
+new and easy to miss: the three most recent zips are tracked in git by explicit
+negation in `.gitignore`, so each release means adding the new version and
+dropping the oldest. Gitignore cannot express "keep the newest three". The
+checklist ends with the `git check-ignore -v` command that catches the mistake,
+because the unescaped-`!` version of this rule silently pushed every zip from
+v1.0 to v2.14 earlier today.
+
+---
+
+## v2.15 — 2026-10-01
+
+### GSX: `SHOW ... ADMIN` added to the T1 pulls (and the T3 pull in gsx_client)
+
+`SHOW T3 <id> ADMIN` existed in exactly one place -- the T3 block of
+`gsx_perfmon.py`. The T1 block never had it, and neither `pull_t1_stats()` nor
+`pull_t3_stats()` in `gsx_client.py` (the pair the autotester uses) issued it at
+all. Requested by pcapps 2026-10-01.
+
+ADMIN reports the CONFIGURED state -- framing, line coding, loopback,
+administrative up/down -- where STATUS reports the operational state. An
+admin-down T1 and a faulted T1 look identical in STATUS alone, and the two
+disagreeing is itself a finding.
+
+Added directly after STATUS in all three places, matching the existing T3
+ordering:
+
+- `gsx_perfmon.py` T1 standard commands -> `("ADMIN", "SHOW T1 {} ADMIN")`
+- `gsx_client.pull_t3_stats()` -> `("ADMIN", "SHOW T3 {} ADMIN")`
+- `gsx_client.pull_t1_stats()` -> `("ADMIN", "SHOW T1 {} ADMIN")`
+
+**Checked before committing, because this inserts into a list the autotester
+verdict logic consumes:**
+
+- Both consumers unpack by destructuring (`for (label, cmd, out) in stats`),
+  not by position, so inserting at index 1 shifts nothing.
+- `gsx_pm_results` concatenates every command's output into one blob that
+  `build_diagnostic_summary()` regex-searches. `Alarm Status:` uses
+  `re.search`, and STATUS still runs before ADMIN, so the first match remains
+  STATUS's value.
+- `_check_gsx_counters()` scans only the regions `_gsx_split_current_perf()`
+  carves out for PERFMON CURRENT FIFTEENMIN / CURRENT DAY. ADMIN output falls
+  outside both and is never scanned for counters, so it cannot manufacture a
+  false non-zero hit.
+
+That last point mattered: items 4 and 10 on the bug list are *already* about
+the autotester summary reaching a wrong verdict, so feeding a new input into
+that logic without checking it would have been careless.
+
+`SHOW T1 <id> ADMIN` has not been run live. If it turns out not to be valid
+syntax it will land as `[command error: ...]` in its own report section --
+`run_command()` failures are already caught per-command -- and nothing else
+is affected.
+
+---
+
 ## v2.14 — 2026-10-01
 
 ### DS1 card expansion, GSX SSH failover, and skipping 96 pulls of zeros
