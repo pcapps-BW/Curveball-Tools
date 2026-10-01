@@ -138,11 +138,19 @@ def _mux_candidates(loc, ds1_oc12_map, hostmap, netbox, progress):
                 progress("  [!] MUX NAME CONFLICT for loc '{}': LOC_TO_MUX "
                          "says '{}', NetBox says '{}'".format(
                              loc, hard["name"], nb_mux))
-            ips, warns = netbox.device_mgmt_ips(nb_mux)
+            ips, warns, iface_by_ip = netbox.device_mgmt_ips(nb_mux)
             for w in warns:
                 progress("  [!] NetBox: {}".format(w))
             for ip in ips:
-                add(nb_mux, ip, "NetBox ({})".format(nb_mux))
+                # Name the interface the address belongs to. A Ge port
+                # answering when the loopback/management address does not is a
+                # finding about the device, and the report should say which
+                # port carried the session rather than just an IP
+                # (dfw1-mux-04.dfw1, 2026-10-01).
+                iface = iface_by_ip.get(ip)
+                src_label = ("NetBox {} {}".format(nb_mux, iface) if iface
+                             else "NetBox {} (primary)".format(nb_mux))
+                add(nb_mux, ip, src_label)
 
     return [by_ip[ip] for ip in order]
 

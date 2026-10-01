@@ -15,6 +15,65 @@ that's bitten this project before.
 
 ---
 
+## v2.22 — 2026-10-01
+
+### MUX: fall back to the Ge ports when the management address is dead
+
+`dfw1-mux-04.dfw1` has `0/13/1` cabled to `ces01.dfw1 > oc12-ts1/1` in NetBox,
+so NetBox was right all along -- its management address is simply unreachable.
+NetBox also holds working IPs on that MUX's Ge ports.
+
+v2.21's `device_mgmt_ips()` already returned every address assigned to the
+device, Ge ports included, so the fallback chain already covered this case.
+What it could not do was say WHICH interface answered -- it returned bare
+addresses, so a report could only show an IP. A Ge port carrying the session
+because the loopback is down is a finding about the device, not a detail to
+swallow.
+
+`device_mgmt_ips()` now returns `(ips, warnings, iface_by_ip)`, mapping each
+address to its NetBox interface name. Candidate sources are labelled with it:
+
+```
+10.243.1.17   LOC_TO_MUX (hardcoded) + NetBox dfw1-mux-04.dfw1 (primary)
+10.243.9.42   NetBox dfw1-mux-04.dfw1 GigabitEthernet0/0/0
+10.243.9.43   NetBox dfw1-mux-04.dfw1 GigabitEthernet0/0/1
+```
+
+and a successful fallback reports the route it took:
+
+```
+MUX FALLBACK: reached dfw1-mux-04 on 10.243.9.42 via NetBox
+dfw1-mux-04.dfw1 GigabitEthernet0/0/0 after 1 failed attempt(s):
+10.243.1.17 (...): connect failed: OSError: No route to host
+```
+
+Also verified that `DFW1-MUX-04` (hardcoded) and `dfw1-mux-04.dfw1` (NetBox)
+are NOT flagged as a name conflict -- the comparison is case- and
+domain-insensitive on the short name, and a false conflict on every DFW run
+would train people to ignore the warning.
+
+### A likely side effect worth watching
+
+The failure that prompted all this was:
+
+```
+NETBOX/MUX MISMATCH: Netbox SONET 0/13/1 not found in any ACR working column
+on DFW1-MUX-04
+```
+
+If `10.243.1.17` answers SSH but is NOT the chassis NetBox means by
+`dfw1-mux-04.dfw1`, that mismatch is explained: we were reading the ACR table
+of the wrong box, which of course had no `0/13/1`. v2.21's hostname
+verification now refuses a box that does not identify itself as the MUX we
+were aiming for, and v2.22 continues to the Ge ports instead of failing.
+
+So this may resolve the ACR mismatch as a consequence rather than needing a
+widened working-OR-protect match. Left alone deliberately until a run says
+otherwise -- widening that match on a guess would make a real NetBox error
+harder to see.
+
+---
+
 ## v2.21 — 2026-10-01
 
 ### MUX resolution: hardcoded map first, then NetBox, exhausting every address

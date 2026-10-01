@@ -316,9 +316,12 @@ class NetboxClient:
         """
         Candidate management IPs for any device, in preference order.
 
-        Returns (ips, warnings). primary_ip4 first -- that is the address
-        NetBox itself considers canonical -- then every other IP assigned to
-        the device, de-duplicated, order preserved.
+        Returns (ips, warnings, iface_by_ip). primary_ip4 first -- that is
+        the address NetBox itself considers canonical -- then every other IP
+        assigned to the device, de-duplicated, order preserved.
+        iface_by_ip maps address -> NetBox interface name where known, so a
+        caller can report that e.g. a Ge port answered when the loopback did
+        not.
 
         Generic on purpose. gsx_mgmt_ips() below is GSX-specific because it
         groups by MGMT-<shelf>-<slot>-<port> interface naming; a MUX has no
@@ -330,13 +333,14 @@ class NetboxClient:
         must not look the same.
         """
         if not self.ok():
-            return [], ["NetBox not configured"]
+            return [], ["NetBox not configured"], {}
         if not device_name:
-            return [], ["no device name"]
+            return [], ["no device name"], {}
 
         import urllib.parse
         q = urllib.parse.quote(device_name, safe="")
         ips, warns = [], []
+        iface_by_ip = {}   # ip -> NetBox interface name, for the report
 
         # primary_ip4 first.
         try:
@@ -353,7 +357,16 @@ class NetboxClient:
             warns.append("device lookup for {} failed: {}: {}".format(
                 device_name, type(e).__name__, e))
 
-        # Then everything else assigned to it.
+        # Then every other address assigned to the device -- loopback,
+        # management, AND physical ports. A MUX whose management address is
+        # unreachable can still be reachable on a Ge port that NetBox knows
+        # about (pcapps, 2026-10-01: dfw1-mux-04.dfw1), so those are candidates
+        # too, tried after the primary.
+        #
+        # The interface each address belongs to is carried alongside it, so the
+        # report can say WHICH port worked rather than just an IP. A Ge port
+        # answering when the loopback does not is a finding about the device,
+        # not a detail to swallow.
         try:
             r = self.session.get(
                 "{}/api/ipam/ip-addresses/?device={}&limit=200".format(
@@ -362,8 +375,13 @@ class NetboxClient:
             r.raise_for_status()
             for item in r.json().get("results", []):
                 addr = (item.get("address") or "").split("/")[0].strip()
-                if addr and addr not in ips:
-                    ips.append(addr)
+                if not addr or addr in ips:
+                    continue
+                ao = item.get("assigned_object") or {}
+                iface = (ao.get("name") or "").strip()
+                ips.append(addr)
+                if iface:
+                    iface_by_ip[addr] = iface
         except Exception as e:
             warns.append("IPAM lookup for {} failed: {}: {}".format(
                 device_name, type(e).__name__, e))
@@ -371,7 +389,7 @@ class NetboxClient:
         if not ips and not warns:
             warns.append("NetBox has no IP addresses for device {}".format(
                 device_name))
-        return ips, warns
+        return ips, warns, iface_by_ip
 
     def gsx_mgmt_ips(self, gsx_device_name):
         """Returns {"1-1":[ips], "1-2":[ips]} (CIDR stripped) or {}."""
