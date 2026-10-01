@@ -37,6 +37,7 @@ import threading
 from flask import Flask, render_template, request, jsonify, send_file, abort
 
 import autotester_standalone
+import reverse_autotester
 import npt1250_discovery
 import ds1_pms
 import fiber_util
@@ -60,7 +61,7 @@ app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v2.23"
+APP_VERSION = "v2.24"
 
 
 @app.context_processor
@@ -361,6 +362,42 @@ def api_autotester_run():
     }
     job_id = _launch_job(ip_1250, _warn_after(len(ds1_list)),
                           lambda: autotester_standalone.run(params))
+    return jsonify(job_id=job_id)
+
+
+@app.route("/api/reverse-autotester/run", methods=["POST"])
+def api_reverse_autotester_run():
+    """
+    Reverse trace: GSX -> MUX -> 1800 -> 1250.
+
+    Lives on the autotester page as a second card rather than its own tool
+    page, so it is deliberately absent from TOOL_URLS / _TOOL_MODULES (those
+    drive the home-page tool list).
+    """
+    f = request.form
+    gsx_ip = (f.get("gsx_ip") or "").strip()
+    if not _valid_ip(gsx_ip):
+        return jsonify(error="Enter a valid GSX IP (4 octets, e.g. 192.168.40.5)."), 400
+    t1_id = (f.get("t1_id") or "").strip()
+    if not reverse_autotester.parse_t1_id(t1_id):
+        return jsonify(
+            error="Enter the GSX T1 as shelf-slot-port-t1, e.g. T1-1-11-1-11."), 400
+    infra_user, infra_pass = _creds(f)
+    gsx_user, gsx_pass = _creds(f, "gsx_user", "gsx_pass")
+    if not (infra_user and infra_pass and gsx_user and gsx_pass):
+        return jsonify(
+            error="Infrastructure and GSX credentials are both required."), 400
+
+    params = {
+        "gsx_ip": gsx_ip, "t1_id": t1_id,
+        "username": infra_user, "password": infra_pass,
+        "gsx_user": gsx_user, "gsx_pass": gsx_pass,
+        "open_when_done": f.get("rev_open_when_done") == "on",
+    }
+    # Nine hops across four device types; give it the same headroom a
+    # multi-DS1 forward run gets rather than the single-DS1 default.
+    job_id = _launch_job(gsx_ip, _warn_after(4),
+                         lambda: reverse_autotester.run(params))
     return jsonify(job_id=job_id)
 
 

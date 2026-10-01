@@ -31,6 +31,114 @@ except ImportError:
 from device_base import BaseDeviceClient
 
 
+# ── REVERSE lookup: GSX assignment -> MUX T3 controller ──────────────────────
+#
+# Forward, the GSX node/slot/port come FROM the MUX: the T3 controller's
+# description is "<NODE>-<slot>-<port>" and the forward code reads it with
+# `show controllers t3 <ce_iface> | inc description`.
+#
+# Reverse needs the opposite: given ATLGSX02 slot 11 port 1, which T3
+# controller carries it? Format confirmed live on ATL1-MUX-02 2026-10-01 via
+# `show run | b <desc>`:
+#
+#   controller T3 0/8/46
+#    no snmp trap link-status
+#    description ATLGSX02-11-2
+#    threshold sd-ber 6
+#   !
+#   controller T3 0/8/47
+#    description ATLGSX02-11-3
+#
+# NOTE the description is NODE-slot-port with NO T1 number -- one description
+# covers the whole T3, i.e. all 28 DS1s on that GSX port. That matches the
+# forward code, which DERIVES gsx_t1 rather than reading it. So this lookup
+# resolves a GSX port, and the specific DS1 still comes from the CEM mapping.
+#
+# ⚠ `show run | i <desc>` is NOT usable here: it prints the matching
+# description lines with no controller context at all (three bare
+# "description ATLGSX02-11-1" lines, confirmed). `| b` or `| section` is
+# required. Also note the same description string appears on several config
+# objects for one path, so matching lines without tracking the enclosing
+# `controller T3` block would overcount.
+
+_T3_CTRL_RE = re.compile(r'^\s*controller\s+T3\s+(?P<id>[\d/]+)\s*$', re.I)
+_T3_DESC_RE = re.compile(r'^\s*description\s+(?P<desc>\S+)\s*$', re.I)
+
+
+def parse_t3_controller_descriptions(raw):
+    """
+    {t3_controller_id: description} from running-config text.
+
+    Tracks the enclosing `controller T3 <id>` block, so a description is only
+    attributed to the controller it actually sits under. Lines appearing
+    before any controller block are ignored -- `| b <match>` starts output
+    mid-block, so the first description in such a dump has no identifiable
+    owner and must NOT be guessed at.
+    """
+    out, current = {}, None
+    for ln in (raw or "").splitlines():
+        m = _T3_CTRL_RE.match(ln)
+        if m:
+            current = m.group("id")
+            continue
+        if ln.strip() == "!":
+            current = None
+            continue
+        if current:
+            md = _T3_DESC_RE.match(ln)
+            if md and current not in out:
+                out[current] = md.group("desc")
+    return out
+
+
+def gsx_assignment_desc(node, slot, port):
+    """'ATLGSX02', 11, 1 -> 'ATLGSX02-11-1' (no T1 -- see the note above)."""
+    return "{}-{}-{}".format((node or "").strip(), slot, port)
+
+
+def t3_for_gsx_assignment(raw, node, slot, port):
+    """
+    (t3_id, description) for the controller carrying this GSX port, or
+    (None, None).
+
+    Exact description match. 'ATLGSX02-11-1' must not also match
+    'ATLGSX02-11-10' -- the unanchored-substring version of this mistake is
+    what produced the LAXGSX04 wrong-circuit report, and slot/port numbers
+    reach double digits here.
+
+    Returns (None, '__AMBIGUOUS__') when more than one controller claims the
+    same assignment, rather than picking one.
+    """
+    want = gsx_assignment_desc(node, slot, port).lower()
+    hits = [(tid, d) for tid, d in parse_t3_controller_descriptions(raw).items()
+            if (d or "").strip().lower() == want]
+    if not hits:
+        return None, None
+    if len(hits) > 1:
+        return None, "__AMBIGUOUS__"
+    return hits[0]
+
+
+def ce_candidates_for_t3(t3_id):
+    """
+    Candidate CE interface names for a T3 controller id, in order.
+
+    The config prints `controller T3 0/8/45` while a forward run reported
+    `GSX CE : CE8/0/45` -- the same path with the first two components
+    TRANSPOSED. Rather than assume that transposition always holds, both forms
+    are returned and the caller VERIFIES which one the device accepts by
+    reading the description back. Guessing the order would produce a
+    real-looking CE interface belonging to a different circuit.
+    """
+    parts = [p for p in (t3_id or "").split("/") if p != ""]
+    if len(parts) != 3:
+        return [t3_id] if t3_id else []
+    a, b, c = parts
+    direct = "{}/{}/{}".format(a, b, c)
+    swapped = "{}/{}/{}".format(b, a, c)
+    return [direct] if direct == swapped else [direct, swapped]
+
+
 class MUX4216Client(BaseDeviceClient):
     PROMPT_RE = re.compile(r'[\w.\-]+#\s*$')   # MUX prompt ends with "#"
     CONN_TIMEOUT = 30

@@ -4,7 +4,8 @@
 <h1>Autotester</h1>
 <div class="sub">Traces a T1 end to end (1250 &rarr; 1800 &rarr; MUX &rarr; GSX), pulls PMs at each hop, and flags faults.</div>
 
-<div class="panel">
+<div class="tool-row" style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;">
+<div class="panel" style="flex:1 1 420px;min-width:380px;">
   <form id="runForm" data-run-url="/api/autotester/run">
     <label for="ip_1250">1250 IP</label>
     <input type="text" id="ip_1250" name="ip_1250" placeholder="10.111.131.79" required>
@@ -59,6 +60,50 @@
   </form>
 </div>
 
+<div class="panel" style="flex:1 1 420px;min-width:380px;">
+  <h2 style="margin-top:0;">Reverse (GSX &rarr; 1250)</h2>
+  <div class="sub" style="margin-bottom:14px;">
+    Start at a GSX T1 and walk inward: GSX &rarr; MUX &rarr; 1800 &rarr; 1250.
+    Resolves the T3 controller, ACR/CEM, SONET leg, OC sub-channel and MUSE on
+    the way. Use it when a GSX alarm is all you have.
+  </div>
+  <form id="revRunForm" data-run-url="/api/reverse-autotester/run">
+    <label for="gsx_ip">GSX IP</label>
+    <input type="text" id="gsx_ip" name="gsx_ip" placeholder="192.168.40.5" required>
+
+    <label for="t1_id">GSX T1 -- shelf-slot-port-t1</label>
+    <input type="text" id="t1_id" name="t1_id" placeholder="T1-1-11-1-11" required>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="revOpenWhenDone" name="rev_open_when_done">
+      <label for="revOpenWhenDone">Open results file when done (Notepad)</label>
+    </div>
+
+    <div class="cred-grid">
+      <div>
+        <label for="rev_infra_user">Infrastructure username (1250/1800/MUX)</label>
+        <input type="text" id="rev_infra_user" name="infra_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="rev_infra_pass">Infrastructure password</label>
+        <input type="password" id="rev_infra_pass" name="infra_pass" required autocomplete="current-password">
+      </div>
+      <div>
+        <label for="rev_gsx_user">GSX username</label>
+        <input type="text" id="rev_gsx_user" name="gsx_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="rev_gsx_pass">GSX password</label>
+        <input type="password" id="rev_gsx_pass" name="gsx_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <button type="submit">Run Reverse Trace</button>
+    <div class="field-error"></div>
+  </form>
+</div>
+</div>
+
 {% include "_job_panels.html" %}
 {% endblock %}
 
@@ -67,5 +112,10 @@
 <script>
   initJiraToggle('addJira', 'jiraTicketWrap');
   initJobForm('runForm');
+  // Second form, same job panels: only one run happens at a time and
+  // both traces belong in the same output area. initJobForm already
+  // supports several forms per page (see its panelSuffix arg), and each
+  // form carries its own .field-error so validation stays local.
+  initJobForm('revRunForm');
 </script>
 {% endblock %}

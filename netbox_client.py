@@ -130,6 +130,64 @@ class NetboxClient:
         mux_name = dev.get("name") or dev.get("display")
         return sonet_path, mux_name
 
+    def sonet_to_oc(self, mux_name, sonet_iface):
+        """
+        The reverse of oc_to_sonet(): MUX SONET interface -> (oc_name, hub_hostname).
+
+        Reads the same cable from the other end. Given 'SONET 0/13/1' (or
+        '0/13/1') on a MUX, returns the 1800's OC facility it lands on and that
+        1800's hostname.
+
+        Returns (None, None) on no match, or ("__AMBIGUOUS__", None) when more
+        than one interface matches -- the same contract oc_to_sonet() uses, so
+        callers can treat "cannot tell" distinctly from "not found". Picking one
+        of several would produce a complete, plausible, wrong route.
+        """
+        if not self.ok() or not mux_name:
+            return None, None
+
+        # Accept 'SONET 0/13/1', 'sonet0/13/1' or a bare '0/13/1'.
+        m = re.search(r'(\d+/\d+/\d+)', sonet_iface or "")
+        if not m:
+            return None, None
+        slot_port = m.group(1)
+
+        import urllib.parse
+        url = ("{}/api/dcim/interfaces/?device={}&name__ic={}&limit=500"
+               .format(self.base_url,
+                       urllib.parse.quote(mux_name, safe=""),
+                       urllib.parse.quote(slot_port, safe="")))
+        results = []
+        try:
+            pages = 0
+            while url and pages < 20:
+                r = self.session.get(url, timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                results.extend(data.get("results", []))
+                url = data.get("next")
+                pages += 1
+        except Exception:
+            return None, None
+
+        # Anchor to end-of-string so '0/13/1' cannot also match '0/13/10'.
+        # Same class of mistake as the unanchored CE match that produced the
+        # LAXGSX04 wrong-circuit report.
+        exact = re.compile(r'(?:^|[^\d])' + re.escape(slot_port) + r'$')
+        matches = [i for i in results if exact.search((i.get("name") or ""))]
+        if not matches:
+            return None, None
+        if len(matches) > 1:
+            return "__AMBIGUOUS__", None
+
+        eps = matches[0].get("connected_endpoints") or []
+        if not eps:
+            return None, None
+        ep = eps[0]
+        oc_name = ep.get("name") or ep.get("display")
+        dev = ep.get("device") or {}
+        return oc_name, (dev.get("name") or dev.get("display"))
+
     def device_interface_descriptions(self, hostname):
         """
         All interfaces for a device: [{name, type, description}, ...].

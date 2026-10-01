@@ -15,6 +15,98 @@ that's bitten this project before.
 
 ---
 
+## v2.24 — 2026-10-01
+
+### Reverse Autotester: GSX -> MUX -> 1800 -> 1250
+
+`reverse_autotester.py` (new), plus a second card on the Autotester page. The
+forward tool starts at a 1250 DS1 and walks outward; this starts at a GSX T1
+and walks inward, for when a GSX alarm is all you have.
+
+Inputs: GSX IP, GSX T1 (`T1-1-11-1-11`), same credentials as the forward run.
+
+**Every hop rests on output captured from a real device, not inference:**
+
+| Hop | How |
+|---|---|
+| T1 id -> shelf/slot/port/t1 | arithmetic, round-trip tested |
+| GSX node + slot/port -> MUX T3 controller | `mux4216_client.t3_for_gsx_assignment()` |
+| T3 controller -> CE interface | `ce_candidates_for_t3()`, **verified** |
+| CE -> ACR : CEM | `show xconnect all`, anchored match |
+| CEM -> STS + DS1 | arithmetic, inverse of the forward formula |
+| ACR -> SONET | `show acr group`, protect-aware (v2.23) |
+| SONET -> 1800 OC | `netbox_client.sonet_to_oc()` (new) |
+| OC sub-channel -> MUSE + 1250 | `chassis_config.parse_layer2_transport()` (new) |
+| 1250 + MUSE -> DS1 | `site_sweep._discover_ds1s()`, existing proven code |
+
+**Samples that shaped it, all captured 2026-10-01:**
+
+- `show configuration interfaces oc12-ts1/1:1:11 | display-set` -- the
+  `layer2-transport` block. **Two line forms**: the broad query keeps the
+  `set interfaces <iface>` prefix, the scoped one strips it. A parser written
+  against either silently matches nothing on the other.
+- `remote-tpe` **is** the 1250's loopback. Verified by finding the same address
+  as a router-ID in `show ospf neighbor` -- the address class
+  `ospf_stability.py` already SSHes to. No translation layer needed.
+- `remote-tpe` is a NESTED block: `pw-id` and `pw-type` appear under it as well
+  as top-level. The first parser captured the address and moved on, dropping
+  every nested option -- `pw_id` came back None despite being in the output.
+- `show run | i <desc>` is **unusable** for the reverse T3 lookup: it prints
+  matching description lines with no controller context (three bare
+  `description ATLGSX02-11-1` lines). `| b` / `| section` is required.
+- The T3 description is `<NODE>-<slot>-<port>` with **no T1 number** -- one
+  description covers all 28 DS1s on a GSX port. Consistent with the forward
+  code, which derives `gsx_t1` rather than reading it. So this hop resolves a
+  port and the CEM mapping resolves the DS1.
+- `| b` starts output mid-block, so the first description in such a dump has
+  no identifiable owner. It is IGNORED rather than attributed to the next
+  controller that happens to appear.
+
+**The CE interface is verified, not derived.** The config prints
+`controller T3 0/8/45` while a forward run reported `CE8/0/45` -- the same path
+with the first two components transposed. Rather than assume that
+transposition always holds, both forms are tried and each is accepted only if
+reading its description back matches what we were looking for. Guessing the
+order would produce a real-looking CE interface belonging to another circuit.
+
+**Failure posture.** Nine hops across four device types, so the orchestration
+records each hop's own outcome and stops at the first that cannot continue:
+
+```
+  [ OK ] GSX T1 identifier    shelf 1 slot 11 port 1 T1 11
+  [ OK ] GSX                  ATLGSX02 (192.168.40.5)
+  [ !! ] MUX T3 controller    no T3 controller described as 'ATLGSX02-11-1' on ...
+
+  TRAIL WENT COLD AT: MUX T3 controller
+  Everything above this line resolved; nothing below was attempted.
+```
+
+A partial trace that names where it stopped is useful; a traceback is not.
+Every ambiguity -- two controllers with one description, several MUSE circuits
+on a sub-channel, one MUSE on several DS1s -- refuses rather than picking.
+
+`ON PROTECT` is reported here too, on the same `active != working` basis
+v2.23 corrected.
+
+**Web card.** A second form on `/tools/autotester` rather than its own page, in
+the space to the right of the existing one, stacking on a narrow window.
+Deliberately absent from `TOOL_URLS` / `_TOOL_MODULES` (those drive the
+home-page tool list). `initJobForm` already supported several forms per page
+via its `panelSuffix` argument; the job panels are shared on purpose, since
+only one run happens at a time and both traces belong in the same output area.
+Each form carries its own `.field-error` so validation stays local.
+
+Verified by booting the app: both routes registered, the page renders with both
+forms, and all three validations (bad T1 id, bad GSX IP, missing credentials)
+reject with a 400 before anything connects.
+
+⚠ **The per-hop lookups are unit-tested; the orchestration has NOT yet run
+against live devices.** It is read-only throughout, so the risk is a wasted run
+rather than impact -- but the first real run is the test, and the per-hop
+reporting exists precisely so that run is diagnosable.
+
+---
+
 ## v2.23 — 2026-10-01
 
 ### THE ACTUAL BUG: ACR lookup matched the working leg only
