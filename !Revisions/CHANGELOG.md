@@ -15,6 +15,53 @@ that's bitten this project before.
 
 ---
 
+## v2.18 — 2026-10-01
+
+### CES PMs disabled: a copy/paste MOP, and removal of two half-MOPs
+
+`output_builders.build_ces_enable_mop()` appends one MOP block at the end of
+the diagnostic summary listing every DS1 that reported `CES PMs not enabled`.
+Sequence supplied verbatim by pcapps:
+
+```
+configure
+set interfaces ds1-<ds1> unit 0 pm-monitor-enable
+set interfaces ds1-<ds1> unit 0 pm-collection-enable
+commit confirm 5
+<verify connectivity is ok>
+commit
+```
+
+**Still read-only.** The function returns a string and has exactly two call
+sites -- its definition and one append into the report text. There is no path
+from it to a device. `INTRUSIVE_COMMANDS.md` updated in the same pass, with the
+`grep -n "build_ces_enable_mop" *.py` command that verifies the claim.
+
+Appended ONCE after the findings rather than beside each
+`[ -- ] CES PMs disabled` line: that line is produced in three separate places,
+and a `set` command sitting among the findings reads as part of the diagnosis,
+which makes it likelier to be pasted unread.
+
+`commit confirm 5` auto-reverts after five minutes unless the bare `commit`
+follows, and the `<verify connectivity is ok>` line is a deliberate human gate
+between them. Both are load-bearing and the docstring says not to tidy the
+block into six paste-in-one-go lines.
+
+**Two existing half-MOPs removed.** Found while verifying the audit claim:
+
+```
+npt1250_client.py:98       "To enable: set interfaces {} unit 0 pm-collection-enable"
+npt1250_discovery.py:251   "To enable: set interfaces {} unit 0 pm-collection-enable"
+```
+
+Both printed only `pm-collection-enable` -- half the sequence, missing
+`pm-monitor-enable`, with no `configure` and nothing to commit. Anyone
+following either one would have got no PMs and no error to explain why. They
+now point at the full MOP rather than restating a partial command, which also
+keeps one copy of the sequence instead of three.
+
+---
+
 ## v2.17 — 2026-10-01
 
 ### MUX: ACR/active-path fallback no longer guesses an ACR group

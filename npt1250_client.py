@@ -95,7 +95,14 @@ class NPT1250Client(BaseDeviceClient):
                 out.append("  CMD: {}".format(cmd))
                 if "switch of this interface object is off" in raw:
                     out.append("    NOTE: CES PMs not enabled on this DS1.")
-                    out.append("    To enable: set interfaces {} unit 0 pm-collection-enable".format(full_ds1))
+                    # Was a single `set ... pm-collection-enable` line, which
+                    # is HALF the sequence -- pm-monitor-enable is also
+                    # required, and nothing commits. Someone following it got
+                    # no PMs and no error. Point at the full MOP instead of
+                    # duplicating it here (2026-10-01).
+                    out.append("    To enable: see the CES PMs DISABLED MOP "
+                               "at the end of the report (2 set commands "
+                               "+ commit confirm)")
                 else:
                     for line in raw.splitlines():
                         clean = line.rstrip()

@@ -25,12 +25,39 @@ device is read-only** — a `show`/`SHOW` query, a `ping`, or a session-only
 display setting (`terminal length 0`, `| no-more` paging) that affects only
 the current CLI session, never saved/persisted device configuration.
 
-Two tools are exceptions **in what they print, not what they run**: they
+Three places are exceptions **in what they print, not what they run**: they
 generate the literal text of intrusive commands as part of a copy/paste
-runbook for a NOC engineer to execute and reverse by hand. Neither tool ever
+runbook for a NOC engineer to execute and reverse by hand. None of them ever
 passes that generated text back into a `.run()` call or any other execution
 path — this was traced and confirmed line by line, not assumed from the
-tool's stated intent. Both are documented in full below.
+tool's stated intent. All are documented in full below.
+
+**Added 2026-10-01: `output_builders.build_ces_enable_mop()`.** When a DS1
+reports `CES PMs not enabled`, the diagnostic summary appends a MOP for
+enabling them. The function returns a STRING and has exactly one caller
+(`build_diagnostic_summary`), which appends it to the report text; there is no
+code path from it to a device. Verify with:
+
+```
+grep -n "build_ces_enable_mop" *.py
+```
+
+Two call sites only: the definition and the one append. The commands it
+prints are:
+
+```
+configure
+set interfaces ds1-<ds1> unit 0 pm-monitor-enable
+set interfaces ds1-<ds1> unit 0 pm-collection-enable
+commit confirm 5
+<verify connectivity is ok>
+commit
+```
+
+`commit confirm 5` auto-reverts after five minutes unless the bare `commit`
+follows, and the `<verify connectivity is ok>` line is a deliberate human gate
+between them. Both are load-bearing: do not "tidy" the block into six
+paste-in-one-go lines.
 
 ---
 

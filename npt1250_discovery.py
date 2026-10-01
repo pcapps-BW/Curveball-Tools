@@ -248,7 +248,9 @@ def run(params):
                 raw = c.run(cmd + " | no-more")
                 if "switch of this interface object is off" in raw:
                     raw = ("  NOTE: CES PMs not enabled on this DS1.\n"
-                           "  To enable: set interfaces {} unit 0 pm-collection-enable".format(ds1))
+                           "  To enable: 2 set commands + commit confirm -- see "
+                           "the CES PMs DISABLED MOP in the autotester report "
+                           "(pm-monitor-enable AND pm-collection-enable)")
                 _section(lines, "CES PM 15min -- {}".format(ds1), cmd, raw)
 
                 cmd = "show interfaces pm 24hour {} ces".format(ds1)

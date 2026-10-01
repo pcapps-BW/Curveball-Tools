@@ -448,6 +448,62 @@ def build_jira_summary(ds1_map, run_summary_block, diag_text_parts):
 # "switch of this interface object is off" (pm-collection-enable not set).
 _CES_DISABLED_RE = re.compile(r'CES PMs not enabled', re.IGNORECASE)
 
+
+def build_ces_enable_mop(ds1s):
+    """
+    Copy/paste MOP for enabling CES PMs, for the DS1s that came back disabled.
+
+    NOT EXECUTED BY ANYTHING. Every tool in this suite is read-only and
+    INTRUSIVE_COMMANDS.md asserts it; this function only ever returns TEXT.
+    It follows the same convention as ds1_gsx_test.py and mux_loop_script.py,
+    which generate intrusive MOPs as copy/paste material with explicit
+    "not executed" framing.
+
+    Emitted ONCE at the end of a run rather than beside each
+    "[ -- ] CES PMs disabled" line, for two reasons: that line is produced in
+    three separate places, and a `set` command sitting inside the findings
+    reads as part of the diagnosis -- someone skimming is likelier to paste it
+    without reading.
+
+    Command sequence supplied by pcapps 2026-10-01, verbatim. Two `set` lines
+    are required (pm-monitor-enable AND pm-collection-enable), and the
+    `<verify connectivity>` step between `commit confirm 5` and the bare
+    `commit` is a HUMAN GATE -- do not remove it to tidy the output. Without
+    it the sequence reads as six lines to paste in one go, which defeats the
+    point of `commit confirm`.
+
+    Returns "" when nothing is disabled, so the caller can append
+    unconditionally.
+    """
+    ds1s = [d for d in (ds1s or []) if d]
+    if not ds1s:
+        return ""
+    out = [
+        "",
+        SEP,
+        "  CES PMs DISABLED -- MOP TO ENABLE  ({} DS1{})".format(
+            len(ds1s), "" if len(ds1s) == 1 else "s"),
+        SEP,
+        "  These commands are COPY/PASTE REFERENCE ONLY. Nothing below was",
+        "  executed by this tool, and nothing in this suite executes it.",
+        "",
+        "  'commit confirm 5' rolls the change back automatically after five",
+        "  minutes unless the bare 'commit' is issued. Verify connectivity in",
+        "  between -- that step is the safety net, not a formality.",
+        "",
+    ]
+    for ds1 in ds1s:
+        out.append("  --- ds1-{} ---".format(ds1))
+        out.append("  configure")
+        out.append("  set interfaces ds1-{} unit 0 pm-monitor-enable".format(ds1))
+        out.append("  set interfaces ds1-{} unit 0 pm-collection-enable".format(ds1))
+        out.append("  commit confirm 5")
+        out.append("  <verify connectivity is ok>")
+        out.append("  commit")
+        out.append("")
+    out.append(SEP)
+    return "\n".join(out)
+
 CEM_CIRCUIT_COUNTERS = [
     "Pkts Missing", "Failure Counts",
     "Generated Lbits", "Received Lbits",
@@ -1409,6 +1465,7 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
                              ospf_events_raw=None, ldp_session_raw=None,
                              gsx_t3_results=None):
     gsx_pm_results  = gsx_pm_results or {}
+    _ces_disabled = []   # DS1s needing the CES-enable MOP (see end of fn)
     gsx_t3_results  = gsx_t3_results or {}
     fiber_results = fiber_results or {}
     evc_results = evc_results or {}
@@ -1745,6 +1802,7 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         # 1250 -- CES above the identifier line; only dirty TDM below
         if _CES_DISABLED_RE.search(pm):
             lines.append("  [ -- ] CES PMs disabled")
+            _ces_disabled.append(ds1)
         elif ces_hits:
             for e in ces_hits:
                 lines.append("  [ !! ] CES {}".format(e))
@@ -1764,6 +1822,11 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         lines.append("")
 
     lines.append(SEP)
+    # One MOP block for every DS1 that reported CES PMs disabled -- appended
+    # once, after the findings, never inline. Returns "" when none are.
+    mop = build_ces_enable_mop(_ces_disabled)
+    if mop:
+        lines.append(mop)
     return "\n".join(lines)
 
 
