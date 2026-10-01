@@ -28,7 +28,7 @@ from device_base import CredentialError, prompt_ip
 from npt1800_client import NPT1800Client
 from mux4216_client import MUX4216Client
 from gsx_client import (GSXClient, find_plink, find_live_ip,
-                        connect_first_live)
+                        connect_first_live, node_names_match)
 from output_builders import (
     build_route_block, build_peerless_block,
     build_diagnostic_summary, run_summary_line, SEP, SEP2,
@@ -617,8 +617,55 @@ def run(params):
                          .format(ds1))
                 continue
             r["gsx_ip"] = live_ip   # stash for the route block, even if the pull below fails
-            progress("  {} -> GSX {} ({}) card {} -> T1-1-{}-{}-{}".format(
-                ds1, node, live_ip, card_key, slot, port, t1))
+
+            # ---- two-source cross-check on the GSX identity ----------------
+            # `node` came from the MUX's own port description
+            # ('description ATLGSX02-11-1'). `g.hostname` is the GSX naming
+            # ITSELF at login (gsx_client, v2.27). Two independent sources for
+            # the same fact, so they can be compared.
+            #
+            # A disagreement means the box we just logged into is NOT the box
+            # the MUX says this circuit lands on -- either the MUX description
+            # is stale, or NetBox's mgmt IPs for '{gsx_dev}' point at the wrong
+            # device. Either way the PMs below belong to a DIFFERENT T1 than
+            # the one being tested, and a clean result would be meaningless.
+            #
+            # It does NOT abort: the pull is read-only and the operator still
+            # wants to see what is there. But it is recorded so the report
+            # states whose counters these are, rather than labelling them with
+            # the MUX-derived name and leaving the contradiction invisible.
+            device_node = (getattr(g, "hostname", "") or "").strip()
+            r["gsx_node_device"] = device_node
+            # Three states, not two. "the device did not name itself" and "the
+            # device named itself as something else" are different findings and
+            # the report treats them differently -- the first is a gap, the
+            # second means the counters are off the wrong box.
+            r["gsx_name_verdict"] = (
+                "unconfirmed" if not device_node else
+                "confirmed" if node_names_match(node, device_node) else
+                "conflict")
+            if not device_node:
+                r["gsx_name_conflict"] = (
+                    "GSX did not give a node name at login -- '{}' is from the "
+                    "MUX description only, unconfirmed by the device"
+                    .format(node))
+                progress("  [!] {} -> GSX node unconfirmed: no name from the "
+                         "device, using MUX description '{}'".format(ds1, node))
+            elif not node_names_match(node, device_node):
+                r["gsx_name_conflict"] = (
+                    "NAME CONFLICT: MUX description says '{}', the device at "
+                    "{} calls itself '{}' -- these counters are {}'s"
+                    .format(node, live_ip, device_node, device_node))
+                progress("  [!!] {} -> GSX NAME CONFLICT: MUX says '{}', "
+                         "device at {} says '{}'. Stale MUX description, or "
+                         "NetBox mgmt IPs for '{}' point at the wrong device. "
+                         "The PMs below are {}'s."
+                         .format(ds1, node, live_ip, device_node, gsx_dev,
+                                 device_node))
+            progress("  {} -> GSX {} ({}) card {} -> T1-1-{}-{}-{}{}".format(
+                ds1, node, live_ip, card_key, slot, port, t1,
+                "" if r["gsx_name_verdict"] == "confirmed"
+                else "  [see note above]"))
             try:
                 stats = g.pull_t1_stats(slot, port, t1)
                 gsx_results[ds1] = stats
@@ -883,6 +930,15 @@ def run(params):
     if extra is not None:
         extra["jira_summary"] = jira_summary
         extra["route_diag"]   = "\n\n".join(route_diag_parts)
+        # Added 2026-10-01 for reverse_autotester's confirmation check. It
+        # needs the GSX assignment this walk DERIVED (gsx_node/slot/port/t1,
+        # ACR, CEM) so it can compare against the GSX T1 the reverse trace
+        # started from -- two independent derivations of one route. Scraping
+        # that back out of route_diag text would be fragile.
+        extra["mux_results"]  = mux_results_all
+        extra["host_1250"]    = host_1250
+        extra["ds1_map"]      = ds1_map
+        extra["run_summary"]  = "\n".join(run_summary_block)
 
     return out_path
 

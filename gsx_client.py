@@ -15,6 +15,7 @@ Built by P. Capps.
 
 import re
 import os
+import sys
 import time
 import json
 import subprocess
@@ -235,6 +236,56 @@ def capture_fingerprint(plink_path, ip, username, password, timeout=20):
     return fp
 
 
+_PROMPT_NODE_RE = re.compile(r'^([A-Za-z][\w.\-]*)>\s*$')
+_NODE_HEADER_RE = re.compile(r'^\s*Node:\s*([\w.\-]+)', re.MULTILINE)
+
+
+def node_from_prompt(banner):
+    """
+    Pull the node name out of a GSX login banner: 'ATLGSX02>' -> 'ATLGSX02'.
+
+    Scans from the BOTTOM up -- the prompt is the last line, and a login
+    banner can contain anything above it. Returns "" when no prompt line is
+    present rather than guessing from banner text.
+    """
+    for line in reversed((banner or "").splitlines()):
+        m = _PROMPT_NODE_RE.match(line.strip())
+        if m:
+            return m.group(1)
+    return ""
+
+
+def node_from_output(text):
+    """
+    Second source for the node name: every GSX command's output starts with a
+    'Node: ATLGSX02    Date: ...' header. Lets a caller name the node from
+    output it has ALREADY pulled, with no extra command -- used as the
+    fallback when the prompt could not be read.
+    """
+    m = _NODE_HEADER_RE.search(text or "")
+    return m.group(1) if m else ""
+
+
+def node_names_match(a, b):
+    """
+    Do two GSX node names refer to the same device?
+
+    Compares the first dot-label, case-insensitively: 'ATLGSX02' and
+    'atlgsx02.bandwidth.com' are the same node. Returns False when either
+    side is empty -- an unknown name is not a match, and must not be reported
+    as agreement.
+
+    Used to cross-check the node the MUX's port description claims against
+    the name the GSX gives at login. Deliberately does NOT try to normalise
+    anything beyond case and domain: if the two differ in any other way,
+    that difference is the finding.
+    """
+    def norm(s):
+        return (s or "").strip().split(".")[0].upper()
+    na, nb = norm(a), norm(b)
+    return bool(na) and na == nb
+
+
 class GSXClient:
     # Full pager line: "--- Press <space> for next page, <c>ontinuous, or <q>uit ---"
     # Match the surrounding dashes too, so no "---  ---" remnant is left behind.
@@ -252,6 +303,16 @@ class GSXClient:
         self._lock = threading.Lock()
         self._reader = None
         self._stop = False
+        # Node name, read from the login prompt by connect().
+        #
+        # ⚠ GSXClient is NOT a DeviceBase subclass -- it talks to plink
+        # directly -- so it does NOT inherit DeviceBase._capture_hostname().
+        # Until 2026-10-01 it had no `hostname` attribute at all, which meant
+        # `getattr(g, "hostname", "")` (reverse_autotester hop 1) silently
+        # returned "" on EVERY run, not just on failures. Kept named
+        # `hostname` to match DeviceBase so callers can treat the two the
+        # same.
+        self.hostname = ""
 
     def _spawn(self, hostkey=None):
         args = [self.plink_path, "-ssh", "{}@{}".format(self.username, self.ip),
@@ -375,6 +436,7 @@ class GSXClient:
                         self.username, self.ip),
                     cred_type='gsx')
             raise RuntimeError("plink exited during login. Output:\n{}".format(banner))
+        self.hostname = node_from_prompt(banner)
         self._consume()
         return banner
 
@@ -476,3 +538,95 @@ class GSXClient:
                 self.proc.terminate()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Self-tests for the node-name parsers. No device needed:
+#   python gsx_client.py --self-test
+#
+# These exist because GSXClient had NO `hostname` attribute until 2026-10-01
+# (it is not a DeviceBase subclass, so it never inherited
+# _capture_hostname). reverse_autotester read it with
+# getattr(g, "hostname", "") and therefore got "" on every single run --
+# a missing attribute read through a defaulted getattr fails silently
+# forever. A test that pins the parsers is the cheap half of the fix; the
+# other half is that hop 1 now FAILS when the name is unknown instead of
+# printing '?'.
+# ---------------------------------------------------------------------------
+
+_BANNER_SAMPLE = """Using username "pcapps".
+
+Sonus Networks GSX9000
+ATLGSX02>
+"""
+
+# First two lines of any GSX command's output (verbatim shape, ATLGSX02).
+_OUTPUT_HEADER_SAMPLE = """Node: ATLGSX02                                 Date: 2026/10/01 12:09:02  GMT
+                                               Zone: GMT
+"""
+
+
+def self_test(verbose=True):
+    fails = []
+
+    def chk(label, got, want):
+        if got != want:
+            fails.append("{}: got {!r} want {!r}".format(label, got, want))
+        elif verbose:
+            print("  ok  {} = {!r}".format(label, got))
+
+    chk("prompt from login banner", node_from_prompt(_BANNER_SAMPLE), "ATLGSX02")
+    chk("prompt bare", node_from_prompt("DFWGSX04>"), "DFWGSX04")
+    chk("prompt trailing space", node_from_prompt("LAXGSX01> "), "LAXGSX01")
+    chk("prompt dotted name",
+        node_from_prompt("atlgsx02.bandwidth.com>"), "atlgsx02.bandwidth.com")
+    # Scans bottom-up: the live prompt is the LAST one, not the first.
+    chk("prompt takes the last one",
+        node_from_prompt("OLDNODE>\nNEWNODE>\n"), "NEWNODE")
+    chk("prompt absent", node_from_prompt("Access denied\n"), "")
+    chk("prompt from empty", node_from_prompt(""), "")
+    chk("prompt from None", node_from_prompt(None), "")
+    # A '>' inside prose must not be read as a prompt.
+    chk("prose with a > is not a prompt",
+        node_from_prompt("see docs > appendix\n"), "")
+
+    chk("Node: header", node_from_output(_OUTPUT_HEADER_SAMPLE), "ATLGSX02")
+    chk("Node: header indented",
+        node_from_output("   Node: DFWGSX04   Date: x"), "DFWGSX04")
+    chk("no Node: header", node_from_output("Shelf: 1  Slot: 6\n"), "")
+    chk("command error is not a node",
+        node_from_output("[command error: timeout]"), "")
+    chk("Node: from empty", node_from_output(""), "")
+
+    # ---- node_names_match: the forward autotester's identity cross-check ---
+    chk("same name", node_names_match("ATLGSX02", "ATLGSX02"), True)
+    chk("case differs", node_names_match("ATLGSX02", "atlgsx02"), True)
+    chk("domain on one side",
+        node_names_match("ATLGSX02", "atlgsx02.bandwidth.com"), True)
+    chk("domain on the other side",
+        node_names_match("atlgsx02.bandwidth.com", "ATLGSX02"), True)
+    chk("whitespace", node_names_match("ATLGSX02", " ATLGSX02 "), True)
+    # The dangerous case: one digit apart. Two real GSXs at the same site.
+    chk("one digit apart is NOT a match",
+        node_names_match("ATLGSX02", "ATLGSX01"), False)
+    chk("different site", node_names_match("ATLGSX02", "DFWGSX04"), False)
+    # An unknown name must never read as agreement.
+    chk("empty is not a match (right)", node_names_match("ATLGSX02", ""), False)
+    chk("empty is not a match (left)", node_names_match("", "ATLGSX02"), False)
+    chk("both empty is not a match", node_names_match("", ""), False)
+    chk("both None is not a match", node_names_match(None, None), False)
+
+    print()
+    if fails:
+        print("FAILURES:")
+        for f in fails:
+            print("  " + f)
+        return False
+    print("All gsx_client self-tests passed.")
+    return True
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(0 if self_test() else 1)
+    print(__doc__ or "gsx_client.py -- GSX9000 SSH client. Try --self-test.")

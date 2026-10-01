@@ -1392,7 +1392,22 @@ def build_route_block(ds1, host_1250, loopback_ip, muse_id,
             mux_data.get("gsx_ce_iface", "?"), mux_data.get("gsx_cem_id", "?")),
         "", SEP2,
         "  HOP 4 -- GSX",
-        "    Node       : {}".format(mux_data.get("gsx_node") or "?"),
+        # The node name has two sources: the MUX port description and the
+        # GSX's own login prompt. Say which, so "device-confirmed" is visible
+        # as a positive fact rather than only its absence being implied.
+        "    Node       : {}{}".format(
+            mux_data.get("gsx_node") or "?",
+            {"confirmed":   "   (confirmed by the device itself)",
+             "unconfirmed": "   (from the MUX description; device did not "
+                            "name itself)",
+             # Name BOTH. The route block is the reference an engineer copies
+             # commands out of, so a disagreement about WHICH BOX must be on
+             # the line itself -- not left to the diagnostic summary further
+             # down.
+             "conflict":    "   <-- MUX description; the device at this IP "
+                            "says '{}'".format(
+                                mux_data.get("gsx_node_device") or "?"),
+             }.get(mux_data.get("gsx_name_verdict"), "")),
         "    IP         : {}".format(mux_data.get("gsx_ip") or "?"),
         "    Assignment : {}".format(gsx_assign),
         "    T1 Command : SHOW T1 T1-1-{}".format(gsx_assign),
@@ -1638,8 +1653,23 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         gsx_t3_alarm_m = re.search(r'Alarm Status:\s*(\S+)', gsx_t3_raw)
         gsx_t3_alarm   = gsx_t3_alarm_m.group(1) if gsx_t3_alarm_m else ""
 
+        # Identity cross-check (v2.28): MUX port description vs the name the
+        # GSX gave at login.
+        #
+        # On a CONFLICT the header is labelled with the DEVICE's own name, not
+        # the MUX-derived one -- the counters below came off the box we logged
+        # into, so naming them after the box the MUX expected would be an
+        # active mislabel, which is the whole fault being reported.
+        _name_verdict = mux.get("gsx_name_verdict")
+        _name_conflict = mux.get("gsx_name_conflict")
+        _hdr_node = (mux.get("gsx_node_device") or gsx_node
+                     if _name_verdict == "conflict" else gsx_node)
         lines.append("         GSX  --  {}  ({})  (current 15 min / 24 hr)".format(
-            gsx_node, mux.get("gsx_ip", "?")))
+            _hdr_node, mux.get("gsx_ip", "?")))
+        # Printed above the counters, because it decides whether the counters
+        # are even the right device's.
+        if _name_conflict:
+            lines.append("  [ !! ] {}".format(_name_conflict))
         if gsx_t3_down:
             lines.append("  [ !! ] GSX T3 DOWN{}  <-- root cause; all T1s on this port affected".format(
                 " ({})".format(gsx_t3_alarm) if gsx_t3_alarm and gsx_t3_alarm.upper() != "NONE" else ""))
@@ -1653,6 +1683,41 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         if gsx_hits:
             for e in gsx_hits:
                 lines.append("  [ !! ] GSX {}".format(e))
+            # State the PARENT T3 whenever the DS1 is erroring.
+            #
+            # Until 2026-10-01 the T3 was mentioned only when it was DOWN, so a
+            # DS1 taking errors behind a T3 that was up produced no T3 line at
+            # all -- and the reader had to go and check the DS3 by hand to tell
+            # a DS1-specific fault from a T3-level one. That is the same
+            # one-ticket-or-28 distinction v2.13 added, which only covered the
+            # outage case and not the errored case.
+            #
+            # Costs no extra command: gsx_t3_raw is already pulled per DS1 for
+            # the T3-DOWN check above. It is STATUS, not PM counters, so the
+            # wording claims only what it knows -- "no alarm on the parent T3",
+            # never "the T3 is clean".
+            if not gsx_t3_down:
+                _t3_alarmed = bool(gsx_t3_alarm
+                                   and gsx_t3_alarm.upper() not in ("NONE",
+                                                                    "NOALARM"))
+                if _t3_alarmed:
+                    lines.append(
+                        "  [ !! ] parent T3 {}-{} ALARM {} -- may affect every "
+                        "DS1 on this port".format(
+                            mux.get("gsx_slot") or "?",
+                            mux.get("gsx_port") or "?", gsx_t3_alarm))
+                elif gsx_t3_raw.strip():
+                    lines.append(
+                        "  [ -- ] parent T3 {}-{} is UP with no alarm -- these "
+                        "errors look DS1-specific".format(
+                            mux.get("gsx_slot") or "?",
+                            mux.get("gsx_port") or "?"))
+                else:
+                    # No T3 status came back. Say so rather than implying the
+                    # parent is healthy by omission.
+                    lines.append(
+                        "  [ -- ] parent T3 status not read -- cannot say "
+                        "whether this is DS1-specific or T3-level")
         if not gsx_t3_down and not gsx_down and not gsx_hits:
             lines.append("  [ OK ] GSX PMs clean")
         lines.append("         {}".format(gsx_assign))
@@ -1996,6 +2061,22 @@ def run_summary_line(ds1, ds1_map, pm_results, oc12_results,
     nb_conflict = mux.get("netbox_conflict")
     if nb_conflict:
         parts.append("NOTE: {}".format(nb_conflict))
+
+    # Identity cross-check (v2.28). A CONFLICT -- the MUX description and the
+    # GSX's own login name disagree -- means the GSX-side counters above were
+    # read off a different device than the one this circuit is supposed to
+    # land on, so "completed successfully" would be a false pass. An
+    # UNCONFIRMED name (device gave none) is a gap, not a contradiction: it
+    # gets a note and keeps the verdict.
+    name_verdict = mux.get("gsx_name_verdict")
+    if name_verdict == "conflict":
+        return ("  {}  --  The test completed with errors  |  {}  |  "
+                "{}".format(ds1.upper(), "  |  ".join(parts),
+                            mux.get("gsx_name_conflict")
+                            or "GSX identity conflict"))
+    if name_verdict == "unconfirmed":
+        parts.append("NOTE: {}".format(
+            mux.get("gsx_name_conflict") or "GSX node name unconfirmed"))
 
     return "  {}  --  The test completed successfully  |  {}".format(
         ds1.upper(), "  |  ".join(parts))

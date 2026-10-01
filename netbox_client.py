@@ -47,6 +47,19 @@ def load_netbox_config(path=CONFIG_PATH):
     return url, token
 
 
+def _first_label(name):
+    """
+    'dfw1-mux-04.dfw1' -> 'DFW1-MUX-04'. The hostname, upper-cased for
+    comparison: the part before the first dot, with any site/domain suffix
+    dropped.
+
+    NetBox stores site-suffixed names while the hardcoded maps and device
+    prompts use bare hostnames, so almost every name comparison in here is
+    really a comparison of first labels.
+    """
+    return (name or "").strip().split(".")[0].upper()
+
+
 class NetboxClient:
     def __init__(self, base_url, token):
         self.base_url = base_url.rstrip("/") if base_url else ""
@@ -56,6 +69,142 @@ class NetboxClient:
                 "Authorization": "Token {}".format(token),
                 "Accept": "application/json",
             })
+
+    # ---- request plumbing --------------------------------------------------
+    #
+    # A bare raise_for_status() gives "400 Client Error: Bad Request for url:
+    # ...", which says nothing about WHY. NetBox always explains itself in the
+    # response body:
+    #
+    #   {"device": ["Select a valid choice. ATL1-MUX-02 is not one of the
+    #    available choices."]}
+    #
+    # That body is the whole answer and it was being thrown away. Observed
+    # 2026-10-01: the reverse autotester reported a flat 400 on both ATL and
+    # DFW and there was no way to tell a bad filter from a device NetBox does
+    # not have under that name.
+
+    def _get_json(self, url, timeout=20):
+        """(data, error_string). Never raises."""
+        try:
+            r = self.session.get(url, timeout=timeout)
+        except Exception as e:
+            return None, "{}: {}".format(type(e).__name__, e)
+        if r.status_code >= 400:
+            detail = ""
+            try:
+                body = r.json()
+                if isinstance(body, dict):
+                    detail = "; ".join(
+                        "{}: {}".format(k, v[0] if isinstance(v, list) and v
+                                        else v)
+                        for k, v in body.items())
+                else:
+                    detail = str(body)[:300]
+            except Exception:
+                detail = (r.text or "")[:300]
+            return None, "HTTP {}{}".format(
+                r.status_code, " -- {}".format(detail) if detail else "")
+        try:
+            return r.json(), None
+        except Exception as e:
+            return None, "response was not JSON: {}: {}".format(
+                type(e).__name__, e)
+
+    def _paged(self, url, limit_pages=20):
+        """(results, error_string). Follows 'next'."""
+        results = []
+        pages = 0
+        while url and pages < limit_pages:
+            data, err = self._get_json(url)
+            if err:
+                return results, err
+            results.extend(data.get("results") or [])
+            url = data.get("next")
+            pages += 1
+        return results, None
+
+    def device_id_for(self, name):
+        """
+        (device_id, canonical_name, error) for a device name.
+
+        Filtering interfaces with `?device=<name>` makes NetBox validate the
+        name against its device list and return **HTTP 400** when it does not
+        match exactly -- not an empty result. So resolve the device first and
+        query by `device_id`, which cannot 400 on a name mismatch, and which
+        lets a name that simply is not in NetBox be reported as that instead
+        of as a protocol error.
+
+        Tries case-insensitive EXACT first, then case-insensitive contains,
+        so 'ATL1-MUX-02' still finds 'atl1-mux-02' without matching
+        'ATL1-MUX-02-SPARE' when an exact row exists.
+        """
+        import urllib.parse
+        if not self.ok() or not name:
+            return None, None, "NetBox not configured"
+        q = urllib.parse.quote(name, safe="")
+
+        # Tier 1: case-insensitive EXACT.
+        rows, err = self._paged(
+            "{}/api/dcim/devices/?name__ie={}&limit=500".format(
+                self.base_url, q))
+        if err:
+            return None, None, "device lookup failed (name__ie): {}".format(err)
+        if len(rows) == 1:
+            d = rows[0]
+            return d.get("id"), (d.get("name") or d.get("display")), None
+        if len(rows) > 1:
+            names = [r.get("name") or r.get("display") or "?" for r in rows]
+            return None, None, (
+                "{} devices in NetBox are named '{}': {}".format(
+                    len(rows), name, ", ".join(names[:8])))
+
+        # Tier 2: case-insensitive CONTAINS, then keep only rows whose
+        # HOSTNAME -- the part before the first dot -- is the name we want.
+        #
+        # NetBox stores these devices site-suffixed: LOC_TO_MUX says
+        # 'DFW1-MUX-04' and NetBox has 'dfw1-mux-04.dfw1'. A contains search
+        # therefore also returns every device whose name merely STARTS with
+        # it, which at DFW is three patch panels:
+        #
+        #   dfw1-mux-04-Panel-01.dfw1     <- panel, hostname differs
+        #   dfw1-mux-04-Panel-02.dfw1     <- panel
+        #   dfw1-mux-04-Panel-03.dfw1     <- panel
+        #   dfw1-mux-04.dfw1              <- THE MUX
+        #
+        # Comparing the first dot-label separates them exactly: the MUX's is
+        # 'dfw1-mux-04', a panel's is 'dfw1-mux-04-panel-01'. This is the same
+        # hostname-vs-FQDN rule used for GSX node names, and it does not
+        # depend on the word "Panel" or on device-role naming -- anything
+        # whose hostname is not the one asked for is simply not it.
+        rows, err = self._paged(
+            "{}/api/dcim/devices/?name__ic={}&limit=500".format(
+                self.base_url, q))
+        if err:
+            return None, None, "device lookup failed (name__ic): {}".format(err)
+        if not rows:
+            return None, None, "no device named '{}' in NetBox".format(name)
+
+        want_host = _first_label(name)
+        hostname_matches = [r for r in rows
+                            if _first_label(r.get("name") or r.get("display"))
+                            == want_host]
+        all_names = [r.get("name") or r.get("display") or "?" for r in rows]
+
+        if len(hostname_matches) == 1:
+            d = hostname_matches[0]
+            dname = d.get("name") or d.get("display")
+            return d.get("id"), dname, None
+        if len(hostname_matches) > 1:
+            hn = [r.get("name") or r.get("display") or "?"
+                  for r in hostname_matches]
+            return None, None, (
+                "{} devices in NetBox have hostname '{}': {}".format(
+                    len(hostname_matches), want_host, ", ".join(hn[:8])))
+        return None, None, (
+            "no device in NetBox has hostname '{}' -- {} name(s) contain it "
+            "but none matches: {}".format(
+                want_host, len(rows), ", ".join(all_names[:8])))
 
     def ok(self):
         return bool(self.base_url and self.session.headers.get("Authorization"))
@@ -87,19 +236,15 @@ class NetboxClient:
         # get truncated. We ALSO paginate (follow 'next') so that even if the
         # name filter is unsupported/ignored and the full list comes back, we
         # still retrieve every page rather than silently stopping at 500.
-        url = "{}/api/dcim/interfaces/?device={}&name__ic={}&limit=500".format(
-            self.base_url, hostname_1800, slot_port)
-        results = []
-        try:
-            pages = 0
-            while url and pages < 20:   # 20-page safety ceiling (10k ifaces)
-                r = self.session.get(url, timeout=20)
-                r.raise_for_status()
-                data = r.json()
-                results.extend(data.get("results", []))
-                url = data.get("next")
-                pages += 1
-        except Exception:
+        # device_id, not device=<name>: a name mismatch makes NetBox return
+        # HTTP 400 rather than an empty list (see device_id_for).
+        dev_id, _dev_name, _err = self.device_id_for(hostname_1800)
+        if not dev_id:
+            return None, None
+        url = ("{}/api/dcim/interfaces/?device_id={}&name__ic={}&limit=500"
+               .format(self.base_url, dev_id, slot_port))
+        results, err = self._paged(url)   # 20-page ceiling (10k ifaces)
+        if err:
             return None, None
 
         # Match ONLY the base OC facility interface: name is 'oc<rate>-tsX/Y'
@@ -120,15 +265,10 @@ class NetboxClient:
             # Can't tell which OC facility is the right one -- don't guess.
             return "__AMBIGUOUS__", None
 
-        iface = matches[0]
-        endpoints = iface.get("connected_endpoints") or []
-        if not endpoints:
-            return None, None
-        ep = endpoints[0]
-        sonet_path = ep.get("name") or ep.get("display")
-        dev = ep.get("device") or {}
-        mux_name = dev.get("name") or dev.get("display")
-        return sonet_path, mux_name
+        # Same fallback chain as the reverse direction (_far_end_detail):
+        # a cable recorded in NetBox whose PATH is unresolved used to read
+        # here as "no cable at all".
+        return self._far_end_of(matches[0])
 
     def sonet_to_oc(self, mux_name, sonet_iface):
         """
@@ -143,50 +283,210 @@ class NetboxClient:
         callers can treat "cannot tell" distinctly from "not found". Picking one
         of several would produce a complete, plausible, wrong route.
         """
-        if not self.ok() or not mux_name:
-            return None, None
+        d = self.sonet_to_oc_detail(mux_name, sonet_iface)
+        if d.get("ambiguous"):
+            return "__AMBIGUOUS__", None
+        return d.get("oc_name"), d.get("hub_hostname")
+
+    def sonet_to_oc_detail(self, mux_name, sonet_iface):
+        """
+        sonet_to_oc() with the reasoning attached:
+
+          {"oc_name", "hub_hostname", "source", "reason", "ambiguous",
+           "matched_name", "candidates"}
+
+        The two-value form collapses every failure to (None, None), which in
+        the reverse autotester printed as "NetBox has no cabled OC" even when
+        NetBox plainly had the cable and only the PATH was unresolved. The
+        operator needs to know which of those it was: one is a NetBox data-
+        entry job, the other is a cable-path/patch-panel job.
+        """
+        out = {"oc_name": None, "hub_hostname": None, "source": None,
+               "reason": None, "ambiguous": False, "matched_name": None,
+               "candidates": []}
+        if not self.ok():
+            out["reason"] = "NetBox is not configured or not reachable"
+            return out
+        if not mux_name:
+            out["reason"] = "no MUX name to look up"
+            return out
 
         # Accept 'SONET 0/13/1', 'sonet0/13/1' or a bare '0/13/1'.
         m = re.search(r'(\d+/\d+/\d+)', sonet_iface or "")
         if not m:
-            return None, None
+            out["reason"] = ("'{}' does not contain a slot/port like 0/13/1"
+                             .format(sonet_iface))
+            return out
         slot_port = m.group(1)
 
         import urllib.parse
-        url = ("{}/api/dcim/interfaces/?device={}&name__ic={}&limit=500"
-               .format(self.base_url,
-                       urllib.parse.quote(mux_name, safe=""),
-                       urllib.parse.quote(slot_port, safe="")))
-        results = []
-        try:
-            pages = 0
-            while url and pages < 20:
-                r = self.session.get(url, timeout=20)
-                r.raise_for_status()
-                data = r.json()
-                results.extend(data.get("results", []))
-                url = data.get("next")
-                pages += 1
-        except Exception:
-            return None, None
+        # Resolve the device to an id first: `?device=<name>` 400s on a name
+        # mismatch instead of returning nothing (see device_id_for).
+        dev_id, dev_name, dev_err = self.device_id_for(mux_name)
+        if not dev_id:
+            out["reason"] = dev_err or "device '{}' not found".format(mux_name)
+            return out
+        results, err = self._paged(
+            "{}/api/dcim/interfaces/?device_id={}&name__ic={}&limit=500"
+            .format(self.base_url, dev_id,
+                    urllib.parse.quote(slot_port, safe="")))
+        if err:
+            # The name filter is only an optimisation -- it keeps the result
+            # set small. If NetBox rejects it (unsupported lookup on this
+            # version, or the slashes upset it), fetch the device's full
+            # interface list and do the matching here, which is where the
+            # anchored match happens anyway.
+            out["source_note"] = (
+                "name filter rejected ({}), fell back to the full interface "
+                "list".format(err))
+            results, err = self._paged(
+                "{}/api/dcim/interfaces/?device_id={}&limit=500".format(
+                    self.base_url, dev_id))
+            if err:
+                out["reason"] = (
+                    "NetBox interface query failed for {}: {}".format(
+                        dev_name or mux_name, err))
+                return out
 
         # Anchor to end-of-string so '0/13/1' cannot also match '0/13/10'.
         # Same class of mistake as the unanchored CE match that produced the
         # LAXGSX04 wrong-circuit report.
         exact = re.compile(r'(?:^|[^\d])' + re.escape(slot_port) + r'$')
         matches = [i for i in results if exact.search((i.get("name") or ""))]
+        out["candidates"] = [i.get("name") for i in results if i.get("name")]
         if not matches:
-            return None, None
+            out["reason"] = (
+                "no interface named '{}' on {} in NetBox{}".format(
+                    slot_port, mux_name,
+                    " (device has: {})".format(
+                        ", ".join(out["candidates"][:12]))
+                    if out["candidates"] else
+                    " -- the device has no interface matching that at all"))
+            return out
         if len(matches) > 1:
-            return "__AMBIGUOUS__", None
+            out["ambiguous"] = True
+            out["reason"] = ("{} interfaces on {} match '{}': {}".format(
+                len(matches), mux_name, slot_port,
+                ", ".join(i.get("name") or "?" for i in matches)))
+            return out
 
-        eps = matches[0].get("connected_endpoints") or []
-        if not eps:
-            return None, None
-        ep = eps[0]
-        oc_name = ep.get("name") or ep.get("display")
-        dev = ep.get("device") or {}
-        return oc_name, (dev.get("name") or dev.get("display"))
+        iface = matches[0]
+        out["matched_name"] = iface.get("name")
+        far = self._far_end_detail(iface)
+        out["oc_name"] = far["name"]
+        out["hub_hostname"] = far["device"]
+        out["source"] = far["source"]
+        out["reason"] = far["reason"]
+        return out
+
+    # ---- reading the far end of a cable -----------------------------------
+    #
+    # `connected_endpoints` is NetBox's resolved PATH endpoint. It is only
+    # populated when the whole path is traceable and marked reachable, so it
+    # comes back empty for an interface that plainly has a cable in the UI --
+    # e.g. when the run crosses a patch panel whose front/rear mapping is
+    # incomplete, or the link is not in a 'connected' state.
+    #
+    # That is what produced "NetBox has no cabled OC for DFW1-MUX-04 0/13/1"
+    # on 2026-10-01 while NetBox's own interface list showed cable #25727 to
+    # ces01.dfw1 oc12-ts1/1.
+    #
+    # So fall back through every shape NetBox exposes, most-resolved first,
+    # and TELL THE CALLER which one answered -- a path endpoint and a raw
+    # cable peer are not equally strong evidence, and the report should not
+    # present them as if they were.
+
+    def _far_end_of(self, iface):
+        d = self._far_end_detail(iface)
+        return d["name"], d["device"]
+
+    def _far_end_detail(self, iface):
+        """
+        {"name","device","source","reason"} for the other end of this
+        interface's cable. name/device are None when nothing resolved, and
+        `reason` then says what WAS found -- cable id, peer count -- so the
+        failure is actionable instead of just negative.
+        """
+        out = {"name": None, "device": None, "source": None, "reason": None}
+
+        # 1. The resolved path endpoint -- strongest.
+        for ep in (iface.get("connected_endpoints") or []):
+            dev = ep.get("device") or {}
+            name = ep.get("name") or ep.get("display")
+            if name:
+                out.update(name=name,
+                           device=dev.get("name") or dev.get("display"),
+                           source="NetBox path endpoint")
+                return out
+
+        # 2. The far end of THIS cable. Resolves when the path is incomplete
+        #    but the cable itself is recorded -- a direct interface-to-
+        #    interface link that NetBox has not marked reachable.
+        for peer in (iface.get("link_peers") or []):
+            dev = peer.get("device") or {}
+            name = peer.get("name") or peer.get("display")
+            if name and (dev.get("name") or dev.get("display")):
+                out.update(name=name,
+                           device=dev.get("name") or dev.get("display"),
+                           source="NetBox cable peer (path not resolved)")
+                return out
+
+        # 3. Read the cable object itself and take whichever termination is
+        #    not this interface.
+        cable = iface.get("cable")
+        cable_id = cable.get("id") if isinstance(cable, dict) else cable
+        if cable_id:
+            peer = self._cable_far_termination(cable_id, iface.get("id"))
+            if peer:
+                name, devname = peer
+                out.update(name=name, device=devname,
+                           source="NetBox cable #{} terminations".format(
+                               cable_id))
+                return out
+            out["reason"] = (
+                "interface '{}' has cable #{} in NetBox but neither a "
+                "resolved path endpoint, a cable peer, nor a readable far "
+                "termination -- the cable path is probably incomplete "
+                "(patch panel front/rear mapping, or link not marked "
+                "connected)".format(iface.get("name"), cable_id))
+            return out
+
+        out["reason"] = ("interface '{}' exists in NetBox but has no cable "
+                         "recorded on it".format(iface.get("name")))
+        return out
+
+    def _cable_far_termination(self, cable_id, this_iface_id):
+        """(name, device_name) of the cable end that is not this_iface_id."""
+        try:
+            r = self.session.get("{}/api/dcim/cables/{}/".format(
+                self.base_url, cable_id), timeout=20)
+            r.raise_for_status()
+            cab = r.json()
+        except Exception:
+            return None
+
+        groups = []
+        # NetBox 3.3+ : a_terminations / b_terminations (lists)
+        for key in ("a_terminations", "b_terminations"):
+            groups.extend(cab.get(key) or [])
+        # Older: termination_a / termination_b (single objects)
+        for key in ("termination_a", "termination_b"):
+            t = cab.get(key)
+            if t:
+                groups.append({"object": t})
+
+        for t in groups:
+            obj = t.get("object") or t
+            if not isinstance(obj, dict):
+                continue
+            if this_iface_id is not None and obj.get("id") == this_iface_id:
+                continue      # this is our own end
+            dev = obj.get("device") or {}
+            name = obj.get("name") or obj.get("display")
+            devname = dev.get("name") or dev.get("display")
+            if name and devname:
+                return name, devname
+        return None
 
     def device_interface_descriptions(self, hostname):
         """
@@ -205,8 +505,13 @@ class NetboxClient:
             return [], "no hostname"
 
         import urllib.parse
-        url = "{}/api/dcim/interfaces/?device={}&limit=500".format(
-            self.base_url, urllib.parse.quote(hostname, safe=""))
+        # device_id, not device=<name>: see device_id_for -- a name mismatch
+        # makes NetBox answer HTTP 400, not an empty list.
+        _did, _dname, _derr = self.device_id_for(hostname)
+        if not _did:
+            return [], (_derr or "device '{}' not in NetBox".format(hostname))
+        url = "{}/api/dcim/interfaces/?device_id={}&limit=500".format(
+            self.base_url, _did)
         out, pages = [], 0
         try:
             while url and pages < 20:

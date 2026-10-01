@@ -61,7 +61,7 @@ app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v2.24"
+APP_VERSION = "v2.35"
 
 
 @app.context_processor
@@ -387,16 +387,37 @@ def api_reverse_autotester_run():
     if not (infra_user and infra_pass and gsx_user and gsx_pass):
         return jsonify(
             error="Infrastructure and GSX credentials are both required."), 400
+    # The reverse form reuses the names 'add_jira'/'jira_ticket' (its element
+    # IDs are prefixed 'rev' so they stay unique on the page). Only the
+    # submitted form's own fields are posted, so _parse_jira reads the right
+    # ones without a second set of keys.
+    jira_ticket, err = _parse_jira(f)
+    if err:
+        return jsonify(error=err), 400
+
+    # Same saved-webhook behaviour as the forward run: a value typed here is
+    # saved and becomes the default for both cards.
+    cfg = secure_config.load_config_silent()
+    slack_webhook = (f.get("slack_webhook") or "").strip() or cfg.get("SLACK_WEBHOOK", "")
+    if (f.get("slack_webhook") or "").strip():
+        secure_config.save_config_key("SLACK_WEBHOOK", slack_webhook)
 
     params = {
         "gsx_ip": gsx_ip, "t1_id": t1_id,
         "username": infra_user, "password": infra_pass,
         "gsx_user": gsx_user, "gsx_pass": gsx_pass,
+        "jira_ticket": jira_ticket,
+        "slack_webhook": slack_webhook,
         "open_when_done": f.get("rev_open_when_done") == "on",
+        # Checked by default in the form, so an absent key means the user
+        # actively unticked it.
+        "analyze": f.get("rev_analyze") == "on",
     }
     # Nine hops across four device types; give it the same headroom a
-    # multi-DS1 forward run gets rather than the single-DS1 default.
-    job_id = _launch_job(gsx_ip, _warn_after(4),
+    # multi-DS1 forward run gets rather than the single-DS1 default. With
+    # analysis on it then runs a whole forward autotester as well, walking
+    # every device a second time -- so roughly double again.
+    job_id = _launch_job(gsx_ip, _warn_after(8 if params["analyze"] else 4),
                          lambda: reverse_autotester.run(params))
     return jsonify(job_id=job_id)
 

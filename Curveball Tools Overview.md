@@ -20,6 +20,7 @@ Troubleshooting a circuit today means logging into each device in the path separ
 
 **Circuit tracing**
 - **Autotester** — full end-to-end T1 trace across all four hops; the core tool everything else builds on.
+- **Reverse Autotester** — the same trace walked backwards: start at a GSX T1 and resolve inward to the customer DS1 on the 1250. For when a GSX alarm is all you have and nobody knows which circuit it is. Shares the Autotester page rather than having its own.
 - **Site Sweep** — fast triage: checks every DS1 on a 1250 at once (no route trace) to see what's clean vs. worth a full Autotester run.
 - **Morning Check** — batch-runs Autotester (plus fiber/OSPF/LDP checks) across every open ticket assigned to the user; posts to JIRA and Slack automatically.
 

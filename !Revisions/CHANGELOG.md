@@ -15,6 +15,938 @@ that's bitten this project before.
 
 ---
 
+## v2.35 — 2026-10-01
+
+### Reverse Autotester gets the full PM/diagnostic pass -- by chaining the forward tool
+
+The reverse trace resolved routes but stopped there: no PMs, no diagnostic
+summary, no run summary line. Those all exist and are proven in
+`autotester_standalone`.
+
+**The reverse trace now hands its answer to the forward tool.** Only the
+ENDPOINT crosses over -- the 1250 address and the DS1:
+
+```python
+fwd_params = {"ip_1250": ctx["remote_tpe"], "ds1_list": [ctx["ds1_1250"]], ...}
+```
+
+Not the MUSE, not the OC sub-channel, not the ACR, CEM, T3 or GSX assignment.
+The forward run re-derives every one of those from the 1250 end using none of
+the reverse trace's lookups.
+
+#### Which makes it a check, not just a continuation
+
+Two independent derivations of one route, from opposite ends. If the forward
+walk starts at `ts1/27` and arrives back at the GSX T1 the operator typed, the
+reverse trace is confirmed by a path sharing none of its evidence:
+
+```
+  [ OK ] ROUTE CONFIRMED -- the forward walk from MDLDTXMU542 ts1/27
+         independently derived the same GSX T1 (DFWGSX04 6-1-23), sharing none
+         of this trace's lookups.
+```
+
+If it arrives somewhere else, that is worth more than either report alone:
+
+```
+  [ !! ] ROUTE CONFLICT -- the forward walk from MDLDTXMU542 ts1/27 did NOT
+         come back to the GSX T1 this trace started from:
+           T1        reverse started at '23', forward derived '28'
+           One of the two routes is wrong. Do not act on either until this is
+           settled.
+```
+
+Same port, wrong T1 is precisely the LAXGSX04 failure mode from September --
+a complete, plausible, wrong answer. This is the first mechanism in the
+project that can catch it.
+
+#### Confirmation requires every field
+
+`confirm_route()` returns confirmed only when all four of node/slot/port/T1
+were compared AND matched.
+
+**A bug caught while testing:** the first version returned `not differ and
+agree`, so a run where only the node and slot came back scored as confirmed --
+with the T1, the actual identity of the circuit, never compared, and "route
+confirmed" printed on the ticket. Anything unchecked is now explicitly not
+confirmation, and `[ -- ] ROUTE PARTLY CONFIRMED` names which fields were
+missing.
+
+Zero-padding and FQDNs are not conflicts (`06` == `6`, `dfwgsx04.bandwidth.com`
+== `DFWGSX04`, reusing `node_names_match`). ACR and CEM are also derived twice;
+a disagreement there is printed even when the T1 agrees, but does not by itself
+overturn the verdict -- the GSX T1 is the circuit's identity.
+
+#### Output
+
+One combined report, one post. The forward run's own JIRA, Slack and
+auto-open are suppressed -- otherwise the same run produces two half-reports.
+Appended after the trace: the confirmation verdict, the forward RUN SUMMARY,
+then its full diagnostic summary and route block. The verdict also goes in the
+shared JIRA/Slack summary, because "a second walk disagrees about which circuit
+this is" belongs at the top of a ticket, not in an appendix.
+
+#### Costs, stated plainly
+
+Every device is walked twice, so runtime roughly doubles and the GSX is
+visited twice (read-only both times). The hung-job threshold doubles to match.
+A **"Pull PMs & diagnostics once the route resolves"** checkbox, ticked by
+default, turns it off for route-resolution-only runs. The CLI prompts for the
+same.
+
+If the forward pass fails, the resolved route is still reported -- the failure
+is named as a diagnostic failure, not a trace failure:
+
+```
+  FORWARD ANALYSIS FAILED
+  RuntimeError: 1250 unreachable
+  The route above still resolved -- only the PM/diagnostic pass failed.
+```
+
+`CredentialError` still propagates rather than being absorbed into that.
+
+#### Handback
+
+`autotester_standalone`'s `_extra_out` already existed for `morning_check`;
+it now also returns `mux_results`, `host_1250`, `ds1_map` and `run_summary`.
+Purely additive and still a no-op unless a caller passes the key, so the web
+route and CLI are untouched -- and the comparison reads structured fields
+rather than scraping `route_diag` text.
+
+#### One deliberate break from v2.26
+
+The cards are no longer field-identical: the reverse card has eleven inputs to
+the forward card's ten. The extra one is "pull PMs & diagnostics", which has
+no meaning on the forward card -- that card IS the forward run. Noted rather
+than papered over.
+
+#### Tests
+
+Eleven self-tests on `confirm_route` (full agreement, zero-padding/FQDN,
+wrong T1, wrong chassis, partial, empty, `?` placeholders, ACR/CEM drift, and
+all three summary headline states) plus five end-to-end chain tests with the
+forward run stubbed: agreement, conflict, forward raising, `CredentialError`
+propagating, and `analyze=False` skipping the chain. The agreement test
+asserts from inside the stub that only the endpoint was handed over and that
+JIRA/Slack/auto-open were suppressed.
+
+---
+
+## v2.34 — 2026-10-01
+
+### Reverse Autotester proven end to end on live devices
+
+```
+  [ OK ] GSX T1 identifier          shelf 1 slot 6 port 1 T1 23
+  [ OK ] GSX                        DFWGSX04 (x.x.x.x) via login prompt
+  [ OK ] MUX identity               DFW1-MUX-04 (x.x.x.x) via LOC_TO_MUX (hardcoded)
+  [ OK ] MUX T3 controller          controller T3 8/1/12 (description
+                                    'DFWGSX04-6-1', t1 23 cem-group 123)
+  [ OK ] GSX-facing CE interface    CE8/1/12 (confirmed by reading its
+                                    description back)
+  [ OK ] ACR / CEM                  ACR 26 CEM 723 -> STS 7 DS1 23
+  [ OK ] ACR -> SONET               working 0/7/1 / protect 0/13/1 /
+                                    active 0/13/1   << ON PROTECT
+  [ OK ] SONET -> 1800 OC           oc12-ts1/1 on ces01.dfw1
+                                    (via NetBox path endpoint)
+  [ OK ] 1800 sub-channel -> 1250   MUSE_972 -> 1250 (label
+                                    542_ODSSTXEM3ED_911)
+  [ OK ] 1250 DS1                   MDLDTXMU542  ds1-ts1/27  (MUSE_972)
+```
+
+Nine hops, GSX T1 to customer DS1. The circuit landed on **MDLDTXMU542** --
+the same 1250 whose FORWARD run was root-caused through three ACR-lookup bugs
+earlier today (v2.21-v2.24). Forward and reverse now agree on it from opposite
+ends, which is the strongest check available that either one is right.
+
+#### Documentation caught up
+
+The module docstring still carried:
+
+> ⚠ THE PER-HOP PARSERS ARE TESTED; THIS ORCHESTRATION IS NOT yet proven
+> against live devices.
+
+True when written this morning, false now, and a stale warning is worse than
+none -- it trains readers to ignore the warnings that still matter. Replaced
+with what the live runs established, plus the one-line-per-release list of what
+each of v2.27-v2.33 actually fixed.
+
+Every one of those was a **lookup** failure -- a wrong command, a wrong NetBox
+filter, a missing attribute -- and not one was in the walk itself. That is
+worth recording: the per-hop-outcome design is what made six rounds of this
+tractable. Each live run named exactly one more wrong assumption instead of
+producing a traceback, and the next run started from the hop after.
+
+The Overview also had no entry for the tool at all (it is deliberately absent
+from `TOOL_URLS`, since it shares the Autotester page rather than having its
+own, so it never appeared on the home-page list either). Added.
+
+---
+
+## v2.33 — 2026-10-01
+
+### Patch panels were being counted as MUX candidates
+
+v2.32's clearer error paid off immediately:
+
+```
+  [ !! ] SONET -> 1800 OC   no device named exactly 'DFW1-MUX-04' in NetBox;
+         4 names contain it: dfw1-mux-04-Panel-01.dfw1,
+         dfw1-mux-04-Panel-02.dfw1, dfw1-mux-04-Panel-03.dfw1,
+         dfw1-mux-04.dfw1
+```
+
+So the MUX **is** in NetBox. Two things were in the way:
+
+1. NetBox stores it **site-suffixed** -- `dfw1-mux-04.dfw1` -- while
+   `LOC_TO_MUX` holds the bare hostname `DFW1-MUX-04`, so the exact match
+   missed.
+2. The contains fallback then returned the MUX **and its three patch panels**,
+   and "more than one" was treated as unresolvable.
+
+#### Fix: compare hostnames, not whole names
+
+Among contains-matches, keep only those whose **first dot-label** is the
+hostname asked for:
+
+```
+  dfw1-mux-04-Panel-01.dfw1  ->  DFW1-MUX-04-PANEL-01    no
+  dfw1-mux-04-Panel-02.dfw1  ->  DFW1-MUX-04-PANEL-02    no
+  dfw1-mux-04-Panel-03.dfw1  ->  DFW1-MUX-04-PANEL-03    no
+  dfw1-mux-04.dfw1           ->  DFW1-MUX-04             yes
+```
+
+This is the same hostname-vs-FQDN rule already used for GSX node names
+(`node_names_match`, v2.28), now shared as `_first_label()`.
+
+**It does not key on the word "Panel"** or on device-role naming. A panel is
+excluded because its hostname is not the one being asked for -- which is also
+true of any other child device, spare, or sub-chassis that happens to share
+the prefix. Pattern-matching "Panel" would have worked today and broken on the
+next naming convention.
+
+Tier order is now: case-insensitive exact, then contains narrowed by hostname.
+An exact hit still short-circuits -- verified that the contains query is not
+even issued in that case.
+
+#### Still refuses where it should
+
+- Only panels match -> `no device in NetBox has hostname 'DFW1-MUX-04' -- 3
+  name(s) contain it but none matches: ...` (names them, so a naming change is
+  visible)
+- Two devices with the same hostname in different domains -> `2 devices in
+  NetBox have hostname 'DFW1-MUX-04': dfw1-mux-04.dfw1, dfw1-mux-04.dfw2` --
+  refuses, because that is a genuine ambiguity about which site's MUX is meant
+- An FQDN passed IN still resolves, so callers may hold either form
+
+#### Tests
+
+Built on the verbatim four-row NetBox result from the DFW search: the MUX
+resolves to id 104 and the interface query is issued against **104, not a
+panel**; panels alone do not resolve; exact match short-circuits; same-hostname
+duplicates refuse; an FQDN input works; `_first_label` is pinned on six inputs
+including None; and ATL's two-row equivalent resolves the same way.
+
+#### Worth noting
+
+`LOC_TO_MUX` is what has carried every hop before this one -- hardcoded
+addresses that were right while NetBox lookups by name could not work at all.
+The hardcoded-first, NetBox-second order (v2.21) is why the reverse tool got as
+far as hop 7 on the first live run instead of failing at hop 2.
+
+---
+
+## v2.32 — 2026-10-01
+
+### The NetBox 400, and why `?device=<name>` was the wrong filter
+
+v2.31 replaced "NetBox has no cabled OC" with the real reason, and the real
+reason turned out to be an HTTP error that had been swallowed all along --
+identically at both sites:
+
+```
+  [ !! ] SONET -> 1800 OC   NetBox query failed: HTTPError: 400 Client Error:
+         Bad Request for url: .../api/dcim/interfaces/?device=ATL1-MUX-02&
+         name__ic=0%2F7%2F2&limit=500
+```
+
+Both ATL and DFW, same shape. Everything up to hop 7 resolved cleanly on both
+-- so this was never about those circuits.
+
+#### Cause
+
+`?device=<name>` makes NetBox **validate the name against its device list**.
+A name that does not match exactly produces:
+
+```json
+{"device": ["Select a valid choice. ATL1-MUX-02 is not one of the available choices."]}
+```
+
+with **HTTP 400** -- not an empty result set. So a MUX recorded under a
+different case or a slightly different name fails as a protocol error rather
+than as "not found", and every caller treated it as a dead end.
+
+#### Fix
+
+**Resolve the device to an id first, then query `?device_id=<id>`.** An id
+cannot 400 on a name mismatch. `device_id_for()` tries case-insensitive exact
+(`name__ie`) and falls back to contains (`name__ic`), so `ATL1-MUX-02` finds
+`atl1-mux-02` without silently matching `ATL1-MUX-02-SPARE` when an exact row
+exists. Both directions now use it -- `oc_to_sonet()` had the same filter and
+the same latent failure.
+
+**And stop throwing away NetBox's explanation.** `raise_for_status()` yields
+"400 Client Error: Bad Request for url: ..." while the response *body* names
+the offending field. New `_get_json()` returns `(data, error)` and formats
+that body:
+
+```
+  device lookup failed (name__ie): HTTP 400 -- device: Select a valid choice.
+  ATL1-MUX-02 is not one of the available choices.
+```
+
+Falls back to raw text for non-JSON bodies, so a proxy's HTML 502 still says
+`HTTP 502 -- <html>502 Bad Gateway...` instead of nothing.
+
+**The name filter is now optional.** It only exists to keep the result set
+small. If NetBox rejects `name__ic` on this version, the lookup refetches the
+device's full interface list and matches locally -- which is where the
+end-anchored match already happened. Verified that `0/7/2` still excludes
+`0/7/20` on that path, and that the note says the fallback was used.
+
+#### Distinguishable outcomes
+
+Each sends the operator somewhere different, so each reads differently now:
+
+| Condition | Reported as |
+|---|---|
+| NetBox rejected the query | the field and message NetBox returned |
+| name absent | `no device named 'ATL1-MUX-02' in NetBox` |
+| no exact, several partial | `no device named exactly '...'; 2 names contain it: ATL1-MUX-02, ATL1-MUX-02-SPARE` |
+| duplicate exact names | `2 devices in NetBox are named 'ATL1-MUX-02': ...` |
+| device fine, interface absent | `no interface named '0/7/2' on ... (device has: ...)` |
+| interface fine, path unresolved | the v2.31 cable-path message |
+
+#### Tests
+
+`device_interface_descriptions()` carried the same `?device=<name>` filter
+and was switched over too -- it is what the circuit audit and IXC check read,
+so the same 400 was waiting there. A grep now confirms no interface query
+filters by device NAME anywhere in the module.
+
+#### Tests
+
+Twelve cases against a stubbed session: the verbatim NetBox 400 body, device
+absent, case-only difference, exact-miss-then-contains, partial collisions,
+duplicate exact names, a 400 on the interface query, a non-JSON 502, the
+name-filter fallback (including that it still excludes `0/7/20`), both
+queries failing, the untouched happy path, the forward direction, and
+`device_interface_descriptions` both resolving by id and reporting an absent
+device.
+
+#### Note
+
+This says nothing yet about whether these MUXes are in NetBox at all. The next
+run will distinguish "NetBox rejected the name" from "no device named that" --
+and if it is the latter, the fix is NetBox data, not code. `LOC_TO_MUX`
+already had the right addresses hardcoded, which is why every hop before this
+one worked.
+
+---
+
+## v2.31 — 2026-10-01
+
+### "NetBox has no cabled OC" was wrong -- NetBox had the cable
+
+Fourth live reverse run reached hop 7 and stopped:
+
+```
+  [ OK ] ACR / CEM          ACR 26 CEM 723 -> STS 7 DS1 23
+  [ OK ] ACR -> SONET       working 0/7/1 / protect 0/13/1 / active 0/13/1  << ON PROTECT
+  [ !! ] SONET -> 1800 OC   NetBox has no cabled OC for DFW1-MUX-04 0/13/1
+```
+
+NetBox's own interface list for that device, same moment: interface `0/13/1`,
+**cable #25727**, far end `ces01.dfw1 > oc12-ts1/1`. The message was simply
+false.
+
+#### Cause
+
+Both directions read only `connected_endpoints`. That is NetBox's resolved
+**path** endpoint -- populated only when the entire cable path is traceable
+and marked reachable. A cable that crosses a patch panel with incomplete
+front/rear mapping, or a link not marked connected, has a cable but no
+resolved path, so `connected_endpoints` is empty while the UI shows the
+connection perfectly well.
+
+#### Fix: read every shape NetBox exposes, strongest first
+
+`_far_end_detail()` now falls through:
+
+1. `connected_endpoints` -- the resolved path. *"NetBox path endpoint"*
+2. `link_peers` -- the far end of this cable. *"NetBox cable peer (path not
+   resolved)"*
+3. the cable object itself -- `GET /api/dcim/cables/<id>/`, taking whichever
+   termination is **not** this interface. Handles both the 3.3+
+   `a_terminations`/`b_terminations` lists and the older
+   `termination_a`/`termination_b` singles. *"NetBox cable #25727
+   terminations"*
+
+**The source travels with the answer.** A traced path and a raw cable peer are
+not equally strong evidence and the report does not pretend otherwise:
+
+```
+  [ OK ] SONET -> 1800 OC   oc12-ts1/1 on ces01.dfw1   (via NetBox cable peer
+                            (path not resolved))
+```
+
+and a note rides to JIRA/Slack saying the cable is recorded but the path is
+incomplete -- the trace succeeded, the NetBox data still needs fixing.
+
+Both directions get this. `oc_to_sonet()` had the identical blind spot, so a
+forward run could have reported no cable for a cabled OC too; it just had not
+been hit yet.
+
+#### Failures now say WHICH failure
+
+`(None, None)` collapsed three unrelated situations into one message, and they
+send the operator to three different places. `sonet_to_oc_detail()` returns
+the reasoning, so the hop reports it:
+
+- `no interface named '0/13/1' on DFW1-MUX-04 in NetBox (device has: 0/13/10,
+  0/13/11)` -- a data-entry job, and it shows what IS there so a naming
+  mismatch is obvious at a glance
+- `interface '0/13/1' exists in NetBox but has no cable recorded on it` --
+  also data entry, different field
+- `interface '0/13/1' has cable #25727 but neither a resolved path endpoint, a
+  cable peer, nor a readable far termination -- the cable path is probably
+  incomplete (patch panel front/rear mapping, or link not marked connected)`
+  -- a cable-path job, not a data-entry one
+
+`sonet_to_oc()` keeps its two-value contract, including `__AMBIGUOUS__`.
+
+#### Tests
+
+Nine cases against a stubbed NetBox session: all three resolution sources,
+both cable-object shapes, cable-present-but-unreadable, interface-without-
+cable, interface-absent, ambiguous, and the forward direction. Two specific
+assertions worth naming -- the cable reader skips **our own** termination
+rather than reporting the MUX interface back as its own far end, and
+end-anchoring still holds so `0/13/1` does not match `0/13/10`.
+
+---
+
+## v2.30 — 2026-10-01
+
+### The T3 duplicate was three, not two -- and the tiebreak is provisioning
+
+pcapps pulled the actual config off DFW1-MUX-04, which settled v2.29's open
+question and exposed two wrong assumptions of mine.
+
+```
+DFW1-MUX-04#show run | i DFWGSX04-6-1
+ description DFWGSX04-6-1
+ description DFWGSX04-6-1
+ description DFWGSX04-6-1          <- THREE, not two
+
+DFW1-MUX-04#show run | b controller T3 0/11/12
+controller T3 0/11/12
+ description DFWGSX04-6-1
+ framing m13
+ cablelength short
+!                                   <- no cem-groups. described, never provisioned
+
+DFW1-MUX-04#show run | b controller T3 8/1/12
+controller T3 8/1/12
+ description DFWGSX04-6-1
+ framing m13
+ t1 1 cem-group 101 unframed        <- THIS one carries circuits
+ t1 2 cem-group 102 unframed
+```
+
+#### Wrong assumption 1: the command
+
+The hop used `show run | b <description>`, which begins output **at the
+description line** -- so the `controller T3` header owning the first of the
+three sits above the dump. `parse_t3_controller_descriptions` correctly
+refuses to attribute an ownerless description, which means that controller was
+**invisible**, and a three-way duplicate was reported as a two-way one. The
+parser was right; the command feeding it was not.
+
+`| section <description>` is no alternative: on this platform it printed three
+bare description lines, i.e. it behaves like `| include`, not like IOS's
+print-the-whole-block. Both of these were recorded in this file as usable.
+They are now recorded as not.
+
+The only reliable form begins at a **controller header** --
+`show run | b controller T3` (now `mux4216_client.T3_CONFIG_CMD`). Every block
+in that output carries its own header, so nothing can be ownerless.
+
+#### Wrong assumption 2: that the description could settle it
+
+v2.29 narrowed candidates by reading each controller's description back off
+the device. But 0/11/12 **has** the description -- it confirms just as readily
+as the real one. That check could never have separated them, which is why both
+"confirmed" and the hop stopped.
+
+The description is `NODE-slot-port`: **per-port**, covering all 28 DS1s. The
+question is **per-DS1**. The config carries exactly the right key:
+
+```
+ t1 23 cem-group 123 unframed
+```
+
+So `t3_for_gsx_t1()` now keeps the controllers with a matching description
+**and a cem-group for this specific T1**. No extra command -- it is in the
+config text already pulled.
+
+```
+  [ OK ] MUX T3 controller   controller T3 8/1/12 (description 'DFWGSX04-6-1',
+                             t1 23 cem-group 123)  [see note]
+
+  note: 3 controllers are described 'DFWGSX04-6-1'; chose T3 8/1/12 because it
+        is the only one with a cem-group for t1 23 -- 1 described but
+        unprovisioned (0/11/12); 1 provisioned for other T1s only (8/1/11)
+```
+
+The note names what was ruled out and why, so the answer is auditable rather
+than asserted. It rides along to JIRA/Slack: the trace resolved, but three
+duplicate descriptions on one MUX port are still a config problem worth
+fixing.
+
+The remaining genuine-ambiguity cases keep their refusal, now stated in terms
+that can actually be acted on: no controller provisioned for this T1 (listing
+which T1s each one *does* carry), or two provisioned for the same T1 -- a real
+duplicate, which stays a human decision.
+
+#### Free bonus: a third source for the CEM
+
+Hop 3 now reads `cem-group 123` out of the running-config, and hop 5 reads the
+CEM off the **live** xconnect. Those are config vs forwarding state, so they
+should agree. If they do not, the walk continues with the live value -- that is
+what is carrying traffic -- and says so:
+
+```
+  [!!] CEM drift on T3 8/1/12: running-config says t1 23 cem-group 123, the
+       live xconnect says 223 -- continuing with the live value
+```
+
+#### Tests
+
+Eleven self-tests built on the verbatim DFW1-MUX-04 blocks, with the third
+controller `| b <desc>` had been hiding restored. They pin: an unprovisioned
+controller parses to zero cem-groups; all three duplicates are now visible;
+t1 23 resolves to 8/1/12 and t1 5 to 8/1/11 from the *same* description; a T1
+provisioned nowhere resolves to nothing; two controllers provisioned for the
+same T1 refuse to choose; and an ownerless leading description stays
+unattributed.
+
+Hops 3 through 5 were also driven end to end against a fake MUX.
+
+#### One near-miss worth recording
+
+While testing, hop 5's `CE(\d+):(\d+)` looked like a bug -- it cannot match
+`CE8/1/12:123`. It is not: a real `show xconnect all` line carries BOTH the
+ACR-side token as plain digits (`CE16:123`) and the GSX-side slashed interface
+(`CE8/1/12:123`), and that regex deliberately selects the ACR side. My test
+fixture only had the GSX token. The fixture was wrong, not the code -- recorded
+here because the same misreading would otherwise be made again.
+
+---
+
+## v2.29 — 2026-10-01
+
+### Duplicate T3 descriptions: narrow against the device instead of refusing
+
+Third live reverse run got two hops further and then:
+
+```
+  [ OK ] GSX              DFWGSX04 (x.x.x.x) via login prompt
+  [ OK ] MUX identity     DFW1-MUX-04 (x.x.x.x) via LOC_TO_MUX (hardcoded)
+  [ !! ] MUX T3 controller  more than one T3 controller is described as
+                            'DFWGSX04-6-1' -- refusing to pick
+```
+
+The refusal was correct -- picking one of two would be the LAXGSX04
+wrong-circuit bug again -- but it was **blind**. It did not say how many, or
+which, or what to go look at. And it matches the ATL1-MUX-02 capture from
+earlier today, where `show run | i ATLGSX02-11-1` returned the description
+three times across controllers 0/8/46 and 0/8/47: duplicate
+`NODE-slot-port` descriptions are a real condition on this fleet, not a
+one-off.
+
+#### Don't guess, don't give up -- ask the device
+
+Hop 3 now enumerates every candidate, then puts each one through the **same CE
+interface verification hop 4 already uses**: read the controller's description
+back off the device. A T3 whose CE interface does not confirm is not carrying
+this circuit.
+
+Three outcomes:
+
+**One survives** -- the ambiguity was in the config text, not the hardware. The
+walk continues and says so:
+
+```
+  [ OK ] MUX T3 controller    controller T3 0/8/46 (description 'DFWGSX04-6-1')
+                              -- narrowed from 2 controllers with the same
+                              description (0/8/46, 0/8/47) by verifying each on
+                              the device
+  [ OK ] GSX-facing CE iface  CE8/0/46 (confirmed while narrowing the T3
+                              candidates)
+```
+
+**Several survive** -- a genuine provisioning duplicate, which is a human
+decision, so it stops and hands over everything it knows:
+
+```
+  [ !! ] 2 T3 controllers are described as 'DFWGSX04-6-1': 0/8/46, 0/8/47.
+         2 of them confirmed a CE interface (T3 0/8/46 -> CE8/0/46, T3 0/8/47
+         -> CE8/0/47) -- a provisioning duplicate, not something this tool
+         should pick between. Check `show run | i DFWGSX04-6-1` on DFW1-MUX-04.
+```
+
+**None survive** -- then the hop's own premise is suspect, and it says that
+rather than blaming the data: *"none of them confirmed a CE interface, so the
+description may not mean what this hop assumes."*
+
+#### No extra device work
+
+The winner's CE interface was already confirmed during narrowing, so hop 4
+reuses it instead of re-issuing the same commands. Asserted in the tests: four
+verify commands for two candidates (two name forms each), and none after hop 4
+begins.
+
+#### The note travels
+
+`t3_ambiguity_resolved` is appended to the shared summary, so a narrowed run
+carries the duplicate-description finding into JIRA and Slack. The trace
+succeeded, but the config behind it still needs fixing, and that should not
+live only in a console log somebody closed.
+
+#### Contract
+
+`t3_for_gsx_assignment()` is unchanged -- still `(None, '__AMBIGUOUS__')` for
+its existing caller. The new `t3_candidates_for_gsx_assignment()` returns every
+match, sorted by controller id. Five self-tests pin both, including that `6-1`
+still does not match `6-10`.
+
+All three outcomes were driven with a fake MUX, plus a fourth case asserting
+the single-candidate path is byte-for-byte what it was before.
+
+---
+
+## v2.28 — 2026-10-01
+
+### Forward autotester: the GSX identity is now cross-checked against the device
+
+v2.27 gave `GSXClient` a `hostname` read from its own login prompt. That makes
+the GSX node name available from **two independent sources** on every forward
+run:
+
+| Source | Where it comes from |
+|---|---|
+| MUX port description | `description ATLGSX02-11-1` on the T3 controller |
+| The GSX itself | the login prompt, `ATLGSX02>` |
+
+Until now only the first was used, and never checked. Comparing them is the
+project's core mechanism applied to a fact it had been taking on trust.
+
+**What a disagreement means:** the box we just logged into is not the box the
+MUX says this circuit lands on. Either the MUX description is stale, or
+NetBox's mgmt IPs for the derived device name point at the wrong device. Either
+way the PMs about to be pulled belong to **a different T1 on a different
+chassis**, and a clean result would be meaningless -- the worst kind of false
+pass, because nothing else in the run looks wrong.
+
+#### Three states, not two
+
+`gsx_name_verdict` is `confirmed` / `unconfirmed` / `conflict`. "The device did
+not name itself" and "the device named itself as something else" are different
+findings:
+
+- **confirmed** -- route block reads `Node : DFWGSX04   (confirmed by the
+  device itself)`. Stated as a positive fact, not left implied by the absence
+  of a warning.
+- **unconfirmed** -- a gap, not a contradiction. Verdict stays "completed
+  successfully", with a `NOTE:` on the summary line.
+- **conflict** -- verdict becomes **"The test completed with errors"**, so the
+  web UI's rollup badge flags it (verified through `app._scan_run_summary`).
+
+#### Where it shows up
+
+All three places a reader might stop:
+
+```
+RUN SUMMARY
+  TS3/8  --  The test completed with errors  |  1250: ... |  NAME CONFLICT: MUX
+  description says 'DFWGSX04', the device at x.x.x.x calls itself 'DFWGSX09' --
+  these counters are DFWGSX09's
+
+HOP 4 -- GSX
+    Node       : DFWGSX04   <-- MUX description; the device at this IP says 'DFWGSX09'
+
+         GSX  --  DFWGSX09  (x.x.x.x)  (current 15 min / 24 hr)
+  [ !! ] NAME CONFLICT: ... these counters are DFWGSX09's
+```
+
+Two deliberate choices there.
+
+**The diagnostic block header is labelled with the DEVICE's name on a
+conflict**, not the MUX-derived one. The counters came off the box we logged
+into; naming them after the box the MUX expected would be an active mislabel --
+which is the exact fault being reported.
+
+**The route block names both.** That block is what an engineer copies commands
+out of, so a disagreement about *which chassis* has to be on the line itself,
+not left to the diagnostic summary further down.
+
+#### It does not abort
+
+The pull is read-only and the operator still wants to see what is there. The
+run continues and reports; it just refuses to present the result as a pass or
+to label the counters with a name the device contradicts.
+
+#### Comparison rule
+
+`node_names_match()` compares the first dot-label, case-insensitively, so
+`ATLGSX02` and `atlgsx02.bandwidth.com` are the same node. It normalises
+nothing else -- any other difference IS the finding. An empty name on either
+side returns False: an unknown name must never read as agreement.
+
+Eleven self-tests pin it, including the dangerous one (`ATLGSX02` vs
+`ATLGSX01` -- one digit apart, two real chassis at the same site) and all four
+empty/None combinations.
+
+Both report builders were driven across all three verdicts, asserting
+specifically that a conflict cannot produce "completed successfully" and that a
+`mux_results` dict with no verdict key at all renders exactly as it did before
+(back-compat for any stored run).
+
+---
+
+## v2.27 — 2026-10-01
+
+### GSXClient had no `hostname` attribute at all -- reverse hop 1 was dead on arrival
+
+First live reverse run, on the same circuit used for the v2.21-v2.24 forward
+fixes:
+
+```
+  [ OK ] GSX T1 identifier     shelf 1 slot 6 port 1 T1 23
+  [ OK ] GSX                   ? (x.x.x.x)
+  [ !! ] MUX identity          cannot derive a site from GSX node '?' --
+                               expected a name starting atl/jfk/dfw/lax
+```
+
+Cause: `GSXClient` is **not** a `DeviceBase` subclass -- it drives plink
+through subprocess pipes directly -- so it never inherited
+`DeviceBase._capture_hostname()` and **had no `hostname` attribute at all.**
+Hop 1 read it as:
+
+```python
+node = (getattr(g, "hostname", "") or "").strip()
+```
+
+The `getattr` default meant that resolved to `""` on **every run**, not just
+failed ones. The reverse tool's first real hop could never have worked. A
+missing attribute read through a defaulted `getattr` fails silently and
+forever -- there is no attribute error to notice.
+
+And the hop reported **`[ OK ]`** while producing `?`, so the failure surfaced
+one hop later as "cannot derive a site", pointing the reader at
+`site_from_gsx_node` and the `atl/jfk/dfw/lax` prefix list -- neither of which
+was wrong. Classic `fails-as-success`: the hop did connect and did pull the
+PMs, so it called itself OK, while the one value every later hop needs was
+empty.
+
+#### Fix, three parts
+
+**1. `GSXClient` now captures its node name at login.** `connect()` already
+returns the banner, and the GSX prompt is the last line of it:
+
+```python
+self.hostname = node_from_prompt(banner)   # 'ATLGSX02>' -> 'ATLGSX02'
+```
+
+Named `hostname` deliberately, matching `DeviceBase`, so callers can treat the
+two client families the same -- which is what hop 1 already assumed.
+
+**2. A second source, at no cost.** Every GSX command's output opens with
+`Node: ATLGSX02    Date: ...`. `node_from_output()` reads that, and hop 1 falls
+back to it across the T1 stats and T3 status it has **already pulled** -- no
+extra command. The report names which source answered:
+
+```
+  [ OK ] GSX    DFWGSX04 (x.x.x.x) via login prompt
+  [ OK ] GSX    DFWGSX04 (x.x.x.x) via Node: header of STATUS
+```
+
+**3. Hop 1 now FAILS when the name is unknown**, instead of printing `?` and
+letting the next hop report the symptom:
+
+```
+  [ !! ] GSX   connected to x.x.x.x but could not read the node name -- not in
+               the login prompt and no 'Node:' header in any command output.
+               Every hop below needs it (site -> MUX, and NODE-slot-port -> T3
+               controller).
+```
+
+That states the dependency, so the reader knows why the walk stopped there
+rather than going to look at the site-prefix list.
+
+#### Tests
+
+`python gsx_client.py --self-test` is new (the module had none). Fourteen
+checks pin both parsers, including the cases that would quietly re-break them:
+the prompt scan takes the LAST prompt in the banner, not the first; a `>` in
+prose is not a prompt; and `[command error: timeout]` is not a node name. The
+`Node:` header case runs against the verbatim ATLGSX02 capture already in
+`gsx_perfmon._DAY_SAMPLE`.
+
+Hop 1 itself was driven with a stubbed client across all four paths: prompt
+resolves, prompt empty but T1 header resolves, only the T3 output carries the
+header, and neither source has it (hop fails, and the assertion is specifically
+that it does NOT report OK -- the original bug).
+
+#### Noted, not done
+
+Now that `GSXClient` knows its own name, the FORWARD autotester could
+cross-check it against the node it derives from the MUX port descriptions
+(`ATLGSX02-11-1`) -- two independent sources for the same fact, which is this
+project's whole premise. Not built; not asked for.
+
+---
+
+## v2.26 — 2026-10-01
+
+### Autotester page: the two cards are now identical except for the source
+
+Requested: keep the cards the same, just different starting points. Three
+changes.
+
+**1. The forward card now has a title, like the reverse one.** It previously
+had no heading of its own -- it inherited the page `<h1>`, so the right card
+looked like the documented tool and the left like an unlabelled form.
+
+```
+  Forward (1250 -> GSX)          Reverse (GSX -> 1250)
+  Start at a 1250 DS1 and        Start at a GSX T1 and
+  walk outward...                walk inward...
+```
+
+**2. `class="cred-grid"` does not exist in style.css.** The reverse card's four
+credential fields were wrapped in it, so they stacked full-width while the
+forward card paired them two-up. Replaced with the same two `.row` divs the
+forward card uses. A class name that is never defined fails silently -- the
+page still renders, just wrong, which is why this survived v2.24.
+
+**3. Field parity: the reverse card gained JIRA and Slack.** It had neither, so
+a reverse trace could only be read on screen or from the written file. Both
+cards now render the same ten fields in the same order (verified by diffing
+the rendered `<label>` list of each panel).
+
+#### Wiring behind the new fields
+
+- `reverse_autotester.run()` gained the JIRA post (`post_report`) and the
+  Slack post (`post_slack`), both optional and independent of each other --
+  same as the forward tool, where a webhook is a separate concern from a
+  ticket.
+- `collect_inputs()` prompts for a ticket too, so the CLI path matches the web
+  path. Blank skips; a malformed ticket re-prompts rather than being dropped.
+- The two forms share the field *names* `add_jira` / `jira_ticket` (element
+  IDs are `rev`-prefixed to stay unique). Only the submitted form's fields are
+  posted, so the existing `_parse_jira()` reads the right ones with no second
+  set of keys.
+- A webhook typed into either card is saved and becomes the default for both.
+
+#### One summary builder, not two
+
+`_slack_summary(ctx)` renders the five-line resolved path and is used verbatim
+by the JIRA always-visible summary AND the Slack body, so the two channels
+cannot drift apart.
+
+It prints unreached hops as `?` rather than omitting them:
+
+```
+GSX   : ATLGSX02 (x.x.x.x)
+MUX   : ATL1-MUX-02  T3 0/8/46 -> CE?
+ACR   : ? CEM ? (STS ? DS1 ?)
+1800  : ?   MUSE ?
+1250  : ? ds1-?
+```
+
+A summary that silently drops the hops a cold trace never reached reads as a
+success. Five lines always, whatever happened -- `fails-as-success` avoided.
+The JIRA intro and the Slack header separately name the hop where the trail
+went cold.
+
+**A failed post does not fail the run.** Both posts are wrapped; the report is
+written and printed first, and a raising poster logs `[JIRA] RuntimeError:
+...` and continues. Verified by stubbing both posters to raise -- `run()` still
+returned the output path.
+
+Tested by stubbing `trace()` and both posters and driving `run()` end to end:
+full path (both channels fire, summaries identical), cold trace (intro names
+the hop, summary still five lines), no ticket and no webhook (neither poster
+is called at all), and both posters raising. Five assertions on
+`_slack_summary` are now permanent self-tests in the file.
+
+---
+
+## v2.25 — 2026-10-01
+
+### GSX block now states the parent T3 whenever the DS1 is erroring
+
+Reported from a live DFWGSX04 run: a DS1 taking heavy errors produced five
+`[ !! ]` counter lines and **no mention of the parent T3 at all**, so telling a
+DS1-specific fault from a T3-level one meant going and checking the DS3 by
+hand.
+
+```
+         GSX  --  DFWGSX04  (x.x.x.x)  (current 15 min / 24 hr)
+  [ !! ] GSX Code Violations: 9 / 796  (15min / 24hr)
+  [ !! ] GSX Errored Seconds: 10 / 1400  (15min / 24hr)
+  ...
+         6-1-23                                   <- no T3 line
+```
+
+Cause: the T3 was mentioned only when `gsx_t3_down` was true. That is the same
+one-ticket-or-28 distinction v2.13 added, but it only ever covered the OUTAGE
+case -- a T3 that is up while its DS1 errors said nothing.
+
+Now, whenever `gsx_hits` is non-empty and the T3 is not down, one of three
+lines is emitted:
+
+```
+  [ -- ] parent T3 6-1 is UP with no alarm -- these errors look DS1-specific
+  [ !! ] parent T3 6-1 ALARM AISFAILURE -- may affect every DS1 on this port
+  [ -- ] parent T3 status not read -- cannot say whether this is DS1-specific
+         or T3-level
+```
+
+**Costs no extra command.** `gsx_t3_results[ds1]` is already pulled per DS1 for
+the existing T3-DOWN check; this reads the alarm field out of the same text.
+
+The wording claims only what the data supports. That text is `SHOW T3 <id>
+STATUS` -- operational state and alarm, NOT PM counters -- so it says "no alarm
+on the parent T3", never "the T3 is clean". And an empty/unread T3 status gets
+its own line rather than being allowed to look healthy by omission, which is
+the `fails-as-success` shape.
+
+Verified against the real DFWGSX04 counters across all four paths: T3 up with
+no alarm, T3 up with an alarm, T3 status unread, and T3 down (unchanged --
+still reports the outage as root cause above the counter lines).
+
+Building the fixture also surfaced a detail worth recording: `gsx_hits` is
+computed by `_gsx_split_current_perf()`, which keys its 15-min and 24-hr
+regions off the echoed COMMAND lines (`...PERFMON CURRENT FIFTEENMIN` /
+`...CURRENT DAY`). A PM fixture without those echoes yields zero counters and
+silently exercises nothing -- the first version of this test did exactly that
+and passed while testing the wrong branch.
+
+---
+
 ## v2.24 — 2026-10-01
 
 ### Reverse Autotester: GSX -> MUX -> 1800 -> 1250

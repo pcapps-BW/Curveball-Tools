@@ -56,13 +56,39 @@ from device_base import BaseDeviceClient
 #
 # ⚠ `show run | i <desc>` is NOT usable here: it prints the matching
 # description lines with no controller context at all (three bare
-# "description ATLGSX02-11-1" lines, confirmed). `| b` or `| section` is
-# required. Also note the same description string appears on several config
-# objects for one path, so matching lines without tracking the enclosing
-# `controller T3` block would overcount.
+# "description ATLGSX02-11-1" lines, confirmed). Also note the same
+# description string appears on several config objects for one path, so
+# matching lines without tracking the enclosing `controller T3` block would
+# overcount.
+#
+# ⚠ NEITHER IS `| section <desc>`, and neither is `| b <desc>`. Both were
+# recorded here as usable on 2026-10-01; a DFW1-MUX-04 capture the same day
+# disproved both:
+#
+#   * `show run | section DFWGSX04-6-1` printed three bare description lines
+#     -- on this platform `| section` behaves like `| include`, NOT like
+#     IOS's print-the-whole-block.
+#   * `show run | b DFWGSX04-6-1` begins AT THE DESCRIPTION, so the
+#     `controller T3` header owning the first of the three is above the
+#     output. parse_t3_controller_descriptions correctly refuses to attribute
+#     an ownerless description -- which means that controller is invisible,
+#     and a three-way duplicate was reported as a two-way one.
+#
+# The only reliable form is to begin at a CONTROLLER HEADER:
+#     show run | b controller T3
+# Every block in that output carries its own header, so nothing is ownerless.
+# See T3_CONFIG_CMD.
+
+T3_CONFIG_CMD = "show run | b controller T3"
 
 _T3_CTRL_RE = re.compile(r'^\s*controller\s+T3\s+(?P<id>[\d/]+)\s*$', re.I)
 _T3_DESC_RE = re.compile(r'^\s*description\s+(?P<desc>\S+)\s*$', re.I)
+# ' t1 1 cem-group 101 unframed' -- the pseudowire channel. A controller with
+# NO cem-group lines carries no circuits: described, but not provisioned.
+# DFW1-MUX-04 0/11/12 was exactly that, and it is why two controllers both
+# "confirmed" a description while only one could possibly carry traffic.
+_T3_CEM_RE = re.compile(
+    r'^\s*t1\s+(?P<t1>\d+)\s+cem-group\s+(?P<cem>\d+)\b', re.I)
 
 
 def parse_t3_controller_descriptions(raw):
@@ -75,19 +101,45 @@ def parse_t3_controller_descriptions(raw):
     mid-block, so the first description in such a dump has no identifiable
     owner and must NOT be guessed at.
     """
+    return {tid: b["description"] for tid, b in
+            parse_t3_controller_blocks(raw).items() if b["description"]}
+
+
+def parse_t3_controller_blocks(raw):
+    """
+    {t3_id: {"description": str|None, "cem_groups": {t1_num: cem_id}}}
+
+    Same block tracking as above, but keeps the `t1 N cem-group M` lines too,
+    because those are what separate a controller that CARRIES circuits from
+    one that merely has a description. On DFW1-MUX-04, controllers 0/11/12
+    and 8/1/12 were both described 'DFWGSX04-6-1'; only 8/1/12 had
+    cem-groups.
+
+    Descriptions appearing before any controller header are ignored -- a
+    dump that starts mid-block has no identifiable owner for its first
+    description and must NOT be guessed at. (Begin at a controller header,
+    T3_CONFIG_CMD, so this cannot happen.)
+    """
     out, current = {}, None
     for ln in (raw or "").splitlines():
         m = _T3_CTRL_RE.match(ln)
         if m:
             current = m.group("id")
+            out.setdefault(current, {"description": None, "cem_groups": {}})
             continue
         if ln.strip() == "!":
             current = None
             continue
-        if current:
-            md = _T3_DESC_RE.match(ln)
-            if md and current not in out:
-                out[current] = md.group("desc")
+        if not current:
+            continue
+        md = _T3_DESC_RE.match(ln)
+        if md:
+            if out[current]["description"] is None:
+                out[current]["description"] = md.group("desc")
+            continue
+        mc = _T3_CEM_RE.match(ln)
+        if mc:
+            out[current]["cem_groups"][int(mc.group("t1"))] = mc.group("cem")
     return out
 
 
@@ -109,14 +161,112 @@ def t3_for_gsx_assignment(raw, node, slot, port):
     Returns (None, '__AMBIGUOUS__') when more than one controller claims the
     same assignment, rather than picking one.
     """
-    want = gsx_assignment_desc(node, slot, port).lower()
-    hits = [(tid, d) for tid, d in parse_t3_controller_descriptions(raw).items()
-            if (d or "").strip().lower() == want]
+    hits = t3_candidates_for_gsx_assignment(raw, node, slot, port)
     if not hits:
         return None, None
     if len(hits) > 1:
         return None, "__AMBIGUOUS__"
     return hits[0]
+
+
+def t3_candidates_for_gsx_assignment(raw, node, slot, port):
+    """
+    EVERY (t3_id, description) whose description equals this GSX assignment.
+
+    `t3_for_gsx_assignment` collapses this to a single answer and reports
+    '__AMBIGUOUS__' for anything else. That is the right contract for a
+    caller that just wants the T3, but a bare "refusing to pick" tells the
+    operator nothing about what it found -- and on a DFW1-MUX-04 reverse run
+    (2026-10-01) two controllers really did carry the same description, which
+    is either a provisioning duplicate or a sign the description means
+    something other than assumed.
+
+    So this exists to let the caller ENUMERATE the candidates and narrow them
+    against the device, rather than guessing or giving up blind. Sorted by
+    controller id for a stable report.
+    """
+    want = gsx_assignment_desc(node, slot, port).lower()
+    hits = [(tid, d) for tid, d in parse_t3_controller_descriptions(raw).items()
+            if (d or "").strip().lower() == want]
+    return sorted(hits, key=lambda h: h[0])
+
+
+def t3_for_gsx_t1(raw, node, slot, port, t1):
+    """
+    Resolve the T3 controller for a specific GSX T1, using provisioning as
+    the tiebreak. Returns (t3_id, desc, cem_id, note) or (None, None, None,
+    reason).
+
+    The description is NODE-slot-port with no T1 number, so several
+    controllers can legitimately carry the same description -- and on
+    DFW1-MUX-04 three did. What separates them is not the description but
+    whether the controller is actually provisioned FOR THIS T1:
+
+      controller T3 0/11/12          controller T3 8/1/12
+       description DFWGSX04-6-1       description DFWGSX04-6-1
+       framing m13                    framing m13
+      !                               t1 1 cem-group 101 unframed
+                                      t1 2 cem-group 102 unframed
+
+    0/11/12 has no cem-groups at all: described, never provisioned, carries
+    nothing. Reading the description back off it "confirms" it just as
+    readily as the real one, which is why description-matching alone could
+    never settle this.
+
+    So: among controllers with the matching description, keep those with a
+    cem-group for THIS T1. That is a stronger key than the description --
+    it is per-DS1, not per-port -- and it costs no extra command.
+    """
+    want = gsx_assignment_desc(node, slot, port)
+    blocks = parse_t3_controller_blocks(raw)
+    described = sorted(
+        (tid, b) for tid, b in blocks.items()
+        if (b["description"] or "").strip().lower() == want.lower())
+    if not described:
+        return None, None, None, "no controller described '{}'".format(want)
+
+    t1 = int(t1)
+    provisioned = [(tid, b) for tid, b in described if t1 in b["cem_groups"]]
+    unprovisioned = [tid for tid, b in described if not b["cem_groups"]]
+    other_t1s = [tid for tid, b in described
+                 if b["cem_groups"] and t1 not in b["cem_groups"]]
+
+    if len(provisioned) == 1:
+        tid, b = provisioned[0]
+        note = None
+        if len(described) > 1:
+            bits = []
+            if unprovisioned:
+                bits.append("{} described but unprovisioned ({})".format(
+                    len(unprovisioned), ", ".join(unprovisioned)))
+            if other_t1s:
+                bits.append("{} provisioned for other T1s only ({})".format(
+                    len(other_t1s), ", ".join(other_t1s)))
+            note = ("{} controllers are described '{}'; chose T3 {} because it "
+                    "is the only one with a cem-group for t1 {}{}".format(
+                        len(described), want, tid, t1,
+                        " -- " + "; ".join(bits) if bits else ""))
+        return tid, b["description"], b["cem_groups"][t1], note
+
+    if not provisioned:
+        return None, None, None, (
+            "{} controller(s) described '{}' ({}), but none has a cem-group "
+            "for t1 {}. {}".format(
+                len(described), want, ", ".join(t for t, _ in described), t1,
+                "All are described but unprovisioned."
+                if len(unprovisioned) == len(described) else
+                "Provisioned T1s found: {}.".format(
+                    ", ".join("T3 {} -> t1 {}".format(
+                        tid, ",".join(str(n) for n in sorted(b["cem_groups"])))
+                        for tid, b in described if b["cem_groups"]))))
+
+    return None, None, None, (
+        "{} controllers are described '{}' AND both have a cem-group for "
+        "t1 {}: {}. That is a real duplicate -- not something this tool "
+        "should pick between.".format(
+            len(provisioned), want, t1,
+            ", ".join("T3 {} (cem {})".format(tid, b["cem_groups"][t1])
+                      for tid, b in provisioned)))
 
 
 def ce_candidates_for_t3(t3_id):

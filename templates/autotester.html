@@ -6,6 +6,12 @@
 
 <div class="tool-row" style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;">
 <div class="panel" style="flex:1 1 420px;min-width:380px;">
+  <h2 style="margin-top:0;">Forward (1250 &rarr; GSX)</h2>
+  <div class="sub" style="margin-bottom:14px;">
+    Start at a 1250 DS1 and walk outward: 1250 &rarr; 1800 &rarr; MUX &rarr; GSX.
+    Resolves the MUSE, OC sub-channel, SONET leg, ACR/CEM and T3 controller on
+    the way. Use it when a customer DS1 is all you have.
+  </div>
   <form id="runForm" data-run-url="/api/autotester/run">
     <label for="ip_1250">1250 IP</label>
     <input type="text" id="ip_1250" name="ip_1250" placeholder="10.111.131.79" required>
@@ -75,11 +81,35 @@
     <input type="text" id="t1_id" name="t1_id" placeholder="T1-1-11-1-11" required>
 
     <div class="checkbox-row">
+      <input type="checkbox" id="revAnalyze" name="rev_analyze" checked>
+      <label for="revAnalyze">Pull PMs &amp; diagnostics once the route resolves</label>
+    </div>
+    <div class="hint">Hands the resolved 1250 + DS1 to the forward Autotester, which walks the route again from the other end &mdash; so you get the same PM and diagnostic output, plus an independent check that both directions agree on which circuit this is. Roughly doubles the runtime. Untick for route resolution only.</div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="revAddJira" name="add_jira">
+      <label for="revAddJira">Post results to JIRA</label>
+    </div>
+    <div id="revJiraTicketWrap" style="display:none;">
+      <label for="rev_jira_ticket">JIRA ticket (NOE-XXXX)</label>
+      <input type="text" id="rev_jira_ticket" name="jira_ticket" placeholder="NOE-1234">
+    </div>
+
+    <div class="checkbox-row">
       <input type="checkbox" id="revOpenWhenDone" name="rev_open_when_done">
       <label for="revOpenWhenDone">Open results file when done (Notepad)</label>
     </div>
+    <div class="hint">Only works when this server is running on your own machine -- it opens the file on whichever machine runs <code>app.py</code>, not on the browser. Fine for the local POC; turn this off once the site is running on a shared host.</div>
 
-    <div class="cred-grid">
+    <label for="rev_slack_webhook">Slack webhook URL <span style="color:var(--muted);font-weight:normal;">(optional)</span></label>
+    <input type="text" id="rev_slack_webhook" name="slack_webhook" value="{{ saved_slack_webhook }}"
+           placeholder="https://hooks.slack.com/services/...">
+    <div class="hint">Posts the resolved path + where the trail ended to Slack when the run finishes. Leave blank to skip, or to reuse whatever's already saved above -- enter a new URL to replace it.</div>
+
+    <!-- Same .row pairs as the forward card. This was a 'cred-grid' div, which
+         is not a class that exists in style.css -- so the four credential
+         fields stacked full-width instead of pairing up. -->
+    <div class="row">
       <div>
         <label for="rev_infra_user">Infrastructure username (1250/1800/MUX)</label>
         <input type="text" id="rev_infra_user" name="infra_user" required autocomplete="username">
@@ -88,6 +118,9 @@
         <label for="rev_infra_pass">Infrastructure password</label>
         <input type="password" id="rev_infra_pass" name="infra_pass" required autocomplete="current-password">
       </div>
+    </div>
+
+    <div class="row">
       <div>
         <label for="rev_gsx_user">GSX username</label>
         <input type="text" id="rev_gsx_user" name="gsx_user" required autocomplete="username">
@@ -111,6 +144,7 @@
 <script src="{{ url_for('static', filename='job.js') }}"></script>
 <script>
   initJiraToggle('addJira', 'jiraTicketWrap');
+  initJiraToggle('revAddJira', 'revJiraTicketWrap');
   initJobForm('runForm');
   // Second form, same job panels: only one run happens at a time and
   // both traces belong in the same output area. initJobForm already
