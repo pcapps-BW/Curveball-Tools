@@ -25,7 +25,7 @@ output (2026-10-01):
 READ-ONLY throughout: `show`/`SHOW` only, plus session-only paging.
 
 PROVEN END TO END on live devices 2026-10-01: DFWGSX04 T1-1-6-1-23 resolved
-all nine hops through to MDLDTXMU542 ds1-ts1/27 (MUSE_972). Getting there took
+all ten hops through to MDLDTXMU542 ds1-ts1/27 (MUSE_972). Getting there took
 v2.27-v2.33 and every failure was in a lookup, not in the walk:
 
   v2.27  GSXClient had no `hostname` attribute at all -- hop 1 could never

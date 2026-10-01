@@ -61,7 +61,7 @@ app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v2.35"
+APP_VERSION = "v2.37"
 
 
 @app.context_processor
@@ -108,6 +108,46 @@ class _JobStdoutTee:
 
 
 sys.stdout = _JobStdoutTee(sys.stdout)
+
+
+# ---- startup environment check --------------------------------------------
+# Checked once at import, loudly, because the failure it catches is both
+# total and misleading: paramiko 5.0.0 removed the SHA-1 kex and host-key
+# types the Cisco NCS 4216 requires, so EVERY MUX at EVERY site becomes
+# unreachable -- and paramiko reports it as "unknown cipher", which points
+# at the wrong thing.
+#
+# This does not raise. The 1250 and 1800 hops still work fine on paramiko 5,
+# so a degraded suite is more useful than one that refuses to start; the
+# banner makes sure nobody spends a run working out why the MUX hop died.
+# Found live 2026-10-01 after "Start Curveball Tools.bat" pip-installed an
+# unpinned paramiko>=3.5 and picked up 5.0.0.
+
+def _check_paramiko():
+    try:
+        import paramiko
+    except Exception as e:
+        print("[!] paramiko not importable: {}".format(e))
+        return
+    missing = [n for n, tbl in (
+        ("diffie-hellman-group14-sha1", getattr(paramiko.Transport, "_kex_info", {})),
+        ("ssh-rsa",                     getattr(paramiko.Transport, "_key_info", {})),
+    ) if n not in tbl]
+    if missing:
+        ver = getattr(paramiko, "__version__", "?")
+        print("")
+        print("!" * 72)
+        print("  paramiko {} has dropped: {}".format(ver, ", ".join(missing)))
+        print("  The Cisco NCS 4216 MUX offers ONLY these algorithms, so every")
+        print("  MUX is unreachable -- the MUX and GSX hops of both autotesters")
+        print("  will fail at every site. The 1250 and 1800 hops are unaffected.")
+        print("")
+        print("  Fix:  pip install -r requirements.txt     (pins paramiko<5)")
+        print("!" * 72)
+        print("")
+
+
+_check_paramiko()
 
 
 def _valid_ip(s):

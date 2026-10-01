@@ -1,4 +1,16 @@
-paramiko>=3.5
+# ⚠ UPPER BOUND IS LOAD-BEARING. paramiko 5.0.0 REMOVED the SHA-1 algorithms
+# (diffie-hellman-group14-sha1 kex, ssh-rsa host key) outright -- they are gone
+# from Transport._kex_info / _key_info, not merely disabled, so
+# disabled_algorithms={} cannot bring them back.
+#
+# The Cisco NCS 4216 MUX offers ONLY those. Under paramiko 5.x every MUX at
+# every site is unreachable, which takes out the MUX and GSX hops of both
+# autotesters. Broke live on 2026-10-01 (LAXGSX01 run) because
+# "Start Curveball Tools.bat" runs `pip install -r requirements.txt` on every
+# launch and this line had no upper bound.
+#
+# Do not raise this ceiling until the MUXes themselves support SHA-2 kex.
+paramiko>=3.5,<5
 requests>=2.30
 flask>=3.0
 keyring>=24.0   # secure_config.py -- Windows Credential Manager storage

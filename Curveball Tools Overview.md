@@ -1,8 +1,12 @@
 # Curveball Tools — Overview
 
+*Non-technical summary. Last updated 2026-10-01, describing v2.35. For the
+current version and module inventory see `../../CONTEXT_PRIMER.md`, which owns
+those numbers.*
+
 ## What it is
 
-Curveball Tools is a personal automation toolkit that traces and diagnoses T1/DS1 circuits end to end across the full transport path — NPT-1250 → NPT-1800 → Cisco NCS 4216 MUX → GSX 9000 — without hand-typing commands into four separate device sessions. It runs as a small local web app (Flask) with a menu of tools, built and iterated over the last ~2 months against real NOC tickets.
+Curveball Tools is a personal automation toolkit that traces and diagnoses T1/DS1 circuits end to end across the full transport path — NPT-1250 → NPT-1800 → Cisco NCS 4216 MUX → GSX 9000 — without hand-typing commands into four separate device sessions. It runs as a small local web app (Flask) with a menu of tools, built and iterated since mid-2026 against real NOC tickets.
 
 ## Why it exists
 
@@ -20,7 +24,9 @@ Troubleshooting a circuit today means logging into each device in the path separ
 
 **Circuit tracing**
 - **Autotester** — full end-to-end T1 trace across all four hops; the core tool everything else builds on.
-- **Reverse Autotester** — the same trace walked backwards: start at a GSX T1 and resolve inward to the customer DS1 on the 1250. For when a GSX alarm is all you have and nobody knows which circuit it is. Shares the Autotester page rather than having its own.
+- **Reverse Autotester** — the same trace walked backwards: start at a GSX T1 and resolve inward to the customer DS1 on the 1250. For when a GSX alarm is all you have and nobody knows which circuit it is. It then hands the circuit it found to the Autotester, which walks the route again from the other end — so the diagnostics come with an independent confirmation that both directions agree on which circuit this is. Shares the Autotester page rather than having its own.
+- **OSPF & LDP Stability** — fleet-wide adjacency monitor with persistent state, so flapping that only shows up over days is visible.
+- **IXC Stability** — *beta, not for production use.*
 - **Site Sweep** — fast triage: checks every DS1 on a 1250 at once (no route trace) to see what's clean vs. worth a full Autotester run.
 - **Morning Check** — batch-runs Autotester (plus fiber/OSPF/LDP checks) across every open ticket assigned to the user; posts to JIRA and Slack automatically.
 
@@ -46,6 +52,7 @@ Troubleshooting a circuit today means logging into each device in the path separ
 
 ## Where it stands
 
-- Actively used and iterated against live tickets for ~2 months; several real bugs (misleading summaries, collapsed PM values, formatting issues) have been caught and fixed through that use.
+- Actively used and iterated against live tickets since mid-2026; several real bugs (misleading summaries, collapsed PM values, formatting issues) have been caught and fixed through that use.
+- Both trace directions are proven against production devices. The reverse direction reached that point on 2026-10-01, and getting there took six consecutive fixes — every one of them a lookup that returned a plausible wrong answer rather than an obvious error. That is the failure mode the tooling is designed around: it reports what it could not prove, rather than filling the gap with a guess.
 - Currently a personal proof of concept — runs locally, single user, not yet an IT-sanctioned or team-wide tool.
 - Natural next conversation for the demo: whether this is worth investing in as a shared/team tool, and what that would take (hosting, multi-user access, security review).

@@ -300,6 +300,30 @@ class MUX4216Client(BaseDeviceClient):
         pre-disabled, then pin the legacy set paramiko still supports.
         """
         import socket
+
+        # Fail BEFORE opening a socket if the running paramiko cannot do
+        # SHA-1 at all. paramiko 5.0.0 removed diffie-hellman-group14-sha1
+        # and ssh-rsa from its algorithm tables entirely -- they are absent,
+        # not disabled, so disabled_algorithms={} does nothing for them and
+        # the MUX becomes unreachable at every site.
+        #
+        # Checked here rather than left to the assignment below because
+        # paramiko's SecurityOptions setter raises the literal string
+        # "unknown cipher" for ANY unsupported algorithm, kex and host key
+        # included. That message sent a reader looking at ciphers, which were
+        # never the problem (2026-10-01, LAXGSX01 run).
+        _missing = [n for n, tbl in (
+            ("diffie-hellman-group14-sha1", getattr(paramiko.Transport, "_kex_info", {})),
+            ("ssh-rsa",                     getattr(paramiko.Transport, "_key_info", {})),
+        ) if n not in tbl]
+        if _missing:
+            raise RuntimeError(
+                "paramiko {} has dropped {} -- the NCS 4216 offers only these, "
+                "so no MUX is reachable with this version. Pin paramiko<5 "
+                "(see requirements.txt) and reinstall: "
+                "pip install -r requirements.txt".format(
+                    getattr(paramiko, "__version__", "?"), ", ".join(_missing)))
+
         sock = socket.create_connection((self.ip, 22), timeout=min(conn_timeout, 30))
         transport = paramiko.Transport(sock, disabled_algorithms={})
         try:
@@ -311,7 +335,10 @@ class MUX4216Client(BaseDeviceClient):
         except Exception as e:
             transport.close()
             raise RuntimeError(
-                "MUX legacy-algo setup failed: {} (paramiko {})".format(
+                "MUX legacy-algo setup failed: {} (paramiko {}). Note paramiko "
+                "says 'unknown cipher' for any unsupported algorithm, "
+                "including kex and host-key types -- check those before the "
+                "cipher list.".format(
                     e, getattr(paramiko, "__version__", "?")))
 
         transport.start_client(timeout=min(conn_timeout, 30))

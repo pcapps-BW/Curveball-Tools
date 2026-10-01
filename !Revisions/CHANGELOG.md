@@ -15,6 +15,216 @@ that's bitten this project before.
 
 ---
 
+## v2.37 — 2026-10-01
+
+### paramiko 5.0.0 took out every MUX at every site
+
+```
+  [ !! ] MUX identity   no reachable MUX for site 'lax' -- tried 1:
+         x.x.x.x (LOC_TO_MUX (hardcoded)): connect failed: RuntimeError:
+         MUX legacy-algo setup failed: unknown cipher (paramiko 5.0.0)
+```
+
+**Not a LAX problem, and nothing to do with today's fixes.** The Cisco NCS
+4216 offers only `diffie-hellman-group14-sha1` kex and an `ssh-rsa` host key.
+**paramiko 5.0.0 removed both outright** — they are absent from
+`Transport._kex_info` and `Transport._key_info`, not merely disabled, so
+`disabled_algorithms={}` cannot bring them back:
+
+```python
+>>> "diffie-hellman-group14-sha1" in paramiko.Transport._kex_info   # 5.0.0
+False
+>>> "ssh-rsa" in paramiko.Transport._key_info
+False
+```
+
+Every MUX at every site is unreachable under 5.x, which takes out the MUX and
+GSX hops of both autotesters. The 1250 and 1800 hops are unaffected.
+
+#### How it got installed
+
+`Start Curveball Tools.bat` runs `pip install -r requirements.txt` on **every
+launch**, and the pin was `paramiko>=3.5` with no ceiling. So launching the
+app upgraded paramiko and broke the MUX — no code change, no release, nothing
+in the changelog to point at. It worked at 11:47 and not at 12:0x.
+
+Now `paramiko>=3.5,<5`, with the reason written beside it. paramiko 4.0.0
+still carries both algorithms, so the ceiling costs nothing today. Because
+the `.bat` reinstalls every launch, the next start downgrades automatically.
+
+#### "unknown cipher" was a red herring
+
+paramiko's `SecurityOptions` setter raises the literal string
+`"unknown cipher"` for **any** unsupported algorithm — kex and host-key types
+included. The code never touches the cipher list. Anyone debugging from that
+message starts in the wrong place.
+
+So the client now checks the algorithm tables **before opening a socket** and
+says what is actually wrong:
+
+```
+paramiko 5.0.0 has dropped diffie-hellman-group14-sha1, ssh-rsa -- the NCS
+4216 offers only these, so no MUX is reachable with this version. Pin
+paramiko<5 (see requirements.txt) and reinstall: pip install -r requirements.txt
+```
+
+The original handler keeps its message too, with a note that paramiko says
+"unknown cipher" for kex and host-key problems as well — so the next person
+reading that string is not sent to the cipher list.
+
+#### Caught at startup, not per-run
+
+`app.py` checks once at import and prints a banner. It does **not** raise: the
+1250 and 1800 hops still work on paramiko 5, so a degraded suite beats one
+that refuses to start. The banner exists so nobody spends a run finding out.
+
+```
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  paramiko 5.0.0 has dropped: diffie-hellman-group14-sha1, ssh-rsa
+  The Cisco NCS 4216 MUX offers ONLY these algorithms, so every
+  MUX is unreachable -- the MUX and GSX hops of both autotesters
+  will fail at every site. The 1250 and 1800 hops are unaffected.
+
+  Fix:  pip install -r requirements.txt     (pins paramiko<5)
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+```
+
+Verified against a real paramiko 5.0.0: the banner fires, the client raises
+before opening a socket, and with the algorithms present the pre-check stays
+silent and the connection proceeds normally.
+
+#### The general lesson
+
+An unpinned dependency plus an auto-installing launcher is a config change
+that arrives with no commit, no release and no changelog entry. Every other
+failure chased today was traceable to a diff; this one was not, and the only
+reason it was attributable at all is that the error named the paramiko
+version. **Check the other unpinned requirements** — `requests`, `flask` and
+`keyring` are all `>=` with no ceiling and reinstall on every launch too.
+
+---
+
+## v2.36 — 2026-10-01
+
+### Documentation pass — and the read-only audit was wrong
+
+Fourteen documents audited against the code. Most findings were ordinary
+staleness. **One was not.**
+
+#### The audit said a command was never sent live. It is.
+
+`ds1_gsx_test.run_gsx_monitor()` executes
+
+```
+CONFIGURE T1 <id> PERFMON RESET COUNTERS ALL
+```
+
+when `params["clear_first"]` is set — and that option is wired to a live
+checkbox in `templates/ds1_gsx_test.html`. `INTRUSIVE_COMMANDS.md` stated
+that exact command was "**never sent live**", and its top-line verdict was
+"every command any tool in this suite actually executes against a device is
+read-only."
+
+The function's own docstring had it right the whole time: *"This is the one
+real config-write path in this function."* **The code was honest; the audit
+was wrong.**
+
+Now documented as **EXCEPTION 4**, with the blast radius stated plainly: no
+service impact, no persisted config, but **irreversible** — that T1's
+accumulated PM history is destroyed, and PM history is exactly the evidence
+someone wants for an intermittent fault.
+
+#### How it was missed, which matters more than the fix
+
+Two compounding reasons, both recorded in the document:
+
+1. **The previous audit reasoned outward from the client instead of inward
+   from the callers.** `gsx_client.py` carried a note saying it "only ever
+   sends whatever `SHOW T1 ...` string it's given", and the callers were
+   assumed to honour that. `gsx_client.py` is a transport with no verb
+   restriction — **it was never a safety boundary.** The guarantee lives in
+   the callers, so each one has to be read.
+2. **The verification grep cannot catch it.** The command is passed as a
+   variable (`g.run_command(clear_cmd)`), so a pattern matching a literal
+   string after `.run(` returns nothing — and reads as a pass. The grep is
+   now labelled a cross-check, with the call-site trace named as the actual
+   assurance.
+
+This is the `never-proven` category from `assurance.py`, applied to the
+document that exists to prove it.
+
+Corrected in every place the claim had been propagated: `README.md`,
+`ADDING_A_TOOL.md`, `CURVEBALL_TOOL_SPEC.md`, `HANDOFF.md` and the new
+`RUNBOOK.md`. The handoff now tells the NOC explicitly not to default
+`clear_first` on and never to set it from an unattended poller.
+
+#### Also wrong: the reverse trace has ten hops, not nine
+
+Counted from `Hop(...)` construction — ten, matching the ten `[ OK ]` lines in
+the live DFWGSX04 run. "Nine" was in four documents and in
+`reverse_autotester.py`'s own docstring, including v2.34's changelog entry.
+Fixed in the code docstring and the docs; the v2.34 entry is left as written,
+since changelog entries are a record of what was said at the time.
+
+#### Ordinary staleness, for the record
+
+- `Create Curveball Shortcut.ps1` was cited four times across `README.md` and
+  `INSTALL.md`. **No such file** — it is `Set Curveball Tools Icon.ps1`, and
+  it creates a `.lnk` in the tools folder rather than on the Desktop.
+- `INSTALL.md` pointed at `secure_config.clear_password()`. The function is
+  `delete_password()`.
+- `ADDING_A_TOOL.md` said four tools use `_simple_1250_route()`; five do.
+- Both `ADDING_A_TOOL.md` and `CURVEBALL_TOOL_SPEC.md` said `order` values
+  10–60 are in use. Actual: 5, 7, 8, 9, 10, 11, 20, 30, 40, 45, 50, 55, 60,
+  65, 70.
+- `RUNBOOK.md` had `hub_registry`'s authority order backwards. It asks NetBox
+  **first** and falls back to `VERIFIED_HUBS` with a warning. `LOC_TO_MUX` is
+  the opposite — hardcoded first. Both are deliberate and now stated
+  separately.
+- `WEB_SETUP.md` described "a proof of concept covering one tool end to end"
+  and listed "one tool wired up" as a limitation, two months after all of them
+  were.
+- `CURVEBALL_TOOL_SPEC.md`'s golden template hardcoded
+  `r"C:\Claude\my_tool_...txt"`. Any tool copied from it would have broken on
+  Linux. Now uses `platform_paths.path()`.
+- `NPT-1250_reference.md` carried a second copy of the hub IP table, listing
+  two addresses `hub_registry` retired as stale the same day. Deleted in favour
+  of a pointer — a duplicated hub map is the exact failure `hub_registry.py`
+  was built to eliminate.
+- The "101 changelog entries" figure appeared in three documents. It is 124.
+- "`interface_check.py` is unit-tested but not live-tested" appeared in **five**
+  documents. It was live-tested on 2026-10-01.
+
+#### Structural changes
+
+- **`RUNBOOK_v1.85.md` → `RUNBOOK.md`**, with no version in the filename,
+  because the version *was* the staleness bug: it was still being read 50
+  releases on, instructing the reader to confirm the web footer said `v1.85`.
+  The old path is a pointer stub, since other documents link to it.
+- **Single-owner facts.** `CONTEXT_PRIMER.md` owns versions, counts and open
+  items; `ADDING_A_TOOL.md` owns the release procedure;  `RUNBOOK.md` owns
+  verification; `INTRUSIVE_COMMANDS.md` owns the safety audit;
+  `hub_registry.py` owns hub identity. Other documents link rather than
+  restate.
+- **`ADDING_A_TOOL.md` §3 is new: how to wire a tool into the web app**, which
+  no document covered. The tool contract gets you into the CLI launcher only.
+  `circuit_audit.py` is the standing proof — a valid `TOOL_INFO`, a
+  `--self-test`, and it has never appeared in the web UI.
+- The **shared-page pattern** (`reverse_autotester` as a second card) is
+  documented for the first time, including *why* the module is deliberately
+  absent from `TOOL_URLS` — an unexplained absence reads as a registration bug,
+  and anything enumerating `TOOL_URLS` to build another front end will silently
+  drop the tool.
+- The **three-way tool count** (14 web-wired / 15 with the shared-page tool /
+  16 with the CLI-only one) is now stated explicitly rather than left as a
+  single misleading number.
+
+Code change in this release is one docstring line. Everything else is prose —
+but the audit correction changes what the suite can truthfully be said to do,
+which is why it gets a version rather than a quiet edit.
+
+---
+
 ## v2.35 — 2026-10-01
 
 ### Reverse Autotester gets the full PM/diagnostic pass -- by chaining the forward tool

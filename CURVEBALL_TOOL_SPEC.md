@@ -42,7 +42,7 @@ A tool module **MUST** define:
        "ran_from": "1250",           # device/source it runs from (e.g. "1250", "1800", "Local")
        "desc": "One line: what it does.",
        "requires": "1250 IP, creds", # inputs the user must supply
-       "order": 70,                  # menu position (existing tools use 10-60; pick an unused number)
+       "order": 75,                  # menu position; see ADDING_A_TOOL.md for values in use
    }
    ```
 
@@ -58,11 +58,19 @@ Plus a `main()` + `if __name__ == "__main__"` so the tool also runs standalone.
 
 ## Hard rules (MUST / MUST NOT)
 
-- **MUST be read-only.** Issue only `show`/`SHOW` commands (and session-only
-  paging like `terminal length 0` or `| no-more`). **NEVER** send `set`,
-  `configure`, `commit`, `write`, `clear`, `reset`, `delete`, `no ...`, loopback,
-  or any command that changes device state. This runs against a live production
-  network. A single mutating command is a hard failure of review.
+- **MUST be read-only in what it EXECUTES.** Issue only `show`/`SHOW` commands
+  (and session-only paging like `terminal length 0` or `| no-more`). **NEVER
+  send** `set`, `configure`, `commit`, `write`, `clear`, `reset`, `delete`,
+  `no ...`, loopback, or any command that changes device state. This runs
+  against a live production network. A single mutating command that reaches a
+  device is a hard failure of review.
+
+  **Printing is not executing.** Three shipped tools legitimately *generate*
+  intrusive command text as a copy/paste runbook for a human — so the rule is
+  about what reaches a `.run()` call, not about which strings appear in the
+  file. If your tool prints such a MOP it must also generate the back-out step,
+  and you must add it to `INTRUSIVE_COMMANDS.md` in the same commit. See
+  `ADDING_A_TOOL.md`.
 - **`run(params)` MUST NOT call `input()` or `getpass()`.** If it prompts, it
   will hang or double-ask when driven by the launcher. All prompting lives in
   `collect_inputs`.
@@ -73,7 +81,10 @@ Plus a `main()` + `if __name__ == "__main__"` so the tool also runs standalone.
 - **MUST NOT hardcode credentials or tokens** anywhere in the file.
 - **MUST handle errors, not swallow them.** No bare `except:`. Catch specific
   exceptions and print a clear message.
-- **SHOULD** write its report to `C:\Claude\<toolname>_<timestamp>_<host>.txt`,
+- **MUST** build its output path with
+  `platform_paths.path("<toolname>_<timestamp>_<host>.txt")` rather than
+  hardcoding `C:\Claude\`. The suite runs on Linux as well as Windows.
+- **SHOULD** name the report `<toolname>_<timestamp>_<host>.txt`,
   echo the report to the console, and support the optional JIRA post — matching
   the rest of the suite so output is consistent.
 
@@ -109,6 +120,8 @@ structure but drop the client/credentials pieces.
 
 import os
 import datetime
+
+import platform_paths                               # all output paths go through this
 
 try:
     import paramiko  # noqa: F401
@@ -216,7 +229,10 @@ def run(params):
     print("")
     print("\n".join(lines))
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\my_tool_{}_{}.txt".format(ts, host)   # EDIT 4: filename prefix
+    # platform_paths.path() resolves the output directory per OS. Do NOT
+    # hardcode C:\Claude\ -- the suite runs on Linux too.
+    out_path = platform_paths.path(
+        "my_tool_{}_{}.txt".format(ts, host))                    # EDIT 4: filename prefix
     try:
         with open(out_path, "w") as f:
             f.write("\n".join(lines))
@@ -258,6 +274,12 @@ if __name__ == "__main__":
 
 Compatibility — the tool won't slide in without these:
 - [ ] File is a single `.py`, dropped in the launcher folder.
+- [ ] Output path via `platform_paths.path(...)`, not a hardcoded `C:\Claude\`.
+- [ ] **Web wiring done, or the tool is deliberately CLI-only and says so in
+      its docstring.** This spec gets you into the launcher; it does **not**
+      get you into the Flask app. That needs `app.py` edits and a template —
+      see `ADDING_A_TOOL.md` §3. `circuit_audit.py` satisfies this entire
+      spec and has never appeared in the web UI.
 - [ ] Has `TOOL_INFO` with all five keys; `order` doesn't collide with existing tools.
 - [ ] Has `collect_inputs(session)` (returns dict or None) and `run(params)`.
 - [ ] `run(params)` contains **no** `input()`/`getpass()` calls.
@@ -266,8 +288,16 @@ Compatibility — the tool won't slide in without these:
 - [ ] No hardcoded credentials/tokens; no bare `except:`.
 
 Safety — required before sharing (non-negotiable):
-- [ ] **Read-only**: every device command starts with `show`/`SHOW`
-      (grep the file to be sure). No `set/configure/commit/write/clear/no/...`.
+- [ ] **Read-only**: every command the tool *executes* starts with
+      `show`/`SHOW`/`ping`, or is session-only paging.
+
+      Check this by reading **every `.run()` / `run_command()` call site** and
+      the command string at its source — including strings built with
+      `.format()`. Do **not** rely on grepping the file for `set`/`configure`:
+      those words appear legitimately in printed runbook text, so the grep
+      produces false failures and tells you nothing about what is sent. The
+      call-site trace is the check; see `INTRUSIVE_COMMANDS.md` §Methodology,
+      which does exactly this for the whole suite.
 
 Function — the tool owner's responsibility:
 - [ ] It actually does what it's supposed to. Runs standalone first

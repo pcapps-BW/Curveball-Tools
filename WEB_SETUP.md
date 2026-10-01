@@ -1,23 +1,44 @@
-# Curveball Tools -- Web Front End (Proof of Concept)
+# Curveball Tools -- Web Front End
 
-A small Flask app that runs the **Autotester** from a browser instead of a
-terminal. This is a proof of concept covering one tool end to end; the plan
-is to run it locally first, then decide whether/how to move it onto a shared
-machine on the network.
+A Flask app that runs the whole suite from a browser instead of a terminal.
+It is now the primary way the tools are used, though it still runs on Flask's
+development server bound to localhost -- see section 6 before it leaves your
+machine.
+
+> This file described "a proof of concept covering one tool end to end" for
+> about two months after every tool was wired up. Section 4's "one tool wired
+> up" limitation was the specific line that misled. Corrected 2026-10-01.
 
 ---
 
-## 1. What's new
-
-Two new files, added alongside the existing tool files (nothing about the
-CLI tools changed except one small addition -- see section 5):
+## 1. The layout
 
 ```
 app.py                  <- the Flask app (run this)
-templates/index.html    <- the single page it serves
+templates/              <- base.html + home.html + one page per tool
+static/                 <- job.js (polling + form wiring), style.css, icon
 ```
 
-`requirements.txt` now also lists `flask>=3.0`.
+Every tool is routed. The **home page builds itself** from each module's
+`TOOL_INFO`, iterating `_TOOL_MODULES` and looking up `TOOL_URLS` for the
+link — so adding a tool to those two structures is what makes it appear.
+
+Three structures in `app.py` decide what exists:
+
+| Structure | Effect of being absent from it |
+|---|---|
+| `_TOOL_MODULES` | no card on the home page |
+| `TOOL_URLS` | `KeyError` at home-page render if it *is* in `_TOOL_MODULES` — they must agree |
+| a `@app.route` + template | nothing to click through to |
+
+**Two tools are deliberately not in all three.** `reverse_autotester.py` has a
+route and lives as a second card inside `templates/autotester.html`, but is
+absent from `_TOOL_MODULES`/`TOOL_URLS` so it does not render its own card.
+`circuit_audit.py` has none of the three and is CLI-only. See
+`ADDING_A_TOOL.md` for both patterns — an unexplained absence here reads
+exactly like a registration bug.
+
+`requirements.txt` lists `paramiko`, `requests`, `flask` and `keyring`.
 
 ---
 
@@ -37,9 +58,8 @@ Curveball Tools -- Web (proof of concept)
 Open http://127.0.0.1:5000 in a browser
 ```
 
-Open that URL. Fill in the form (same fields the CLI Autotester asks for --
-1250 IP, DS1 list, optional JIRA ticket, infra creds, GSX creds) and click
-**Run Autotester**.
+Open that URL. The home page lists every tool; each page's form asks the same
+fields that tool's `collect_inputs()` would have prompted for.
 
 What happens:
 1. The page submits the form and gets back a job id immediately.
@@ -64,10 +84,10 @@ never put in a cookie/session.
   with `input()`/`getpass()`, which would just hang forever with no
   terminal attached to a web request. `app.py` has its own form that asks
   for the same fields, builds the exact same `params` dict `collect_inputs()`
-  would have built, and calls `autotester_standalone.run(params)` directly.
-  Nothing about `run()`'s logic changed -- the SSH clients, Netbox lookups,
-  MUX resolution, GSX pull, report building are all the exact same code path
-  as the CLI.
+  would have built, and calls that tool's `run(params)` directly. Nothing
+  about `run()`'s logic changed -- the SSH clients, Netbox lookups, MUX
+  resolution, GSX pull, report building are all the exact same code path as
+  the CLI.
 
 - **Each run happens in a background thread, not the web request.** A
   multi-minute SSH job can't reasonably hold an HTTP connection open --
@@ -98,24 +118,38 @@ never put in a cookie/session.
 - **In-memory job store, no cleanup.** Every run adds an entry to a dict that
   nothing ever removes. Not a problem for a POC session; would want a real
   store (or at least a periodic sweep) before this runs unattended for days.
-- **One tool wired up.** Only the Autotester has a form right now. The other
-  8 tools follow the same pattern (a form matching their `collect_inputs()`
-  fields + a call to their `run(params)`) -- mechanical repetition once
-  you're happy with this one.
-- **Flask's built-in dev server, with `debug=True`.** Fine on localhost.
+- **The live progress log is captured by swapping `sys.stdout`.** Tools
+  already `print()` their progress; `_JobStdoutTee` routes each write to
+  whichever background thread's job log is writing, via a thread-id map. That
+  is why no tool module needed logging calls added — but it also means
+  anything that writes to stdout during a run lands in the user's log.
+- **Flask's built-in dev server, with `debug=True`.** Still true as of
+  v2.35 (`app.py` binds `127.0.0.1` with `debug=True`). Fine on localhost.
   See the migration checklist below before this is reachable from anywhere
   else.
 
 ---
 
-## 5. The one CLI-side change
+## 5. The CLI-side changes
 
-`autotester_standalone.run()` previously wrote its report to a file but
-returned nothing -- fine for the CLI (it only ever printed to the console),
-but the web app needs the file path back so it can read the report and offer
-a download link. `run()` now `return`s the output path in every code path
-(including early-exit failures). This doesn't change CLI behavior at all --
-`main()` still just calls `run(params)` and ignores the return value.
+**Two**, both additive, both no-ops for the CLI.
+
+**`run()` returns its output path.** It previously wrote the report and
+returned nothing — fine for a console tool, but the web app needs the path to
+read the report and offer a download. Every code path returns it now,
+including early-exit failures. `main()` still ignores the return value.
+
+**`autotester_standalone.run()` has an optional structured handback.** Pass an
+empty dict as `params["_extra_out"]` and it fills in `jira_summary`,
+`route_diag`, `mux_results`, `host_1250`, `ds1_map` and `run_summary`. Callers
+that don't set the key are completely unaffected, which is why `run()`'s return
+type never had to change.
+
+Two callers use it: `morning_check.py`, and — since v2.35 —
+`reverse_autotester.py`, which reads `mux_results` to compare the GSX
+assignment the forward walk derived against the one its own trace started
+from. **So `run()` now has consumers beyond the CLI and the web route**; check
+them before changing its params or what it hands back.
 
 ---
 

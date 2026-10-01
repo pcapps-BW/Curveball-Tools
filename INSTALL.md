@@ -1,4 +1,4 @@
-# Autotester (Standalone) — Installation & Setup Guide
+# Curveball Tools — Installation & Setup Guide
 
 **T1 Route Tracer with Performance Monitors**
 
@@ -10,28 +10,24 @@ This guide covers everything needed to run it on a new machine.
 
 ## 1. What you received
 
-A folder (e.g. `Consolidation`) containing these files. **Keep them all together in one folder** — the scripts import each other by filename.
+A folder containing the whole suite. **Keep it together** — the modules import
+each other by filename, so moving or renaming individual files breaks them.
 
-| File | Purpose |
+| What | Purpose |
 |------|---------|
-| `launcher.py` | **The program you run.** Menu front door for all the tools. |
-| `autotester_standalone.py` | Autotester tool — traces a T1 end to end across all four hops. |
-| `npt1250_discovery.py` | NPT-1250 discovery dump tool. |
-| `ds1_pms.py` | DS1 PMs tool. |
-| `fiber_util.py` | Fiber (GE) utilization tool. |
-| `health_check.py` | 1250 high-level health check tool. |
-| `interface_check.py` | IXC / interface check tool (runs from the 1800). |
-| `device_base.py` | Shared SSH machinery (base class for the device clients). |
-| `npt1250_client.py` | NPT-1250 client. |
-| `npt1800_client.py` | NPT-1800 client. |
-| `mux4216_client.py` | Cisco NCS 4216 MUX client (includes Netbox path reconciliation). |
-| `gsx_client.py` | GSX9000 client (uses plink). |
-| `netbox_client.py` | Netbox lookups (OC→SONET, GSX management IPs). |
-| `output_builders.py` | Builds the Autotester report. |
-| `jira_client.py` | Posts results to JIRA. |
-| `gsx_hostkey_test.py` | *Optional* standalone test for the GSX host-key handling. Not needed for normal use. |
+| `app.py` | **The web app — the normal way to run the suite.** `python app.py`, then http://127.0.0.1:5000 |
+| `templates/`, `static/` | The web app's pages and its JS/CSS. |
+| `launcher.py`, `Curveball Tools.bat` | CLI menu front door, for terminal use. |
+| the tool modules | One per tool (`autotester_standalone.py`, `reverse_autotester.py`, `site_sweep.py`, …). The home page builds itself from these, so that page is always the accurate list. |
+| the device clients | `device_base.py` plus `npt1250_client.py`, `npt1800_client.py`, `mux4216_client.py`, `gsx_client.py`. |
+| shared lookups & reporting | `hub_registry.py`, `netbox_client.py`, `ds1_util.py`, `chassis_config.py`, `nni_check.py`, `output_builders.py`. |
+| integrations & infrastructure | `jira_client.py`, `secure_config.py`, `platform_paths.py`, `assurance.py`. |
 | `requirements.txt` | Python package list for setup. |
-| `ADDING_A_TOOL.md` | How to add a new tool to the launcher (for contributors). |
+| `*.md` | Documentation — see `README.md` §Documentation for which file owns what. |
+
+This deliberately does not enumerate every module: the list was wrong for
+about two months, missing roughly fifteen files. `README.md` has the
+architecture table, and the code is the authority.
 
 ---
 
@@ -48,11 +44,11 @@ python --version
 ```
 
 ### 2.2 Python packages
-From inside the tool folder, install the two required packages:
+From inside the tool folder, install the required packages:
 ```
 pip install -r requirements.txt
 ```
-(That installs `paramiko` and `requests`. If `pip` isn't found, use `python -m pip install -r requirements.txt`.)
+(That installs `paramiko`, `requests`, `flask` and `keyring`. If `pip` isn't found, use `python -m pip install -r requirements.txt`.)
 
 ### 2.3 PuTTY (for the GSX hop)
 The GSX hop uses **plink**, which ships with PuTTY. Install PuTTY from the official site. A standard install puts `plink.exe` in `C:\Program Files\PuTTY\`, which the tool finds automatically.
@@ -116,7 +112,7 @@ Manager under the app name `Curveball`. Re-adding it to the file just migrates
 it again.
 
 To change or clear a stored token, use `secure_config.py`'s
-`set_password()` / `clear_password()`, or edit the entry directly in Windows
+`set_password()` / `delete_password()`, or edit the entry directly in Windows
 Credential Manager (Control Panel → Credential Manager → Windows Credentials).
 
 **`NETBOX_TOKEN` is not migrated.** It stays in `autotester_config.txt` as
@@ -140,22 +136,60 @@ On Windows this never applies: Credential Manager is always available.
 
 ## 4. Running the tools
 
-### Quickest way — double-click
-Double-click **`Curveball Tools.bat`** in the tool folder. It opens a terminal window, changes to the right directory, and launches the menu automatically. No need to navigate there manually.
-
-### From a terminal
+### The web app — the normal way
 From inside the tool folder:
+```
+python app.py
+```
+Then open **http://127.0.0.1:5000**. The home page lists every tool; each has
+a form, and the browser shows a live progress log while the run happens.
+
+This is how the suite is normally used. It binds to localhost only — see
+`WEB_SETUP.md` §6 before putting it on the network.
+
+Or double-click **`Start Curveball Tools.bat`**, which installs requirements if
+needed and starts the web app.
+
+### The CLI menu
 ```
 python launcher.py
 ```
+Or double-click **`Curveball Tools.bat`**. Note the two `.bat` files do
+different things: `Start Curveball Tools.bat` → the **web app**,
+`Curveball Tools.bat` → the **CLI menu**.
 
-### Pinning to the taskbar (optional, one-time setup)
-1. Right-click **`Create Curveball Shortcut.ps1`** → **Run with PowerShell**
+Each tool also runs on its own (`python autotester_standalone.py`), prompting
+for its own inputs.
+
+### Checking the install worked
+Seven self-tests run off-box, need no credentials and touch no devices:
+```
+python ds1_util.py
+python chassis_config.py
+python assurance.py
+python gsx_client.py --self-test
+python gsx_perfmon.py --self-test
+python circuit_audit.py --self-test
+python reverse_autotester.py --self-test
+```
+Each prints one `ok` line per check and ends with a pass line — the exact
+wording varies by module (`All reverse_autotester self-tests passed.`,
+`All parser self-tests passed.`, and `assurance.py` prints a worked example
+instead). **What matters is that no module prints `FAILED` / `FAILURES`.**
+If one does, stop — do not go near a device. `../../RUNBOOK.md` covers
+verification in full.
+
+### A pinnable shortcut (optional, one-time setup)
+1. Right-click **`Set Curveball Tools Icon.ps1`** → **Run with PowerShell**
    (Double-clicking opens Notepad — that is a Windows default for `.ps1` files, not a bug.)
-2. A **Curveball Tools** shortcut appears on your Desktop.
-3. Right-click that shortcut → **Pin to taskbar**.
+2. **`Start Curveball Tools.lnk` appears in this same folder** — not on your
+   Desktop. The icon has to live on a `.lnk` file, which is why the script
+   creates one rather than pinning the `.bat` directly.
+3. Copy or move that `.lnk` into your Start Menu Programs folder, then pin it.
 
-One click on the taskbar icon opens a terminal and launches the menu.
+The shortcut targets `Start Curveball Tools.bat`, so it launches the **web
+app** — not the CLI menu. The script's own header comments document a Windows
+quirk where the pinned item loses its target; the fix is in there.
 
 The menu is built automatically from the tool files present in the folder, so new tools can be dropped in without changing the launcher (see `ADDING_A_TOOL.md`).
 
@@ -222,8 +256,10 @@ No action is needed from you; this happens automatically.
 - [ ] `C:\Claude\` folder exists
 - [ ] `C:\Claude\autotester_config.txt` created with your own tokens
 - [ ] All tool files kept together in one folder
-- [ ] Launch: double-click `Curveball Tools.bat` — or `python launcher.py`
-- [ ] *(Optional)* Right-click `Create Curveball Shortcut.ps1` → Run with PowerShell → Pin to taskbar
+- [ ] Launch the web app: `python app.py`, then open http://127.0.0.1:5000
+- [ ] *(or the CLI menu)* double-click `Curveball Tools.bat` — or `python launcher.py`
+- [ ] Run the seven self-tests (section 4) — they need no credentials
+- [ ] *(Optional)* Right-click `Set Curveball Tools Icon.ps1` → Run with PowerShell → Pin to taskbar
 
 ---
 
@@ -245,4 +281,5 @@ No action is needed from you; this happens automatically.
 - **Read-only.** The tool only issues show/status/PM commands and session-only paging settings (e.g. `terminal length 0`). It makes no configuration changes to any device.
 - **Peerless circuits** (customer-facing, ts21/ts24 on the 1800) correctly stop at the 1800 — there is no Bandwidth MUX or GSX hop for them.
 - Runs take a few minutes; the 1800 MUSE lookup in particular is slow by nature.
-- Paths (`C:\Claude\`) are currently fixed. A future version is planned with a graphical front end and configurable paths.
+- Output paths resolve through `platform_paths.py`, so the suite runs on Linux as well as Windows. New tools must use it rather than hardcoding a path.
+- The web front end exists (`app.py`); it runs on Flask's development server bound to localhost. See `WEB_SETUP.md` §6 for what to change before it leaves your machine.
