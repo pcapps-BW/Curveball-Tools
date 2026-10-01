@@ -423,7 +423,20 @@ def _run_from_1250(params):
     mr = mux_results[ds1]
     acr_num      = mr["acr_group"]
     cem_group    = mr["cem_group"]
-    active_sonet = mr.get("active_sonet", "?")
+    active_sonet = mr.get("active_sonet")
+
+    # acr_group / active_sonet are None when the CEM could not be located in
+    # any ACR group (mux4216_client stopped guessing one, 2026-10-01). Both
+    # are interpolated straight into device commands below -- 'show run
+    # controller SONET-ACR None' and 'show cem interface CEM None' -- so bail
+    # out here rather than sending malformed commands to a production MUX and
+    # then parsing whatever error comes back.
+    if not acr_num or not active_sonet:
+        print("[!] {}: ACR/active SONET path undetermined on the MUX "
+              "(CEM {} not found in any ACR group) -- cannot build the MUX "
+              "loop commands.".format(ds1, cem_group or "?"))
+        cmux.close()
+        return None
     gsx_ce_iface = mr.get("gsx_ce_iface", "?")
     gsx_cem_id   = mr.get("gsx_cem_id", "?")
     gsx_node     = mr.get("gsx_node", "?")
@@ -739,12 +752,12 @@ def _run_mux_direct(params):
 
 def _build_script(circuit, precheck_sections):
     acr_num      = circuit.get("acr_num", "?")
-    cem_group    = circuit.get("cem_group", "?")
+    cem_group    = circuit.get("cem_group") or "?"
     gsx_ce_iface = circuit.get("gsx_ce_iface", "?")
     gsx_cem_id   = circuit.get("gsx_cem_id", "?")
     conn_name    = circuit.get("conn_name") or "<CONNECTION_NAME>"
     conn_missing = not circuit.get("conn_name")
-    active_sonet = circuit.get("active_sonet", "?")
+    active_sonet = circuit.get("active_sonet") or "?"
     ds1          = circuit.get("ds1", "?")
     host_1250    = circuit.get("host_1250", circuit.get("ip_1250", "?"))
     hub_hostname = circuit.get("hub_hostname", circuit.get("hub_ip", "?"))

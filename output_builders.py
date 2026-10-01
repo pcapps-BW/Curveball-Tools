@@ -1319,8 +1319,15 @@ def build_route_block(ds1, host_1250, loopback_ip, muse_id,
         "  HOP 3 -- Cisco NCS 4216 MUX",
         "    MUX        : {}".format(mux_data.get("mux_name", "?")),
         "    IP         : {}".format(mux_data.get("mux_ip", "?")),
-        "    Active Path: SONET {}".format(mux_data.get("active_sonet") or "?"),
-        "    ACR Group  : {}".format(mux_data.get("acr_group", "?")),
+        # ACR / active path are None when the CEM could not be located in any
+        # ACR group. Rendered as NONE FOUND rather than "?" or "None": "?" is
+        # used all over this report for merely-absent fields, and this is a
+        # stronger statement -- we looked and did not find it. Previously a
+        # guessed ACR was printed here as though it were determined.
+        "    Active Path: {}".format(
+            "SONET {}".format(mux_data["active_sonet"])
+            if mux_data.get("active_sonet") else "NONE FOUND"),
+        "    ACR Group  : {}".format(mux_data.get("acr_group") or "NONE FOUND"),
         "    CEM Group  : {} (VTG {}, T1 {})".format(
             mux_data.get("cem_group", "?"),
             mux_data.get("vtg") or "?",
@@ -1360,7 +1367,7 @@ def build_route_block(ds1, host_1250, loopback_ip, muse_id,
         "  SUMMARY",
         "  1250 {}  |  {}  |  {}".format(ds1, muse_id, oc12),
         "  {} ACR {} CEM {}  |  CE{}:{}  |  {} {}".format(
-            mux_data.get("mux_name", "?"), mux_data.get("acr_group", "?"),
+            mux_data.get("mux_name", "?"), mux_data.get("acr_group") or "?",
             mux_data.get("cem_group", "?"),
             mux_data.get("gsx_ce_iface", "?"), mux_data.get("gsx_cem_id", "?"),
             mux_data.get("gsx_node") or "?", gsx_assign),
@@ -1612,7 +1619,7 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         lines.append("         MUX  --  {}  ({})".format(
             mux.get("mux_name", "?"), mux.get("mux_ip", "?")))
         lines.append("         {} | SONET {}  ACR {}  CEM {}".format(
-            oc12, mux.get("active_sonet", "?"), mux.get("acr_group", "?"),
+            oc12, mux.get("active_sonet") or "?", mux.get("acr_group") or "?",
             mux.get("cem_group", "?")))
         fa_list = mux.get("facility_alarms") or []
         if fa_list:

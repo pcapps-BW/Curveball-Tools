@@ -15,6 +15,65 @@ that's bitten this project before.
 
 ---
 
+## v2.17 — 2026-10-01
+
+### MUX: ACR/active-path fallback no longer guesses an ACR group
+
+When the CEM group could not be located in any ACR group, `mux4216_client.py`
+assigned `acr_groups[0]` -- whichever ACR happened to parse first off
+`show acr group` -- and the route block printed that ACR number and its active
+SONET path as though they had been determined:
+
+```python
+if not cem_group:
+    cem_group    = expected_cem
+    acr_num      = acr_groups[0]["acr"]      # <- a guess
+    active_sonet = acr_groups[0]["active"]   # <- a guess
+```
+
+A confident wrong ACR and SONET path is the LAXGSX04 failure in a different
+field, and the comment documenting that very lesson sits twenty lines below
+this code. The NetBox-mismatch branch above it already does the right thing and
+raises rather than guessing.
+
+**Now:** `acr_num` and `active_sonet` are left `None` and the report says
+`NONE FOUND` (pcapps' call -- mark it not found, do not fail the whole run).
+`cem_group` keeps `expected_cem`, because that is arithmetic from the OC
+assignment (STS + DS1), not a guess -- it is the value we were looking for.
+A warning naming the CEM and MUX is added to `netbox_conflict`.
+
+`NONE FOUND` rather than `?` deliberately: `?` is used across this report for
+merely-absent fields, and this is a stronger statement -- we looked and did not
+find it.
+
+**Following the None through the rest of the suite**, which mattered more than
+the fix itself:
+
+- `mux_loop_script.py` interpolates both values straight into device commands
+  (`show run controller SONET-ACR {}`, `show cem interface CEM {}`). With
+  `None` it would have sent `SONET-ACR None` to a production MUX and then
+  parsed whatever error came back. It now refuses with an explanatory message
+  before connecting further.
+- Four render sites used `.get("acr_group", "?")`. A positional default does
+  NOT apply when the key exists with value `None`, so those would have printed
+  the literal string `None`. Changed to `or "?"` in `output_builders.py` (x2),
+  `autotester_standalone.py`, and `mux_loop_script.py` (x2).
+
+Verified by rendering a route block both ways -- resolved shows
+`Active Path: SONET 0/7/4 / ACR Group: 53`, undetermined shows
+`Active Path: NONE FOUND / ACR Group: NONE FOUND` with the CEM still reported.
+
+### Not a bug: ACR 53 on ATL1-MUX-02
+
+Investigated and cleared. A TAMPFLXA952 run reported `ACR Group: 53` /
+`Active Path: SONET 0/7/4`, which looked wrong against a `show acr group`
+screenshot showing 0/7/4 under ACR 13. `show acr group | i 0/7/4` on the live
+device returns ACR 53 (working 0/7/4, protect 0/12/4, currently active 0/7/4).
+The report was correct; the screenshot was illustrative documentation, not that
+box's current state. Recorded so nobody re-opens it.
+
+---
+
 ## v2.16 — 2026-10-01
 
 ### `chassis_config.py` (new): read the far-end description off the 1800 itself

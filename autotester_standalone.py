@@ -532,7 +532,7 @@ def run(params):
         emit("")
         emit("  -- {} --".format(ds1.upper()))
         emit("  CEM-ACR{} {}  (conn: {})".format(
-            r.get("acr_group", "?"), r.get("cem_group", "?"),
+            r.get("acr_group") or "?", r.get("cem_group") or "?",
             r.get("conn_name") or "not found"))
         if cem_h.get("cem_circuit_raw"):
             for line in cem_h["cem_circuit_raw"].splitlines():

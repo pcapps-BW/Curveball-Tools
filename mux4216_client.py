@@ -341,9 +341,28 @@ class MUX4216Client(BaseDeviceClient):
                             if cem_group:
                                 break
                         if not cem_group:
+                            # NOT FOUND -- say so. This used to assign
+                            # acr_groups[0], i.e. whichever ACR happened to
+                            # parse first, and the report then printed that
+                            # ACR number and its active SONET path as if they
+                            # had been determined. A confident wrong ACR and
+                            # SONET path is the LAXGSX04 failure (see the
+                            # comment block below), just in a different field.
+                            #
+                            # cem_group keeps expected_cem because that is
+                            # ARITHMETIC from the OC assignment (STS + DS1),
+                            # not a guess -- it is what we were looking for.
+                            # acr_num and active_sonet stay None, which the
+                            # route block renders as "NONE FOUND".
                             cem_group    = expected_cem
-                            acr_num      = acr_groups[0]["acr"]
-                            active_sonet = acr_groups[0]["active"]
+                            acr_num      = None
+                            active_sonet = None
+                            _nf = ("CEM {} not found in any ACR group on {} "
+                                   "-- ACR and active SONET path UNDETERMINED "
+                                   "(not guessed)".format(expected_cem, mux_name))
+                            netbox_conflict = (
+                                "{}; {}".format(netbox_conflict, _nf)
+                                if netbox_conflict else "WARNING: " + _nf)
 
                 # ---- xconnect -> GSX CE interface + CEM id ----
                 #
