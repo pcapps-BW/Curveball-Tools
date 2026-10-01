@@ -1,4 +1,0 @@
-paramiko>=3.5
-requests>=2.30
-flask>=3.0
-keyring>=24.0   # secure_config.py -- Windows Credential Manager storage

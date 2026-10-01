@@ -1,33 +1,56 @@
-# Python bytecode -- 48 .pyc files were tracked until 2026-10-01, which made
-# every run show the repo as dirty and buried real changes in the diff.
+# ⚠ THE LEADING BACKSLASH ON '\!Revisions' IS REQUIRED.
+#
+# '!' starts a NEGATION pattern in gitignore. The release folder is literally
+# named '!Revisions', so an unescaped '!Revisions/*.zip' is parsed as
+# "un-ignore Revisions/*.zip" -- a silent no-op. That mistake shipped on
+# 2026-10-01 and pushed 25 release zips (14.34 MiB) to the remote. Verified
+# with `git check-ignore -v` after escaping.
+
+# --- Python bytecode (48 .pyc files were tracked until 2026-10-01) ---
 __pycache__/
 *.py[cod]
 *.pyo
 
-# Runtime config and credentials. autotester_config.txt holds NETBOX_TOKEN in
-# plaintext (NETBOX_TOKEN is not migrated to the credential store). The
-# .example file is the one that belongs in the repo.
+# --- Credentials and runtime config ---
+# autotester_config.txt holds NETBOX_TOKEN in plaintext (NETBOX_TOKEN is NOT
+# migrated to the OS credential store). Only the .example belongs in the repo.
 autotester_config.txt
 .secure_fallback.json
 *.pem
 *.key
 
-# Per-run state and reports -- machine-local, not source.
+# --- Per-run state and reports: machine-local, not source ---
 ospf_stability_state.json
 *.xlsx
-Circuit_Audit_*.xlsx
 autotester_*.txt
 gsx_perfmon_*.txt
 site_sweep_*.txt
 health_check_*.txt
 interface_check_*.txt
+ds1_pms_*.txt
 *_connect_fail.txt
 
-# Release artifacts. The canonical CHANGELOG lives in !Revisions/ and IS
-# tracked; the zips are build output and should not be.
-!Revisions/*.zip
-!Revisions/Production/
+# --- Release artifacts: build output, not source ---
+# The canonical CHANGELOG lives at '!Revisions/CHANGELOG.md' and IS tracked
+# (negated at the bottom of this file). Everything else under there is built.
+\!Revisions/*.zip
+\!Revisions/Production/
+\!Revisions/Curveball*/
+# Orphaned temp files from interrupted zip writes (random 8-char names).
+\!Revisions/zi??????
 
-# Windows shortcut/launcher cruft and stray path artifacts.
+# --- Windows launcher cruft ---
 *.lnk
+# Artifact of a path-handling bug: a literal 'C:\Claude' directory created
+# inside the project.
 C:\\Claude/
+
+# --- Internal working notes, not for the shared repo ---
+SYSTEMS_MEETING_PREP.md
+
+# --- Re-include things the blanket rules above would wrongly catch ---
+# 'autotester_*.txt' is meant for run reports, but it also matches the example
+# config template, which DOES belong in the repo. Caught by a check-ignore
+# test, not by reading the file.
+!autotester_config.example.txt
+!\!Revisions/CHANGELOG.md

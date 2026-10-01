@@ -1,4 +1,0 @@
-Keith Wood  [10:24 AM]
-@netops-ip-eng i built netops-app-01a.dfw1.bwnet.us for us to have as a shared server for scripts/tools/apps, whatever.
-1 replyKeith Wood  [10:25 AM]
-eventually once it is moving, we'll set us ip a nightly replication to netops-app-01a.atl1 as a disaster recovery
