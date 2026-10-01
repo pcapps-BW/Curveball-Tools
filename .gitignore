@@ -1,0 +1,33 @@
+# Python bytecode -- 48 .pyc files were tracked until 2026-10-01, which made
+# every run show the repo as dirty and buried real changes in the diff.
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Runtime config and credentials. autotester_config.txt holds NETBOX_TOKEN in
+# plaintext (NETBOX_TOKEN is not migrated to the credential store). The
+# .example file is the one that belongs in the repo.
+autotester_config.txt
+.secure_fallback.json
+*.pem
+*.key
+
+# Per-run state and reports -- machine-local, not source.
+ospf_stability_state.json
+*.xlsx
+Circuit_Audit_*.xlsx
+autotester_*.txt
+gsx_perfmon_*.txt
+site_sweep_*.txt
+health_check_*.txt
+interface_check_*.txt
+*_connect_fail.txt
+
+# Release artifacts. The canonical CHANGELOG lives in !Revisions/ and IS
+# tracked; the zips are build output and should not be.
+!Revisions/*.zip
+!Revisions/Production/
+
+# Windows shortcut/launcher cruft and stray path artifacts.
+*.lnk
+C:\\Claude/

@@ -17,13 +17,15 @@ Built by P. Capps.
 import re
 import sys
 
+import platform_paths
+
 try:
     import requests
 except ImportError:
     print("ERROR: requests not installed. Run:  pip install requests")
     sys.exit(1)
 
-CONFIG_PATH = r"C:\Claude\autotester_config.txt"
+CONFIG_PATH = platform_paths.path("autotester_config.txt")
 
 
 def load_netbox_config(path=CONFIG_PATH):
@@ -127,6 +129,75 @@ class NetboxClient:
         dev = ep.get("device") or {}
         mux_name = dev.get("name") or dev.get("display")
         return sonet_path, mux_name
+
+    def device_interface_descriptions(self, hostname):
+        """
+        All interfaces for a device: [{name, type, description}, ...].
+
+        Returns ([], reason) on failure -- NEVER an empty list presented as
+        "this device has no interfaces". A NetBox outage and a device with
+        nothing configured must not look the same; that ambiguity is what
+        made a dropped VPN read as "no MUX found" (2026-09-18).
+
+        Paginated, same 20-page ceiling as oc_to_sonet.
+        """
+        if not self.ok():
+            return [], "NetBox not configured"
+        if not hostname:
+            return [], "no hostname"
+
+        import urllib.parse
+        url = "{}/api/dcim/interfaces/?device={}&limit=500".format(
+            self.base_url, urllib.parse.quote(hostname, safe=""))
+        out, pages = [], 0
+        try:
+            while url and pages < 20:
+                r = self.session.get(url, timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                for i in data.get("results", []):
+                    t = i.get("type") or {}
+                    out.append({
+                        "name": (i.get("name") or "").strip(),
+                        "type": (t.get("label") or t.get("value") or ""),
+                        "description": (i.get("description") or "").strip(),
+                        "ip": "",
+                    })
+                url = data.get("next")
+                pages += 1
+        except Exception as e:
+            return [], "{}: {}".format(type(e).__name__, e)
+
+        # Interface IPs come from IPAM, not the interface serializer.
+        # They are what lets a hub's OSPF neighbour address be matched to a
+        # specific 1250 interface -- and therefore to that interface's
+        # circuit description -- WITHOUT needing to log into the device.
+        # Confirmed on FTMYFLXA939: ge-ts2/1 = 10.111.133.212/31 (JFK range),
+        # ge-ts5/1 = 10.111.132.212/31 (ATL range).
+        by_name = {}
+        ipurl = "{}/api/ipam/ip-addresses/?device={}&limit=500".format(
+            self.base_url, urllib.parse.quote(hostname, safe=""))
+        try:
+            pages = 0
+            while ipurl and pages < 20:
+                r = self.session.get(ipurl, timeout=20)
+                r.raise_for_status()
+                data = r.json()
+                for rec in data.get("results", []):
+                    ao = rec.get("assigned_object") or {}
+                    nm = (ao.get("name") or "").strip()
+                    addr = (rec.get("address") or "").split("/")[0].strip()
+                    if nm and addr and nm not in by_name:
+                        by_name[nm] = addr
+                ipurl = data.get("next")
+                pages += 1
+        except Exception:
+            # Descriptions are still usable without IPs -- degrade, don't fail.
+            by_name = {}
+
+        for i in out:
+            i["ip"] = by_name.get(i["name"], "")
+        return out, None
 
     # ---- NPT-1800 hub device discovery ----
     def hub_1800_devices(self, name_contains="ces01"):

@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}IXC Stability (BETA) -- Curveball Tools{% endblock %}
+{% block content %}
+<h1>IXC Stability Monitor <span style="color:#c0392b;font-size:0.7em;vertical-align:middle;">(BETA)</span></h1>
+<div class="sub">Fleet-wide DS1 physical alarm sweep.  Tracks LOS/NoLOS state per DS1 on every CES slot and
+  reports transitions since the last run.  Catches IXC-side failures invisible to OSPF/LDP monitoring.
+  Requires OSPF &amp; LDP Stability to have run at least once.  State persists between runs --
+  first run establishes baseline only.</div>
+
+<div class="panel" style="border-left:4px solid #c0392b;">
+  <p style="margin:0 0 12px;color:#c0392b;font-weight:600;">
+    &#9888; BETA &mdash; run locally for validation only.  Do not rely on this output for production decisions.
+  </p>
+</div>
+
+<div class="panel">
+  <form id="runForm" data-run-url="/api/ixc-stability/run">
+
+    <div class="row">
+      <div>
+        <label for="infra_user">Infrastructure username</label>
+        <input type="text" id="infra_user" name="infra_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="infra_pass">Infrastructure password</label>
+        <input type="password" id="infra_pass" name="infra_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="openWhenDone" name="open_when_done">
+      <label for="openWhenDone">Open report when done</label>
+    </div>
+    <div class="hint">Only works when this server is running on your own machine.</div>
+
+    <button type="submit">Run IXC Stability Sweep</button>
+    <div class="field-error" id="formError"></div>
+  </form>
+</div>
+
+{% include "_job_panels.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='job.js') }}"></script>
+<script>
+  initJobForm('runForm');
+</script>
+{% endblock %}

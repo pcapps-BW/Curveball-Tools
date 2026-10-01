@@ -96,6 +96,46 @@ Notes:
 **Getting a Netbox API token:** Netbox → your profile → API Tokens.
 **Getting an Atlassian API token:** Atlassian account settings → Security → API tokens.
 
+### `JIRA_TOKEN` disappears from this file — that is expected
+
+On first load, `secure_config.py` moves any sensitive key it finds in plaintext
+into the OS credential store (**Windows Credential Manager**) and **deletes the
+plaintext line from `autotester_config.txt`**.
+
+Keys handled this way:
+
+| Key | Stored where |
+|---|---|
+| `INFRA_PASS` | Credential Manager |
+| `GSX_PASS` | Credential Manager |
+| `JIRA_TOKEN` | Credential Manager |
+
+So after your first run, the `JIRA_TOKEN=` line is gone from the file. **Nothing
+is broken and you do not need to re-add it** — the token is in Credential
+Manager under the app name `Curveball`. Re-adding it to the file just migrates
+it again.
+
+To change or clear a stored token, use `secure_config.py`'s
+`set_password()` / `clear_password()`, or edit the entry directly in Windows
+Credential Manager (Control Panel → Credential Manager → Windows Credentials).
+
+**`NETBOX_TOKEN` is not migrated.** It stays in `autotester_config.txt` as
+plaintext. Treat the file as sensitive and do not share or commit it.
+
+### On Linux, there may be no credential store
+
+`keyring` only works on Linux when a Secret Service (GNOME Keyring) or KWallet
+daemon is actually running. A headless server or VM usually has neither. In that
+case `secure_config.py` falls back to a permissions-locked (`chmod 600`) local
+JSON file — **still plaintext**.
+
+This is acceptable for a lab or demo box. It is **not** an appropriate
+credential posture for a shared or production deployment; that needs a real
+secrets backend. The tool prints a warning when it takes this path — do not
+ignore it.
+
+On Windows this never applies: Credential Manager is always available.
+
 ---
 
 ## 4. Running the tools

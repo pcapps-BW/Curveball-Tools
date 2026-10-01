@@ -17,6 +17,8 @@ import re
 import os
 import datetime
 
+import platform_paths
+
 try:
     import paramiko  # noqa: F401
     _DEP_ERROR = None
@@ -148,119 +150,126 @@ def run(params):
     except Exception as e:
         print("[!] connect failed: {}: {}".format(type(e).__name__, e))
         return None
-    host = c.hostname
-    print("  host: {}".format(host))
+    try:
+        # try/finally added 2026-10-01: the body below is long, and any
+        # exception in it used to return without closing the session.
+        # Harmless for a one-shot CLI run (process exits, socket drops) but
+        # NOT in the long-lived Flask app, where the transport and its
+        # reader thread would survive until the device timed the session out.
+        host = c.hostname
+        print("  host: {}".format(host))
 
-    lines = []
-    lines.append("NPT-1250 DISCOVERY DUMP")
-    lines.append("Host: {}".format(host))
-    lines.append("IP:   {}".format(ip))
-    lines.append("=" * 64)
+        lines = []
+        lines.append("NPT-1250 DISCOVERY DUMP")
+        lines.append("Host: {}".format(host))
+        lines.append("IP:   {}".format(ip))
+        lines.append("=" * 64)
 
-    raw_by_title = {}   # section title -> raw output, for the JIRA summary
+        raw_by_title = {}   # section title -> raw output, for the JIRA summary
 
-    def sec(title, cmd, nomore=True):
-        full = cmd + (" | no-more" if nomore else "")
-        print("  collecting: {}".format(title))
-        raw = c.run(full)
-        raw_by_title[title] = raw
-        _section(lines, title, cmd, raw)
+        def sec(title, cmd, nomore=True):
+            full = cmd + (" | no-more" if nomore else "")
+            print("  collecting: {}".format(title))
+            raw = c.run(full)
+            raw_by_title[title] = raw
+            _section(lines, title, cmd, raw)
 
-    # Device info
-    sec("Software Version", "show version")
-    sec("Chassis Hardware", "show chassis hardware")
-    sec("Interface Summary", "show interfaces")
+        # Device info
+        sec("Software Version", "show version")
+        sec("Chassis Hardware", "show chassis hardware")
+        sec("Interface Summary", "show interfaces")
 
-    # Fiber interfaces
-    fiber_slots = _get_fiber_slots(c)
-    if not fiber_slots:
-        lines.append("\n  NOTE: No fiber (GE) slots detected.")
-    for slot in fiber_slots:
-        # transceiver info does not support | no-more
-        cmd = "show chassis transceiver information slot {} port1".format(slot)
-        print("  collecting: Transceiver -- {}".format(slot))
-        _section(lines, "Transceiver -- {}".format(slot), cmd, c.run(cmd))
-        sec("Fiber Interface Config -- {}".format(slot),
-            "show configuration interfaces ge-{}/1 | display-set".format(slot))
-        sec("Fiber Interface Stats -- {}".format(slot),
-            "show interfaces ge-{}/1".format(slot))
+        # Fiber interfaces
+        fiber_slots = _get_fiber_slots(c)
+        if not fiber_slots:
+            lines.append("\n  NOTE: No fiber (GE) slots detected.")
+        for slot in fiber_slots:
+            # transceiver info does not support | no-more
+            cmd = "show chassis transceiver information slot {} port1".format(slot)
+            print("  collecting: Transceiver -- {}".format(slot))
+            _section(lines, "Transceiver -- {}".format(slot), cmd, c.run(cmd))
+            sec("Fiber Interface Config -- {}".format(slot),
+                "show configuration interfaces ge-{}/1 | display-set".format(slot))
+            sec("Fiber Interface Stats -- {}".format(slot),
+                "show interfaces ge-{}/1".format(slot))
 
-    # Routing / protocols
-    sec("Protocols Config (OSPF/LDP)",
-        "show configuration protocols | display-set | except tunnel")
-    sec("OSPF Neighbors", "show ospf neighbor")
-    sec("OSPF Interfaces", "show ospf interface")
-    sec("LDP Sessions", "show ldp session")
-    sec("LDP Adjacency", "show ldp adjacency")
-    sec("BFD Sessions", "show bfd session")
+        # Routing / protocols
+        sec("Protocols Config (OSPF/LDP)",
+            "show configuration protocols | display-set | except tunnel")
+        sec("OSPF Neighbors", "show ospf neighbor")
+        sec("OSPF Interfaces", "show ospf interface")
+        sec("LDP Sessions", "show ldp session")
+        sec("LDP Adjacency", "show ldp adjacency")
+        sec("BFD Sessions", "show bfd session")
 
-    # Alarms and events
-    sec("Chassis Alarms", "show chassis alarms")
-    sec("System Alarms", "show system alarms")
-    sec("NE Alarms", "show ne alarms")
-    sec("NE Events", "show ne events")
-    sec("NE Events Unreported", "show ne events unreported")
+        # Alarms and events
+        sec("Chassis Alarms", "show chassis alarms")
+        sec("System Alarms", "show system alarms")
+        sec("NE Alarms", "show ne alarms")
+        sec("NE Events", "show ne events")
+        sec("NE Events Unreported", "show ne events unreported")
 
-    # DS1 physical status -- populated CES slots
-    ces_slots = _get_ces_slots(c)
-    if not ces_slots:
-        lines.append("\n  NOTE: No CES slots detected.")
-    for slot in ces_slots:
-        sec("DS1 Physical Status -- {}".format(slot),
-            "show interfaces physical status slot {}".format(slot))
+        # DS1 physical status -- populated CES slots
+        ces_slots = _get_ces_slots(c)
+        if not ces_slots:
+            lines.append("\n  NOTE: No CES slots detected.")
+        for slot in ces_slots:
+            sec("DS1 Physical Status -- {}".format(slot),
+                "show interfaces physical status slot {}".format(slot))
 
-    # MUSE / active DS1 config
-    sec("Active DS1s (MUSE Tunnels)",
-        'show configuration | display-set | grep ds1 | grep "peer-address"')
-    sec("All Peer Addresses",
-        'show configuration | display-set | match "peer-address"')
-    sec("NE-ID (VLAN)", 'show configuration | display-set | grep ne-id')
-    sec("DS1 Descriptions", 'show configuration | display-set | grep description')
-    sec("Customer DS1s (Peerless)",
-        'show configuration | display-set | grep Peerless')
-    sec("PM Collection Enabled Interfaces",
-        'show configuration | display-set | grep pm-collection-enable | match interfaces')
-    sec("PM Monitor Enabled Interfaces",
-        'show configuration | display-set | grep pm-monitor-enable | match interfaces')
+        # MUSE / active DS1 config
+        sec("Active DS1s (MUSE Tunnels)",
+            'show configuration | display-set | grep ds1 | grep "peer-address"')
+        sec("All Peer Addresses",
+            'show configuration | display-set | match "peer-address"')
+        sec("NE-ID (VLAN)", 'show configuration | display-set | grep ne-id')
+        sec("DS1 Descriptions", 'show configuration | display-set | grep description')
+        sec("Customer DS1s (Peerless)",
+            'show configuration | display-set | grep Peerless')
+        sec("PM Collection Enabled Interfaces",
+            'show configuration | display-set | grep pm-collection-enable | match interfaces')
+        sec("PM Monitor Enabled Interfaces",
+            'show configuration | display-set | grep pm-monitor-enable | match interfaces')
 
-    # PMs -- active DS1s only
-    active_ds1s = _get_active_ds1s(c)
-    lines.append("")
-    lines.append("=" * 64)
-    lines.append("  PERFORMANCE MONITORS -- ACTIVE DS1s ({})".format(len(active_ds1s)))
-    lines.append("=" * 64)
-    if not active_ds1s:
-        lines.append("  No active MUSE DS1s found.")
-    else:
-        for ds1 in active_ds1s:
-            print("  collecting: PMs -- {}".format(ds1))
-            lines.append("\n  -- {} --".format(ds1))
+        # PMs -- active DS1s only
+        active_ds1s = _get_active_ds1s(c)
+        lines.append("")
+        lines.append("=" * 64)
+        lines.append("  PERFORMANCE MONITORS -- ACTIVE DS1s ({})".format(len(active_ds1s)))
+        lines.append("=" * 64)
+        if not active_ds1s:
+            lines.append("  No active MUSE DS1s found.")
+        else:
+            for ds1 in active_ds1s:
+                print("  collecting: PMs -- {}".format(ds1))
+                lines.append("\n  -- {} --".format(ds1))
 
-            cmd = "show interfaces pm 15min {} ces".format(ds1)
-            raw = c.run(cmd + " | no-more")
-            if "switch of this interface object is off" in raw:
-                raw = ("  NOTE: CES PMs not enabled on this DS1.\n"
-                       "  To enable: set interfaces {} unit 0 pm-collection-enable".format(ds1))
-            _section(lines, "CES PM 15min -- {}".format(ds1), cmd, raw)
+                cmd = "show interfaces pm 15min {} ces".format(ds1)
+                raw = c.run(cmd + " | no-more")
+                if "switch of this interface object is off" in raw:
+                    raw = ("  NOTE: CES PMs not enabled on this DS1.\n"
+                           "  To enable: set interfaces {} unit 0 pm-collection-enable".format(ds1))
+                _section(lines, "CES PM 15min -- {}".format(ds1), cmd, raw)
 
-            cmd = "show interfaces pm 24hour {} ces".format(ds1)
-            raw = c.run(cmd + " | no-more")
-            if "switch of this interface object is off" in raw:
-                raw = "  NOTE: CES PMs not enabled on this DS1."
-            _section(lines, "CES PM 24hr -- {}".format(ds1), cmd, raw)
+                cmd = "show interfaces pm 24hour {} ces".format(ds1)
+                raw = c.run(cmd + " | no-more")
+                if "switch of this interface object is off" in raw:
+                    raw = "  NOTE: CES PMs not enabled on this DS1."
+                _section(lines, "CES PM 24hr -- {}".format(ds1), cmd, raw)
 
-            sec("Physical PM 24hr -- {}".format(ds1),
-                "show interfaces physical pm 24hour {}".format(ds1))
+                sec("Physical PM 24hr -- {}".format(ds1),
+                    "show interfaces physical pm 24hour {}".format(ds1))
 
-    # Loopbacks
-    sec("Loopback Config", 'show configuration | display-set | match "lo0"')
-    sec("Active Maintenance Loopbacks",
-        'show configuration | display-set | grep "loopback terminal"')
+        # Loopbacks
+        sec("Loopback Config", 'show configuration | display-set | match "lo0"')
+        sec("Active Maintenance Loopbacks",
+            'show configuration | display-set | grep "loopback terminal"')
 
-    c.close()
+    finally:
+        c.close()
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\1250_discovery_{}_{}.txt".format(ts, host)
+    out_path = platform_paths.path("1250_discovery_{}_{}.txt".format(ts, host))
     try:
         with open(out_path, "w") as f:
             f.write("\n".join(lines))

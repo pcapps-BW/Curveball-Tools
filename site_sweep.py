@@ -24,6 +24,7 @@ import sys
 import datetime
 import getpass
 
+import platform_paths
 from device_base import CredentialError, prompt_ip
 from npt1250_client import NPT1250Client
 from jira_client import post_report, valid_ticket, post_slack, load_jira_config
@@ -50,7 +51,7 @@ TOOL_INFO = {
     'order':    7,
 }
 
-OUTPUT_DIR  = r"C:\Claude"
+OUTPUT_DIR  = platform_paths.BASE_DIR
 
 
 # ── DS1 auto-discovery ────────────────────────────────────────────────────────
@@ -124,10 +125,10 @@ def _collect_fiber(c1250):
             pm15  = c1250.run(
                 "show interfaces physical pm 15min {} | no-more".format(port))
             laser = c1250.run(
-                "show chassis transceiver information slot {} port1 | grep laser"
+                "show chassis transceiver information slot {} port1 | grep laser | no-more"
                 .format(slot))
             tca = c1250.run(
-                "show chassis transceiver tca slot {} port1".format(slot))
+                "show chassis transceiver tca slot {} port1 | no-more".format(slot))
             combined = (pm24 or "") + "\n" + (pm15 or "")
             if combined.strip() and "Monitored Seconds" in combined:
                 fiber_results[port] = {"pm": combined, "laser": laser or "",
@@ -427,32 +428,37 @@ def run(params):
         print("[!] Connect failed: {}: {}".format(type(e).__name__, e))
         return None
 
-    host_1250 = c1250.hostname
-    print("  Host: {}".format(host_1250))
+    # try/finally added 2026-10-01. Only the no-DS1s path closed the session;
+    # an exception in discovery, PM collection, fiber or OSPF/LDP returned
+    # without closing. The explicit close() in the no-DS1s branch is now
+    # redundant and removed -- two places closing one session is how a
+    # double-close or a missed close happens.
+    try:
+        host_1250 = c1250.hostname
+        print("  Host: {}".format(host_1250))
 
-    # ── Discover DS1s ─────────────────────────────────────────────────────
-    print("[1250] Discovering MUSE-assigned DS1s...")
-    ds1_list, loopback_ip, config_map = _discover_ds1s(c1250)
-    if not ds1_list:
-        print("[!] No MUSE-assigned DS1s found on this device.")
+        # ── Discover DS1s ─────────────────────────────────────────────────
+        print("[1250] Discovering MUSE-assigned DS1s...")
+        ds1_list, loopback_ip, config_map = _discover_ds1s(c1250)
+        if not ds1_list:
+            print("[!] No MUSE-assigned DS1s found on this device.")
+            return None
+        print("  Found {} DS1(s): {}".format(
+            len(ds1_list), ", ".join(d.upper() for d in ds1_list)))
+
+        # ── DS1 PMs ───────────────────────────────────────────────────────
+        print("[1250] Collecting DS1 PMs ({} DS1s)...".format(len(ds1_list)))
+        pm_results = c1250.query_ds1_pms(ds1_list)
+
+        # ── Fiber uplink ──────────────────────────────────────────────────
+        print("[1250] Collecting fiber uplink health...")
+        fiber_results, evc_results = _collect_fiber(c1250)
+
+        # ── OSPF / LDP ────────────────────────────────────────────────────
+        print("[1250] Collecting OSPF/LDP health...")
+        ospf_events_raw, ldp_session_raw = _collect_ospf_ldp(c1250)
+    finally:
         c1250.close()
-        return None
-    print("  Found {} DS1(s): {}".format(
-        len(ds1_list), ", ".join(d.upper() for d in ds1_list)))
-
-    # ── DS1 PMs ───────────────────────────────────────────────────────────
-    print("[1250] Collecting DS1 PMs ({} DS1s)...".format(len(ds1_list)))
-    pm_results = c1250.query_ds1_pms(ds1_list)
-
-    # ── Fiber uplink ──────────────────────────────────────────────────────
-    print("[1250] Collecting fiber uplink health...")
-    fiber_results, evc_results = _collect_fiber(c1250)
-
-    # ── OSPF / LDP ────────────────────────────────────────────────────────
-    print("[1250] Collecting OSPF/LDP health...")
-    ospf_events_raw, ldp_session_raw = _collect_ospf_ldp(c1250)
-
-    c1250.close()
 
     # ── Build report ──────────────────────────────────────────────────────
     print("\nBuilding report...")

@@ -12,7 +12,8 @@ Drop detection (two independent mechanisms -- catches both slow and fast bounces
   2. Transitions delta: Num State Transitions jumped by > 1 since last poll
      (fast bounce within a single poll cycle that uptime alone would miss)
 
-State persisted to:  C:\Claude\ospf_stability_state.json
+State persisted to:  platform_paths.path("ospf_stability_state.json")
+  (C:\Claude\ospf_stability_state.json on Windows, ~/.claude/... on Linux)
   Keyed by OSPF router-ID (= 1250 loopback IP). Router-ID is the stable
   identifier -- it survives interface IP renumbering and is always present
   in 'show ospf neighbor detail' output regardless of OSPF version.
@@ -36,17 +37,33 @@ import datetime
 import getpass
 import threading
 
+import platform_paths
 from netbox_client import NetboxClient, load_netbox_config
 from npt1800_client import NPT1800Client
 from npt1250_client import NPT1250Client
 from device_base import CredentialError
 from jira_client import post_slack
 from secure_config import load_config, load_config_silent
+from output_builders import (
+    check_ospf_outage_events,
+    pair_ospf_outages,
+    pair_ospf_outages_by_peer,
+    format_ospf_outages,
+)
+
+
+def _merge_event_maps(*maps):
+    """Union multiple '<iso>|<kind>' -> event-dict maps, later maps winning
+    on key collision (harmless -- same key means same event, same content)."""
+    merged = {}
+    for m in maps:
+        merged.update(m or {})
+    return merged
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-OUTPUT_DIR       = r"C:\Claude"
+OUTPUT_DIR       = platform_paths.BASE_DIR
 STATE_FILE       = os.path.join(OUTPUT_DIR, "ospf_stability_state.json")
-CONFIG_PATH      = r"C:\Claude\autotester_config.txt"
+CONFIG_PATH      = platform_paths.path("autotester_config.txt")
 
 # Uptime tolerance: if new_uptime < stored_uptime - this value, treat as reset.
 # Accounts for clock skew and the fact that uptime ticks forward between polls.
@@ -70,6 +87,13 @@ SWEEP_WINDOW_DAYS = 30
 # roughly 45 min to under 15.
 SWEEP_WORKERS = 24
 
+# Two adjacency legs whose uptimes agree within this many seconds came up in the
+# same event -- so they went DOWN in the same event, which points at the site's
+# transport rather than either hub. Hub polls are staggered by a fraction of a
+# second and uptime is reported to the second, so a couple of minutes is ample
+# slack without merging genuinely independent bounces.
+LEG_SYNC_TOLERANCE_S = 120
+
 # Write the state file every N devices during the sweep, so a crash, a dropped
 # link, or a sleeping laptop costs at most this many devices instead of the
 # entire run. Without it, nothing reached disk until the sweep finished -- a
@@ -90,12 +114,17 @@ _NEIGHBOR_BLOCK_RE = re.compile(
 
 # ── Launcher contract ─────────────────────────────────────────────────────────
 TOOL_INFO = {
-    'name':     'OSPF Stability',
+    'name':     'OSPF & LDP Stability',
     'ran_from': 'NPT-1800 hubs (via NetBox)',
     'desc':     'Polls all NPT-1800 hubs from NetBox and tracks OSPF adjacency '
-                'stability per 1250 site -- uptime, drop count (24 h / 72 h / '
-                '7 d / 30 d), and last-drop timestamp. Alerts to Slack on new '
-                'drops. State persists between runs.',
+                'AND LDP session stability per 1250 site -- uptime, drop count '
+                '(24 h / 72 h / 7 d / 30 d), and last-drop timestamp for OSPF, '
+                'plus a paired LDP outage history (Down/Up with uptime and '
+                'downtime durations) sourced from both the 1800 and the 1250. '
+                'Historical NNI-port correlation for chronic-ticket review is '
+                'built in but currently disabled pending confirmation against a '
+                'real NNI outage (see LDP_PORT_CORR_ENABLED). Alerts to Slack '
+                'on new drops. State persists between runs.',
     'requires': 'infra creds + NetBox',
     'order':    8,
 }
@@ -266,6 +295,36 @@ _NE_NBR_IP      = re.compile(r'ospfNbrIpAddr:\s*([\d.]+)')
 # log OSPF adjacency changes reliably; the read was cut short.
 DEVICE_EVENT_CMD = 'show ne events unreported | grep ospfNbrStateChange | no-more'
 
+# LDP session-down bounce history, read from the HUB (1800) side, keyed on
+# each site's OSPF router-ID (= 1250 loopback IP) -- same value already used
+# to key everything else in this tool, no separate derivation needed.
+#
+# Deliberately LDP-only here, NOT broadened to a bare 'Down' grep (unlike
+# interface_check.py's version of this check): this tool already tracks OSPF
+# adjacency drops separately and more authoritatively, straight from each
+# 1250's own event log via _sweep_1250/parse_ne_events_ospf_down (see
+# drop_events / count_drops_since / the 24h-72h-7d-30d columns in the main
+# report table). A bare 'Down' grep against a hub's FULL event log with no
+# per-site filter would match every 'Down' state across every NE element over
+# 300+ days of retention -- a much larger transfer per poll than this tool's
+# existing per-event-type greps, for data this tool already has from a better
+# source. LDP has no such existing source, so it alone is added here.
+#
+# Uses the FULL log, not '| unreported', deliberately: confirmed live that
+# 'unreported' gets crowded out by unrelated churn within roughly an hour to a
+# day, while the full log held LDP-Session-Down entries 300+ days old. One
+# call per hub covers every site on it -- grep only on the event name here,
+# then match each site's loopback client-side (check_ospf_outage_events),
+# rather than one grep-per-site round trip.
+#
+# Broadened 2026-09-14 from 'grep LDP-Session-Down' to 'grep LDP-Session':
+# outage pairing (uptime before a drop / downtime before it clears) needs
+# the LDP-Session-Up recovery events too, not just the downs. Still scoped
+# to the LDP-Session event name only -- deliberately not a bare 'Down'/'Up'
+# grep against the hub's full log (see the OSPF-drop note above: this tool
+# already has a better, per-site source for OSPF adjacency drops).
+LDP_EVENT_CMD = 'show ne events | grep LDP-Session | no-more'
+
 # The NPT-1250 runs its clock in UTC (verified: device reported 15:21:34 +0000
 # while the workstation read 11:21 EDT). Its event log therefore timestamps in
 # UTC, while poll times and the report stamp are workstation-local.
@@ -383,6 +442,139 @@ def parse_ne_events_ospf_down(raw):
     return down_events, oldest_dt, unparsed
 
 
+def parse_ne_events_ospf_transitions(raw):
+    """
+    Sibling to parse_ne_events_ospf_down: same entries, same log, same
+    already-fetched DEVICE_EVENT_CMD output -- but returns BOTH down and
+    up(full) OSPF adjacency transitions instead of down-only, for outage
+    pairing (uptime before a drop / downtime before it clears), sourced
+    entirely from the 1250's own event log with no additional device call
+    and no need to touch the 1800 at all.
+
+    Kept as a separate function rather than changing parse_ne_events_ospf_down
+    itself: that function's down-only, exact-format output already drives the
+    report's 24h/72h/7d/30d drop-count columns and the persisted drop_events
+    history, and this codebase has already been bitten once (BTRGLAGW492) by
+    a subtle change to this parsing path -- safer to add a sibling than to
+    modify the hardened original.
+
+    Returns (events, oldest_dt, unparsed):
+      events      list of {"dt": datetime (local), "kind": "down"|"up",
+                            "nbr_rtr_id": str, "nbr_ip": str}, chronological.
+      oldest_dt, unparsed -- same meaning as parse_ne_events_ospf_down.
+
+    'full' is treated as the recovery/"up" transition -- the same interpretation
+    parse_ne_events_ospf_down's comment already uses ("init/twoWay/.../full =
+    recovery"). Any other transient state (init, twoWay, etc.) is neither a
+    drop nor a clear and is skipped here, same as in parse_ne_events_ospf_down.
+    """
+    events = []
+    oldest_dt = None
+    unparsed = 0
+    if not raw:
+        return events, oldest_dt, unparsed
+
+    for chunk in _NE_ENTRY_SPLIT.split(raw):
+        if not chunk.strip():
+            continue
+        entry = re.sub(r'[\r\n]+', '', chunk)
+
+        tm = _NE_TS_RE.search(entry)
+        if not tm:
+            if _is_real_nbr_entry(entry):
+                unparsed += 1
+            continue
+        try:
+            dt = datetime.datetime(
+                int(tm.group(1)), int(tm.group(2)), int(tm.group(3)),
+                int(tm.group(4)), int(tm.group(5)), int(tm.group(6)))
+        except ValueError:
+            if _is_real_nbr_entry(entry):
+                unparsed += 1
+            continue
+        dt = _device_dt_to_local(dt)
+
+        if oldest_dt is None or dt < oldest_dt:
+            oldest_dt = dt
+
+        if 'ospfNbrStateChange' not in entry:
+            continue
+
+        sm = _NE_NBR_STATE.search(entry)
+        if not sm:
+            unparsed += 1
+            continue
+        state = sm.group(1).lower()
+        if state == 'down':
+            kind = 'down'
+        elif state == 'full':
+            kind = 'up'
+        else:
+            continue   # init/twoWay/... -- transient, not a drop or a clear
+
+        rid_m = _NE_NBR_RTRID.search(entry)
+        ip_m  = _NE_NBR_IP.search(entry)
+        events.append({
+            "dt":         dt,
+            "kind":       kind,
+            "nbr_rtr_id": rid_m.group(1) if rid_m else "",
+            "nbr_ip":     ip_m.group(1) if ip_m else "",
+        })
+
+    events.sort(key=lambda e: e["dt"])
+    return events, oldest_dt, unparsed
+
+
+def merge_transition_events(existing, incoming):
+    """
+    Merge OSPF adjacency transition events (parse_ne_events_ospf_transitions
+    output, JSON-serialized form) into stored history, de-duplicating on
+    (timestamp, neighbour router-id, kind) -- same pattern as
+    merge_drop_events, extended with "kind" since a down and an up can
+    legitimately share the same second in rare cases.
+    """
+    seen = set()
+    merged = []
+    for e in (existing or []) + (incoming or []):
+        key = (e.get("detected", ""), e.get("nbr_rtr_id", ""), e.get("kind", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(e)
+    merged.sort(key=lambda e: e.get("detected", ""))
+    return merged
+
+
+def _ospf_transition_events_for_pairing(transition_list):
+    """
+    Convert a persisted ospf_transitions list (JSON-safe dicts with a
+    "detected" isoformat string) into the {"dt", "kind", "formatted", "peer"}
+    shape pair_ospf_outages_by_peer expects. Display format is this
+    pipeline's own simple local-time stamp -- distinct from the 1800 log's
+    UTC-based format_down_event, since these timestamps are already
+    device-local (converted from the 1250's UTC clock at parse time, not
+    tagged the same way format_down_event expects).
+
+    "peer" is nbr_rtr_id (the OSPF neighbor's router-id, i.e. which hub) --
+    a dual-homed 1250 peers OSPF with two different hub router-ids, and
+    without grouping by that before pairing, the two independent adjacencies'
+    events would get cross-paired (same class of bug fixed for LDP -- see
+    pair_ospf_outages_by_peer's docstring).
+    """
+    events = []
+    for e in (transition_list or []):
+        try:
+            dt = datetime.datetime.fromisoformat(e["detected"])
+        except Exception:
+            continue
+        events.append({
+            "dt": dt, "kind": e.get("kind", "down"),
+            "peer": e.get("nbr_rtr_id", ""),
+            "formatted": dt.strftime("%m/%d/%y %H:%M:%S local"),
+        })
+    return events
+
+
 # ── Hostname lookup ───────────────────────────────────────────────────────────
 def build_loopback_hostname_map(output_dir=OUTPUT_DIR):
     """
@@ -453,6 +645,55 @@ def load_state(path=STATE_FILE):
         return {}
 
 
+# Bumped whenever a stored field can be WRONG in a way that can't be
+# detected/self-healed per-entry on the next poll (see _migrate_state_schema).
+# Tracked via a "_schema_version" key at the top level of the state dict,
+# alongside the per-router-id site entries -- the leading underscore keeps it
+# from ever colliding with a real router-id key.
+STATE_SCHEMA_VERSION = 2
+_SCHEMA_KEY = "_schema_version"
+
+
+def _migrate_state_schema(state, progress=print):
+    """
+    One-time state cleanup for schema changes that can't self-heal per-entry.
+
+    v2 (2026-09-14): ldp_event_map (hub-side LDP events, populated in
+    _poll_hub) was scoped to one site out of a hub's shared, multi-site event
+    log using a naive substring IP match. Confirmed live (pcapps: 'show ldp
+    session | grep .5' on the 1800 hit peers '.5' AND '.50'-'.59') that this
+    over-matches and can pull a DIFFERENT site's Down/Up events in under the
+    wrong site's key. Unlike the missing-"peer"-field issue fixed the same
+    day (which self-heals per entry on the next poll, because a bad entry is
+    structurally identifiable -- it's just missing a field), a contaminated
+    ldp_event_map entry looks IDENTICAL to a correct one: same shape, real
+    timestamp, real-looking data, just attributed to the wrong site. There is
+    no way to tell after storage which entries came from a different site's
+    log line. The only safe fix is to discard ldp_event_map for every site
+    once and let it rebuild from the hub polls using the corrected exact-IP
+    match (output_builders._ip_in_line) -- LDP full-log retention is 300+
+    days confirmed on the 1800 side, so nothing is permanently lost, it just
+    needs one more poll to come back correctly scoped.
+
+    Runs once per state file, tracked via _SCHEMA_KEY.
+    """
+    current = state.get(_SCHEMA_KEY, 1)
+    if current >= STATE_SCHEMA_VERSION:
+        return state
+    cleared = 0
+    for rid, entry in state.items():
+        if rid == _SCHEMA_KEY or not isinstance(entry, dict):
+            continue
+        if entry.pop("ldp_event_map", None) is not None:
+            cleared += 1
+    state[_SCHEMA_KEY] = STATE_SCHEMA_VERSION
+    if cleared:
+        progress("  [migration] Cleared ldp_event_map on {} site(s) -- "
+                 "confirmed IP-substring over-match bug fixed 2026-09-14; "
+                 "will rebuild correctly-scoped from the next hub poll.".format(cleared))
+    return state
+
+
 def save_state(state, path=STATE_FILE):
     """Atomically write state JSON."""
     tmp = path + ".tmp"
@@ -478,6 +719,32 @@ def count_drops_since(drop_events, hours, now=None):
     base = now or datetime.datetime.now()
     cutoff_iso = (base - datetime.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
     return sum(1 for e in drop_events if e.get("detected", "") >= cutoff_iso)
+
+
+def count_ldp_drops_since(outages, hours, now=None):
+    """
+    Count LDP Down events within the last N hours, from a pair_ospf_outages()
+    list (each outage dict carries its own "down_dt").
+
+    Windows are nested by construction, same as count_drops_since above.
+
+    down_dt is UTC (see check_ospf_outage_events / format_down_event -- LDP
+    events, from both the 1800 and the 1250, are parsed straight off the
+    device timestamp with no local conversion applied yet) -- converted to
+    local here before comparing, same as every other windowed count in this
+    tool (_device_dt_to_local), so a bounce right at a window boundary isn't
+    miscounted by the ~4-5 h UTC/Eastern offset.
+    """
+    base = now or datetime.datetime.now()
+    cutoff = base - datetime.timedelta(hours=hours)
+    count = 0
+    for o in outages:
+        down_dt = o.get("down_dt")
+        if down_dt is None:
+            continue
+        if _device_dt_to_local(down_dt) >= cutoff:
+            count += 1
+    return count
 
 
 def merge_drop_events(existing, incoming):
@@ -510,7 +777,7 @@ def merge_drop_events(existing, incoming):
 # ── Per-hub poll ──────────────────────────────────────────────────────────────
 def _poll_hub(hub_name, hub_ip, username, password, lb_map, state,
               results_lock, seen_rids, new_events_by_rid, run_id,
-              progress=print):
+              progress=print, new_ldp_events_by_rid=None):
     """
     SSH one 1800 hub, parse neighbors, detect drops, record into state.
 
@@ -541,6 +808,16 @@ def _poll_hub(hub_name, hub_ip, username, password, lb_map, state,
         progress("  [!] {} ospf query failed: {}".format(hub_name, e))
         c1800.close()
         return
+
+    # LDP session-down bounce history for every site on this hub, in one call
+    # (see LDP_EVENT_CMD). Best-effort -- a failure here must not take down the
+    # OSPF poll this function exists for, so it's logged and swallowed, not
+    # raised.
+    try:
+        ldp_raw = c1800.run(LDP_EVENT_CMD)
+    except Exception as e:
+        progress("  [!] {} LDP event query failed: {}".format(hub_name, e))
+        ldp_raw = ""
     finally:
         try:
             c1800.close()
@@ -575,6 +852,70 @@ def _poll_hub(hub_name, hub_ip, username, password, lb_map, state,
             # Always update hostname if we now know it
             if hostname != rid:
                 stored["hostname"] = hostname
+
+            # LDP session outage history (Down + Up/Full pairs) for this
+            # site's loopback, read from THIS hub's own event log this poll.
+            # Deliberately NOT folded into drop_events/count_drops_since,
+            # which are keyed to a different device's log with its own
+            # timestamp format (see parse_ne_events_ospf_down). Kept as its
+            # own field, reported separately, so neither pipeline has to
+            # guess at the other's timestamp convention.
+            #
+            # Merged (not overwritten) across hubs: a dual-homed site's two
+            # legs sit on two different hubs, each with its OWN event log of
+            # that leg's LDP session -- overwriting on the second hub's poll
+            # would silently drop the first leg's history. Keyed on
+            # "<UTC ISO timestamp>|<down/up>" so a down and an up at
+            # different times never collide, and dedup/merge is a plain dict
+            # update. Stored as isoformat strings (not datetime objects) --
+            # this whole state dict gets json.dump'd by save_state().
+            # "peer" here is the HUB's own loopback (hub_ip), not whatever
+            # check_ospf_outage_events parsed off the line's peerRouterID
+            # field -- on a hub's own log, filtered to this one site,
+            # peerRouterID is the SITE's loopback (== rid), which is the SAME
+            # value regardless of which hub we're polling. A dual-homed
+            # site's two sessions (to hub A and hub B) would therefore both
+            # get tagged with the identical "peer" if left as-is, defeating
+            # the whole point of pair_ospf_outages_by_peer -- so this
+            # overrides it with the one thing that actually distinguishes
+            # the two sessions from the site's point of view: which hub.
+            #
+            # hub_ip, NOT hub_name: _sweep_1250 (below) tags its own LDP
+            # events with the parsed peerRouterID off the 1250's own log,
+            # which is the HUB's loopback IP -- using hub_name here instead
+            # would put the two sources' events for the exact same session
+            # into two different "peer" buckets, so a session that's only
+            # partially visible on one side would never get combined with
+            # the other side's view of the same session. hub_ip is the same
+            # identifier space check_ospf_outage_events already parses on
+            # the 1250 side.
+            new_events = {
+                "{}|{}".format(e["dt"].isoformat(), e["kind"]): {
+                    "dt": e["dt"].isoformat(), "kind": e["kind"],
+                    "formatted": e["formatted"], "peer": hub_ip,
+                }
+                for e in check_ospf_outage_events(ldp_raw, rid)
+            }
+            prior_map = dict(stored.get("ldp_event_map", {}) or {})
+            # Keys genuinely new this poll (not already known) -- drives the
+            # LDP Slack alert, same "new, not just present" distinction
+            # new_events_by_rid already makes for OSPF drops below. Only the
+            # "down" side is alert-worthy; a fresh "up" is a recovery, not
+            # something to page on.
+            fresh_keys = set(new_events) - set(prior_map)
+            if fresh_keys and new_ldp_events_by_rid is not None:
+                fresh_downs = [new_events[k] for k in fresh_keys
+                              if new_events[k]["kind"] == "down"]
+                if fresh_downs:
+                    new_ldp_events_by_rid.setdefault(rid, []).extend(fresh_downs)
+            prior_map.update(new_events)
+            stored["ldp_event_map"] = prior_map
+            # Old flat down-only fields from before outage pairing (v1.9x) --
+            # dropped going forward in favor of ldp_event_map above. Left
+            # alone if already present in an older state file (harmless,
+            # unused) rather than actively deleted.
+            stored.pop("ldp_down_hits_map", None)
+            stored.pop("ldp_down_hits", None)
 
             # NOTE: hub polling deliberately records NO drop events.
             #
@@ -697,22 +1038,39 @@ def select_sweep_targets(state, seen_rids, run_id, window_days=30):
 
 
 def _sweep_1250(rid, username, password, state, lock, stats,
-                new_events_by_rid, progress=print):
+                new_events_by_rid, progress=print, new_ldp_events_by_rid=None):
     """
-    SSH one 1250, read its OSPF adjacency event log, merge drops into state.
+    SSH one 1250, read its OSPF adjacency event log AND its own LDP session
+    event log, merge both into state.
 
     Target IP is the site's OSPF router-ID, which on this network is the 1250's
     loopback address.
 
     Records per site (under lock):
-      drop_events   merged, de-duplicated, exact device timestamps
-      log_oldest    oldest entry in the device log -- bounds trustworthy depth
-      log_unparsed  entries that looked like adjacency events but did not parse
-      sweep_status  'ok' | 'unreachable' | 'error'
+      drop_events       merged, de-duplicated, exact device timestamps (OSPF)
+      ospf_transitions  merged OSPF down+up(full) events, for outage pairing
+      ldp_event_map_1250  merged LDP down+up events, this 1250's own log
+      log_oldest        oldest entry in the device log -- bounds trustworthy depth
+      log_unparsed      entries that looked like adjacency events but did not parse
+      sweep_status      'ok' | 'unreachable' | 'error'
 
     A site we cannot reach is marked unreachable and its counts are left blank
     rather than filled with an estimate -- a fabricated number in a column
     labelled as measured is worse than an honest gap.
+
+    LDP session events use the SAME command already confirmed working against
+    the 1800 hub side (LDP_EVENT_CMD, 'show ne events | grep LDP-Session |
+    no-more') -- confirmed live against a 1250 too (2026-09-14, FARGNDBC636:
+    real LDP-Session-Down/Up entries with the same 'YYYY-MM-DD,HH:MM:SS'
+    timestamp format the 1800-side parser already handles). 'show ne events
+    unreported' returned nothing at all for LDP on that same device -- same
+    short-retention problem already documented for OSPF elsewhere in this
+    tool -- so the full log is used here too, matching the hub-side design.
+
+    The LDP fetch is best-effort and separate from the OSPF fetch above: a
+    failure here must not take down the OSPF sweep this function primarily
+    exists for (same reasoning _poll_hub already applies to its own LDP
+    fetch on the hub side).
     """
     c = NPT1250Client(rid, username, password)
     try:
@@ -735,7 +1093,17 @@ def _sweep_1250(rid, username, password, state, lock, stats,
             state[rid]["sweep_error"] = str(e)[:120]
             stats["errors"] += 1
         progress("  [!] {} event-log query failed: {}".format(rid, str(e)[:70]))
+        try:
+            c.close()
+        except Exception:
+            pass
         return
+
+    try:
+        ldp_raw = c.run(LDP_EVENT_CMD, timeout=90)
+    except Exception as e:
+        progress("  [!] {} LDP event query failed: {}".format(rid, str(e)[:70]))
+        ldp_raw = ""
     finally:
         try:
             c.close()
@@ -744,11 +1112,55 @@ def _sweep_1250(rid, username, password, state, lock, stats,
 
     downs, oldest_dt, unparsed = parse_ne_events_ospf_down(raw)
 
+    # Same already-fetched raw event text, no extra device call: also pull
+    # the Up/Full recovery transitions so drops can be paired into outages
+    # (uptime before the drop / downtime before it clears), entirely from
+    # this 1250's own log -- see parse_ne_events_ospf_transitions.
+    transitions, _, _ = parse_ne_events_ospf_transitions(raw)
+    transitions_json = [
+        {"detected": e["dt"].strftime("%Y-%m-%dT%H:%M:%S"),
+         "kind": e["kind"], "nbr_rtr_id": e["nbr_rtr_id"], "nbr_ip": e["nbr_ip"]}
+        for e in transitions
+    ]
+
+    # LDP session events from this 1250's own log -- no peer-IP filter (this
+    # command is run directly on the site, so every LDP-Session event in its
+    # own log belongs to its own session(s)). Confirmed the 1250's clock is
+    # UTC (same as the 1800 -- see DEVICE_CLOCK_IS_UTC), so format_down_event's
+    # UTC-in / Eastern-out formatting applies here too, same display
+    # convention as the hub-sourced LDP events.
+    ldp_events_1250 = check_ospf_outage_events(ldp_raw, peer_ip=None, protocol="ldp")
+    # "peer" here comes straight from check_ospf_outage_events' own parsing
+    # of the line's peerRouterID field -- on the 1250's OWN log, that field
+    # is the HUB's loopback, which correctly differs between a dual-homed
+    # site's two sessions (unlike the hub-side case above, where the roles
+    # are reversed -- see the comment on new_events in _poll_hub).
+    new_ldp_events = {
+        "{}|{}".format(e["dt"].isoformat(), e["kind"]): {
+            "dt": e["dt"].isoformat(), "kind": e["kind"], "formatted": e["formatted"],
+            "peer": e.get("peer", ""),
+        }
+        for e in ldp_events_1250
+    }
+
     with lock:
         stored = state.setdefault(rid, {})
         prior_keys = {(e.get("detected", ""), e.get("nbr_rtr_id", ""))
                       for e in stored.get("drop_events", [])}
         merged, added = merge_drop_events(stored.get("drop_events", []), downs)
+        stored["ospf_transitions"] = merge_transition_events(
+            stored.get("ospf_transitions", []), transitions_json)
+        prior_ldp_map = dict(stored.get("ldp_event_map_1250", {}) or {})
+        # Same "genuinely new this poll" distinction as the hub side (see
+        # _poll_hub) -- drives the LDP Slack alert.
+        fresh_ldp_keys = set(new_ldp_events) - set(prior_ldp_map)
+        if fresh_ldp_keys and new_ldp_events_by_rid is not None:
+            fresh_ldp_downs = [new_ldp_events[k] for k in fresh_ldp_keys
+                               if new_ldp_events[k]["kind"] == "down"]
+            if fresh_ldp_downs:
+                new_ldp_events_by_rid.setdefault(rid, []).extend(fresh_ldp_downs)
+        prior_ldp_map.update(new_ldp_events)
+        stored["ldp_event_map_1250"] = prior_ldp_map
         # Events genuinely new to us this run -- drives the Slack alert. On the
         # very first run every historical event is "new", so alerting is
         # suppressed for baseline runs by the caller.
@@ -783,7 +1195,7 @@ def _sweep_1250(rid, username, password, state, lock, stats,
 
 
 def _run_sweep(targets, username, password, state, workers,
-               new_events_by_rid, progress=print):
+               new_events_by_rid, progress=print, new_ldp_events_by_rid=None):
     """
     Sweep the target 1250s for their event logs using a bounded worker pool.
 
@@ -823,7 +1235,8 @@ def _run_sweep(targets, username, password, state, workers,
                 rid = queue.pop(0)
             try:
                 _sweep_1250(rid, username, password, state, lock, stats,
-                            new_events_by_rid, progress)
+                            new_events_by_rid, progress,
+                            new_ldp_events_by_rid=new_ldp_events_by_rid)
             except CredentialError:
                 with qlock:
                     queue.clear()       # bad creds -- stop the whole sweep
@@ -849,9 +1262,43 @@ def _run_sweep(targets, username, password, state, workers,
     return stats
 
 
+def _ldp_events_from_map(event_map):
+    """
+    Convert a persisted ldp_event_map ({"<iso>|<kind>": {...}} -- see
+    _poll_hub / _sweep_1250) back into the {"dt", "kind", "formatted", "peer"}
+    shape pair_ospf_outages_by_peer expects. Skips any entry whose isoformat
+    string fails to parse (corrupt/hand-edited state file) rather than
+    raising.
+
+    Entries with NO "peer" key at all -- stored by a version of this tool
+    before the peer field was added (pre-v2.06) -- are dropped, not defaulted
+    to "". Defaulting them into one shared bucket would silently reproduce
+    the exact cross-session pairing bug v2.06 fixed (a dual-homed site's two
+    untagged legacy sessions would land in the same "" group and get
+    cross-paired again, just with old data instead of new). Dropping forces
+    a clean re-collection from the device on the next poll -- the events
+    themselves are recent (LDP full-log retention is 300+ days confirmed on
+    the 1800 side), so nothing is permanently lost, it just needs one more
+    poll to come back correctly peer-tagged.
+    """
+    events = []
+    for v in (event_map or {}).values():
+        if "peer" not in v:
+            continue
+        try:
+            dt = datetime.datetime.fromisoformat(v["dt"])
+        except Exception:
+            continue
+        events.append({"dt": dt, "kind": v.get("kind", "down"),
+                       "formatted": v.get("formatted", ""),
+                       "peer": v.get("peer", "")})
+    return events
+
+
 # ── Per-site aggregation ──────────────────────────────────────────────────────
 def _aggregate_results(state, seen_rids, new_events_by_rid, run_id,
-                       skipped_rids=(), unchanged_rids=()):
+                       skipped_rids=(), unchanged_rids=(),
+                       new_ldp_events_by_rid=None):
     """
     Build exactly ONE report row per 1250 site (router-ID), aggregating every
     OSPF adjacency leg observed in this run.
@@ -885,22 +1332,29 @@ def _aggregate_results(state, seen_rids, new_events_by_rid, run_id,
                      if d.get("run_id") == run_id]
         if not live_legs:
             continue
+        live_legs.sort(key=lambda t: t[0])
 
-        # Worst state across legs ("Full" only if every leg is Full)
-        leg_states = [str(d.get("state", "")) for _, d in live_legs]
-        bad = [s for s in leg_states if s.lower() != "full"]
-        site_state = bad[0] if bad else "Full"
-
-        # Minimum uptime across legs (least-stable leg)
-        ups = [(d.get("uptime_s"), d.get("uptime_str", ""))
-               for _, d in live_legs if d.get("uptime_s") is not None]
-        if ups:
-            min_s, min_str = min(ups, key=lambda t: t[0])
+        # ---- Leg-synchronisation pattern -------------------------------------
+        # For a dual-homed site, comparing the legs' UPTIMES answers a question
+        # the drop counts cannot: did both adjacencies come up at the same moment?
+        # If they did, they went down at the same moment, which points at the
+        # site's transport rather than either hub. Observed on DLTHMNME624, where
+        # 3 of 4 drops hit both hubs in the same second.
+        #
+        # This is derived entirely from hub-reported uptime, which is exact -- no
+        # log attribution required, nothing inferred.
+        leg_ups = [d.get("uptime_s") for _, d in live_legs
+                   if d.get("uptime_s") is not None]
+        if len(live_legs) < 2:
+            pattern = "single-homed"
+        elif len(leg_ups) < len(live_legs):
+            pattern = "unknown"           # a leg's uptime didn't parse
+        elif (max(leg_ups) - min(leg_ups)) <= LEG_SYNC_TOLERANCE_S:
+            pattern = "legs together"     # same event took both -> site/transport
         else:
-            min_s = None
-            min_str = live_legs[0][1].get("uptime_str", "")
+            pattern = "legs differ"       # independent -> hub or path specific
 
-        hubs = sorted(h for h, _ in live_legs)
+        hubs   = [h for h, _ in live_legs]
         events = stored.get("drop_events", [])
 
         # Provenance. Counts are only shown when they were actually measured.
@@ -926,7 +1380,7 @@ def _aggregate_results(state, seen_rids, new_events_by_rid, run_id,
         log_oldest = stored.get("log_oldest", "")
         log_days = None
         if source == "proven_zero":
-            log_days = int((min_s or 0) // 86400)
+            log_days = int((min(leg_ups) if leg_ups else 0) // 86400)
         elif log_oldest:
             try:
                 dt = datetime.datetime.strptime(log_oldest, "%Y-%m-%dT%H:%M:%S")
@@ -945,24 +1399,291 @@ def _aggregate_results(state, seen_rids, new_events_by_rid, run_id,
             counts = {"drop_24h": None, "drop_72h": None,
                       "drop_7d": None, "drop_30d": None}
 
-        row = {
-            "router_id":    rid,
-            "hostname":     stored.get("hostname", rid),
-            "hub_1800":     ", ".join(hubs),
-            "hub_count":    len(hubs),
-            "state":        site_state,
-            "uptime_str":   min_str,
-            "uptime_s":     min_s,
-            "new_events":   new_events_by_rid.get(rid, []),
-            "source":       source,
-            "log_oldest":   log_oldest,
-            "log_days":     log_days,
-            "log_unparsed": stored.get("log_unparsed", 0) or 0,
-            "sweep_error":  stored.get("sweep_error", ""),
+        # ---- ONE ROW PER ADJACENCY LEG ---------------------------------------
+        # Previously one row per SITE, which forced two lossy aggregations:
+        # state = worst leg, uptime = minimum leg. Both hid the healthy/unhealthy
+        # split on the ~68 dual-homed sites, and neither answered the operational
+        # question "which circuit, to which hub". The interface -- the actual
+        # circuit identifier -- was discarded entirely.
+        #
+        # State, uptime and interface are per-leg and EXACT. Drop counts remain
+        # SITE-level: the device event log identifies its peer by router-id, and
+        # the hub poll never learns each hub's own router-id, so attributing an
+        # event to one leg would require an inference this tool does not have
+        # evidence for. Column headers say "Site" so the scope is unambiguous.
+        # Merged from BOTH ends of the session: the hub's (1800) own log
+        # (ldp_event_map, from _poll_hub) and this site's own 1250 log
+        # (ldp_event_map_1250, from _sweep_1250). Either side's log can hold
+        # an event the other's retention already rolled past, so combining
+        # gives the fullest picture -- same spirit as merge_drop_events
+        # letting OSPF coverage grow across runs. Computed once per site
+        # (not per leg row) since it's the same list on every leg.
+        site_ldp_outages = pair_ospf_outages_by_peer(_ldp_events_from_map(
+            _merge_event_maps(stored.get("ldp_event_map", {}),
+                              stored.get("ldp_event_map_1250", {}))))
+        ldp_counts = {
+            "ldp_drop_24h": count_ldp_drops_since(site_ldp_outages, 24),
+            "ldp_drop_72h": count_ldp_drops_since(site_ldp_outages, 72),
+            "ldp_drop_7d":  count_ldp_drops_since(site_ldp_outages, 168),
+            "ldp_drop_30d": count_ldp_drops_since(site_ldp_outages, 720),
         }
-        row.update(counts)
-        results.append(row)
+        site_ospf_outages = pair_ospf_outages_by_peer(
+            _ospf_transition_events_for_pairing(stored.get("ospf_transitions", [])))
+
+        # Fresh-this-run LDP down events, from either the hub's log or the
+        # 1250's own log (see _poll_hub / _sweep_1250). Site-level, same as
+        # site_ldp_outages -- both hub polls and the 1250 sweep write into
+        # the same list under this rid, so no merge is needed here.
+        new_ldp_down_events = (new_ldp_events_by_rid or {}).get(rid, [])
+
+        for hub_name, leg in live_legs:
+            results.append(dict(
+                router_id    = rid,
+                hostname     = stored.get("hostname", rid),
+                hub_1800     = hub_name,
+                hub_count    = len(live_legs),
+                legs_pattern = pattern,
+                interface    = leg.get("interface") or "",
+                neighbor_ip  = leg.get("neighbor_ip") or "",
+                state        = str(leg.get("state") or "?"),
+                uptime_str   = leg.get("uptime_str", ""),
+                uptime_s     = leg.get("uptime_s"),
+                transitions  = leg.get("transitions"),
+                new_events   = new_events_by_rid.get(rid, []),
+                source       = source,
+                log_oldest   = log_oldest,
+                log_days     = log_days,
+                log_unparsed = stored.get("log_unparsed", 0) or 0,
+                sweep_error  = stored.get("sweep_error", ""),
+                ldp_outages  = site_ldp_outages,
+                ospf_outages = site_ospf_outages,
+                new_ldp_down_events = new_ldp_down_events,
+                **ldp_counts,
+                **counts
+            ))
     return results
+
+
+# ── Port-level rollup (higher-level outage detection) ─────────────────────────
+def port_rollup(results, min_down=2):
+    """
+    Group adjacencies by their physical port and report ports with multiple
+    sub-interfaces down.
+
+    WHY: the NOC works the queue circuit by circuit and opens an IXC ticket per
+    EVC. When a whole NNI port is down, every one of those tickets is the same
+    outage reported N times -- effort wasted, and the actual fault (one port)
+    buried under its symptoms (many circuits).
+
+    An 1800 NNI is a sub-interface (xe-ts16/2.111 = one 1250 site, all of whose
+    EVCs ride it). Its physical parent (xe-ts16/2) carries many such
+    sub-interfaces, i.e. many sites. So a parent-level failure is one ticket, not
+    fifty.
+
+    Costs NOTHING extra: every interface and state here already came back from
+    the `show ospf neighbor detail` call each hub gets anyway.
+
+    Returns a list of dicts, worst first:
+        {hub, port, total, down, down_share, sites:[(hostname, iface, state)]}
+    """
+    ports = {}
+    for r in results:
+        iface = (r.get("interface") or "").strip()
+        if not iface or "." not in iface or "/" not in iface:
+            continue
+        parent, sub = iface.rsplit(".", 1)
+        if not sub.isdigit():
+            continue
+        key = (r.get("hub_1800", ""), parent)
+        p = ports.setdefault(key, {"hub": key[0], "port": parent,
+                                   "total": 0, "down": 0, "sites": []})
+        p["total"] += 1
+        if str(r.get("state", "")).strip().lower() != "full":
+            p["down"] += 1
+            p["sites"].append((r.get("hostname", "?"), iface,
+                               r.get("state", "?")))
+    out = []
+    for p in ports.values():
+        if p["down"] >= min_down:
+            p["down_share"] = p["down"] / float(p["total"] or 1)
+            p["sites"].sort()
+            out.append(p)
+    out.sort(key=lambda p: (-p["down"], -p["down_share"], p["hub"], p["port"]))
+    return out
+
+
+# ── Historical LDP port correlation (chronic-ticket review) ───────────────────
+# pcapps asked (2026-09-14): for chronic/problem review, is there a way to
+# check whether the NNI dropped in the same timeframe as the sub-int/EVC, so
+# repeat tickets against the same NNI flap don't waste review time re-solving
+# the same fault per site?
+#
+# There's no protocol running between the 1800 and the IXC across the NNI
+# itself, and pcapps confirmed directly on the hubs there's no port-level
+# Down/Up line to grep for (no example found -- see chat 2026-09-14). So this
+# does NOT read a port event log; one doesn't exist. Instead it correlates
+# ACROSS sites: every site's own LDP outage history is already trustworthy
+# (pair_ospf_outages_by_peer, hardened this session), and we already know
+# which physical port each site's sub-interface rides (same grouping key
+# port_rollup uses above, just applied to stored history instead of a live
+# snapshot). If two DIFFERENT sites sharing a physical port both drop within
+# a few minutes of each other, that's strong circumstantial evidence the
+# port itself is the fault, not either circuit -- same "blast radius" idea
+# nni_check.py already applies live, run here against history.
+def _parent_of(iface):
+    """
+    'xe-ts16/2.111' -> 'xe-ts16/2'. Deliberately duplicated from
+    nni_check.parent_of() rather than imported: nni_check.py imports
+    parse_ospf_neighbors FROM this module, so importing nni_check here would
+    be circular. It's a small, pure, unit-tested-by-inspection function --
+    keep both copies in sync if the sub-interface naming convention ever
+    changes.
+    """
+    s = (iface or "").strip()
+    if not s or "." not in s:
+        return None
+    parent, sub = s.rsplit(".", 1)
+    if not sub.isdigit() or "/" not in parent:
+        return None
+    return parent
+
+
+LDP_PORT_CORR_WINDOW_MIN = 5   # pcapps's call (2026-09-14): tight window,
+                               # minimize false positives from coincidental
+                               # separate circuit faults.
+LDP_PORT_CORR_MIN_SITES  = 2   # same threshold port_rollup/nni_check use for
+                               # "this is a port event, not one circuit".
+
+# Kill switch -- pcapps (2026-09-14): "keep the tooling written somewhere but
+# disable it until we get another NNI outage and I can be certain. false
+# flagging is the worst." This is inferred correlation, not a read of a real
+# port-down event (none exists to read -- see correlate_ldp_port_events'
+# docstring), so it hasn't been checked against a real NNI outage yet.
+#
+# While False: correlate_ldp_port_events() is never called (run() short-
+# circuits to an empty result), so no outage is ever marked
+# port_correlated, the text report's "HISTORICAL PORT-CORRELATED LDP DROPS"
+# section never appears, and the Excel column reads "n/a (disabled)" instead
+# of "no" -- deliberately NOT "no", so a disabled check can never be misread
+# as "confirmed not correlated".
+#
+# To re-enable: flip to True once a real NNI outage happens and pcapps can
+# confirm the flagged sites actually match what went down. All the
+# correlation code stays in place either way -- this is the only switch.
+LDP_PORT_CORR_ENABLED = False
+
+
+def correlate_ldp_port_events(results, hub_ip_to_name,
+                              window_minutes=LDP_PORT_CORR_WINDOW_MIN,
+                              min_sites=LDP_PORT_CORR_MIN_SITES):
+    """
+    Flag LDP outages that coincide, within `window_minutes`, with a DIFFERENT
+    site's own LDP outage on the same physical NNI port.
+
+    Mutates each qualifying outage dict IN PLACE, setting
+    outage["port_correlated"] = True (only ever set to True; never set to
+    False, so a caller can use .get("port_correlated") as the check).
+
+    Returns a list of cluster summaries, worst (most sites) first:
+        {hub, port, sites: [(hostname, router_id, down_formatted), ...]}
+
+    ATTRIBUTION / LIMITATION -- dual-homed sites: pair_ospf_outages_by_peer
+    tags each outage with "peer" = the hub loopback IP the session belonged
+    to (see output_builders.py). That's enough to know WHICH of a dual-homed
+    site's (up to two) physical ports an outage happened on. An outage whose
+    peer is missing, empty, or doesn't map to a known hub/port (e.g. it
+    predates the peer-tagging fix shipped in v2.07, or the 1250-side log
+    lacked a parseable peerRouterID) is left OUT of correlation entirely --
+    skipped rather than guessed onto either port. Single-homed sites (the
+    large majority) have exactly one port, so this ambiguity never applies
+    to them.
+    """
+    # ---- one leg-port map per site: {router_id: {hub_name: parent_port}} ----
+    site_ports = {}
+    for r in results:
+        iface = (r.get("interface") or "").strip()
+        parent = _parent_of(iface)
+        if not parent:
+            continue
+        site_ports.setdefault(r["router_id"], {})[r.get("hub_1800", "")] = parent
+
+    # ---- bucket every outage by (hub_name, parent_port) ---------------------
+    buckets = {}   # (hub_name, parent) -> [(down_dt, rid, hostname, outage)]
+    seen_rids = set()
+    for r in results:
+        rid = r["router_id"]
+        if rid in seen_rids:
+            continue
+        seen_rids.add(rid)
+        for o in (r.get("ldp_outages") or []):
+            hub_ip = o.get("peer") or ""
+            hub_name = hub_ip_to_name.get(hub_ip)
+            if not hub_name:
+                continue                       # unknown/legacy peer -- skip
+            parent = site_ports.get(rid, {}).get(hub_name)
+            if not parent:
+                continue                       # can't attribute -- skip
+            buckets.setdefault((hub_name, parent), []).append(
+                (o["down_dt"], rid, r["hostname"], o))
+
+    # ---- cluster each bucket's outages by time, flag clusters with enough
+    #      DISTINCT sites ------------------------------------------------------
+    events = []
+    for (hub_name, parent), items in buckets.items():
+        items.sort(key=lambda t: t[0])
+        window = datetime.timedelta(minutes=window_minutes)
+        cluster = []
+        for item in items:
+            if cluster and item[0] - cluster[0][0] > window:
+                _flag_cluster(cluster, min_sites, hub_name, parent, events)
+                cluster = []
+            cluster.append(item)
+        if cluster:
+            _flag_cluster(cluster, min_sites, hub_name, parent, events)
+
+    events.sort(key=lambda e: -len(e["sites"]))
+    return events
+
+
+def _flag_cluster(cluster, min_sites, hub_name, parent, events):
+    """Mark a time-clustered group of outages as port-correlated if it spans
+    enough distinct sites, and record it for the summary rollup."""
+    unique_rids = {rid for _, rid, _, _ in cluster}
+    if len(unique_rids) < min_sites:
+        return
+    for down_dt, rid, hostname, o in cluster:
+        o["port_correlated"] = True
+    seen = set()
+    site_list = []
+    for down_dt, rid, hostname, o in cluster:
+        if rid in seen:
+            continue
+        seen.add(rid)
+        site_list.append((hostname, rid, o["down_formatted"]))
+    events.append({"hub": hub_name, "port": parent, "sites": site_list})
+
+
+def _format_ldp_outages_with_flags(outages):
+    """
+    Same rendering as output_builders.format_ospf_outages(), plus a
+    "[PORT EVENT?]" suffix on any Down line whose outage was marked
+    port_correlated by correlate_ldp_port_events(). Kept local to this
+    module rather than added to the shared formatter -- interface_check.py
+    and ospf_events.py call format_ospf_outages() too, and neither has (or
+    needs) port correlation.
+    """
+    lines = ["LDP Outages: {}".format(len(outages))]
+    n = 1
+    for o in outages:
+        flag = "  [PORT EVENT?]" if o.get("port_correlated") else ""
+        lines.append("{}) Down    -> {} -> Uptime before drop: {}{}".format(
+            n, o["down_formatted"], o["uptime_before"], flag))
+        n += 1
+        up_ts = o["up_formatted"] if o["up_formatted"] else "(not yet logged)"
+        lines.append("{}) Up/Full -> {} -> Downtime before up: {}".format(
+            n, up_ts, o["downtime_before_up"]))
+        n += 1
+    return "\n".join(lines)
 
 
 # ── Timestamp display ─────────────────────────────────────────────────────────
@@ -1038,7 +1759,7 @@ def _resolve_hostnames_netbox(nb, router_ids, progress=print):
 
 
 # ── Report builder ────────────────────────────────────────────────────────────
-def _build_report(results, hub_names, stamp, elapsed_s):
+def _build_report(results, hub_names, stamp, elapsed_s, port_corr_events=None):
     """
     Build pipe-delimited, fixed-width plain-text report for the progress log.
 
@@ -1050,16 +1771,20 @@ def _build_report(results, hub_names, stamp, elapsed_s):
     SEP  = "=" * 84
     SEP2 = "-" * 84
 
-    HDR = ("   {:<22} | {:<15} | {:<6} | {:12} | {:>4} | {:>4} | {:>4} | {:>4}".format(
-        "Hostname", "Hub-1800", "State", "Uptime", "24h", "72h", "7d", "30d"))
-    DIV = ("   " + "-"*22 + "-+-" + "-"*15 + "-+-" + "-"*6 + "-+-" + "-"*12 +
-           "-+-" + "-"*4 + "-+-" + "-"*4 + "-+-" + "-"*4 + "-+-" + "-"*4)
+    HDR = ("   {:<20} | {:<13} | {:<14} | {:<6} | {:12} | "
+           "{:>4} | {:>4} | {:>4} | {:>4}".format(
+               "Hostname", "Hub-1800", "Interface", "State", "Uptime",
+               "24h", "72h", "7d", "30d"))
+    DIV = ("   " + "-"*20 + "-+-" + "-"*13 + "-+-" + "-"*14 + "-+-" + "-"*6 +
+           "-+-" + "-"*12 + "-+-" + "-"*4 + "-+-" + "-"*4 + "-+-" + "-"*4 +
+           "-+-" + "-"*4)
 
     lines = [
         SEP,
         "  OSPF STABILITY REPORT  --  {}".format(stamp),
-        "  Hubs polled: {}  |  Sites: {}  |  Elapsed: {}s".format(
-            len(hub_names), len(results), int(elapsed_s)),
+        "  Hubs polled: {}  |  Adjacencies: {}  |  Sites: {}  |  Elapsed: {}s".format(
+            len(hub_names), len(results),
+            len({r["router_id"] for r in results}), int(elapsed_s)),
         SEP,
         "",
         HDR,
@@ -1081,15 +1806,17 @@ def _build_report(results, hub_names, stamp, elapsed_s):
         icon = "!!" if flagged else ("??" if r["drop_24h"] is None else "  ")
         raw_up = r.get("uptime_str", "")
         uptime_s = r.get("uptime_s") or _parse_uptime_s(raw_up)
-        lines.append("{} {:<22} | {:<15} | {:<6} | {} | {:>4} | {:>4} | {:>4} | {:>4}".format(
-            icon,
-            r["hostname"][:22],
-            r["hub_1800"][:15],
-            r["state"][:6],
-            _fmt_uptime_fixed(uptime_s, raw_up),
-            _n(r["drop_24h"]), _n(r["drop_72h"]),
-            _n(r["drop_7d"]),  _n(r["drop_30d"]),
-        ))
+        lines.append("{} {:<20} | {:<13} | {:<14} | {:<6} | {} | "
+                     "{:>4} | {:>4} | {:>4} | {:>4}".format(
+                         icon,
+                         r["hostname"][:20],
+                         r["hub_1800"][:13],
+                         (r.get("interface") or "")[:14],
+                         r["state"][:6],
+                         _fmt_uptime_fixed(uptime_s, raw_up),
+                         _n(r["drop_24h"]), _n(r["drop_72h"]),
+                         _n(r["drop_7d"]),  _n(r["drop_30d"]),
+                     ))
 
     lines.append("")
     # Flagged detail block
@@ -1102,11 +1829,14 @@ def _build_report(results, hub_names, stamp, elapsed_s):
         for r in flagged:
             raw_up   = r.get("uptime_str", "")
             uptime_s = r.get("uptime_s") or _parse_uptime_s(raw_up)
-            lines.append("  {} | {}  state={}  up={}  drops: 24h={} 72h={} 7d={} 30d={}".format(
-                r["hostname"], r["hub_1800"],
-                r["state"], _fmt_uptime_fixed(uptime_s, raw_up),
-                _n(r["drop_24h"]), _n(r["drop_72h"]),
-                _n(r["drop_7d"]),  _n(r["drop_30d"])))
+            lines.append("  {} | {} {}  state={}  up={}  [{}]  "
+                         "site drops: 24h={} 72h={} 7d={} 30d={}".format(
+                             r["hostname"], r["hub_1800"],
+                             r.get("interface") or "?",
+                             r["state"], _fmt_uptime_fixed(uptime_s, raw_up),
+                             r.get("legs_pattern") or "?",
+                             _n(r["drop_24h"]), _n(r["drop_72h"]),
+                             _n(r["drop_7d"]),  _n(r["drop_30d"])))
     else:
         lines.append("  All {} sites OSPF Full -- no drops in last 24 hours.".format(
             len(results)))
@@ -1133,6 +1863,144 @@ def _build_report(results, hub_names, stamp, elapsed_s):
                 r["hostname"], r["router_id"], r.get("sweep_error", "")[:50]))
         if len(unreach) > 15:
             lines.append("      ... and {} more".format(len(unreach) - 15))
+
+    # ── LDP SESSION OUTAGE HISTORY ────────────────────────────────────────────
+    # Down/Up-paired outage history for the LDP session to each site's
+    # loopback -- merged from BOTH ends: the hub's own event log (see
+    # LDP_EVENT_CMD, read in _poll_hub) and this site's own 1250 event log
+    # (same command, read directly against the 1250 in _sweep_1250, added
+    # 2026-09-14 -- LDP is a better indicator of an actual IXC outage than
+    # OSPF adjacency state, since traffic can keep routing on an intact LDP
+    # session through an OSPF reconvergence). Separate from the OSPF drop
+    # counts above -- different timestamp source/format -- so shown as its
+    # own list rather than merged into a column.
+    #
+    # Deduped by router-id: ldp_outages is site-level (one LDP session per
+    # site loopback), but results has one ROW PER LEG for dual-homed sites --
+    # without the dedup, a dual-homed site's identical outage list would
+    # print twice, once per hub leg.
+    seen_rids = set()
+    ldp_flagged = []
+    for r in results:
+        if not r.get("ldp_outages") or r["router_id"] in seen_rids:
+            continue
+        seen_rids.add(r["router_id"])
+        ldp_flagged.append(r)
+    if ldp_flagged:
+        lines.append("")
+        lines.append(SEP2)
+        lines.append("  LDP SESSION OUTAGE HISTORY ({} site(s) with events)".format(
+            len(ldp_flagged)))
+        lines.append(SEP2)
+        for r in ldp_flagged:
+            outages = r["ldp_outages"]
+            shown = outages[:5]
+            lines.append("  {} ({})  hub={}  -- {} outage(s)  |  "
+                         "24h: {}  72h: {}  7d: {}  30d: {}".format(
+                r["hostname"], r["router_id"], r["hub_1800"], len(outages),
+                r.get("ldp_drop_24h", 0), r.get("ldp_drop_72h", 0),
+                r.get("ldp_drop_7d", 0), r.get("ldp_drop_30d", 0)))
+            # Skip the formatter's own "LDP Outages: N" header line -- the
+            # count above already covers it (and reflects the true total,
+            # not just what's shown when truncated). Uses the flagged
+            # formatter (not the shared format_ospf_outages) so any outage
+            # correlate_ldp_port_events() marked as coinciding with a
+            # sibling site's drop on the same physical port shows
+            # "[PORT EVENT?]" right on the Down line.
+            for ln in _format_ldp_outages_with_flags(shown).splitlines()[1:]:
+                lines.append("      {}".format(ln))
+            if len(outages) > len(shown):
+                lines.append("      ... and {} more outage(s)".format(
+                    len(outages) - len(shown)))
+
+    # ── OSPF ADJACENCY OUTAGE HISTORY ─────────────────────────────────────────
+    # Down/Up-paired outage history sourced straight from each 1250's own
+    # event log (see DEVICE_EVENT_CMD / parse_ne_events_ospf_transitions) --
+    # the same authoritative source the drop_24h/72h/7d/30d columns above
+    # already use, just also keeping the Full/recovery side instead of
+    # discarding it. No additional device call: reuses the event text the
+    # sweep already fetched for the drop-count columns.
+    #
+    # Site-level, not per-leg, same limitation as the drop counts above: the
+    # 1250's own event log identifies the OSPF neighbor by router-id, and a
+    # dual-homed site's two adjacencies can bounce independently, so an
+    # outage here cannot be reliably attributed to one leg over the other.
+    # Deduped by router-id for the same reason the LDP section above is.
+    seen_rids = set()
+    ospf_flagged = []
+    for r in results:
+        if not r.get("ospf_outages") or r["router_id"] in seen_rids:
+            continue
+        seen_rids.add(r["router_id"])
+        ospf_flagged.append(r)
+    if ospf_flagged:
+        lines.append("")
+        lines.append(SEP2)
+        lines.append("  OSPF ADJACENCY OUTAGE HISTORY ({} site(s) with events)".format(
+            len(ospf_flagged)))
+        lines.append(SEP2)
+        for r in ospf_flagged:
+            outages = r["ospf_outages"]
+            shown = outages[:5]
+            lines.append("  {} ({})  -- {} outage(s)".format(
+                r["hostname"], r["router_id"], len(outages)))
+            for ln in format_ospf_outages(shown).splitlines()[1:]:
+                lines.append("      {}".format(ln))
+            if len(outages) > len(shown):
+                lines.append("      ... and {} more outage(s)".format(
+                    len(outages) - len(shown)))
+
+    # ── PORT-LEVEL EVENTS — the "one ticket, not fifty" section ──────────────
+    # Placed high in the footer deliberately: if a whole NNI port is down, that
+    # is the finding, and the per-circuit rows above are its symptoms.
+    port_events = port_rollup(results)
+    if port_events:
+        lines.append("")
+        lines.append(SEP)
+        lines.append("  PORT-LEVEL EVENTS ({}) -- read these BEFORE ticketing circuits".format(
+            len(port_events)))
+        lines.append(SEP)
+        for p in port_events:
+            majority = p["down_share"] >= 0.5
+            lines.append("  [{}] {} {} -- {} of {} sub-interfaces DOWN ({:.0%})".format(
+                "!!" if majority else "! ", p["hub"], p["port"],
+                p["down"], p["total"], p["down_share"]))
+            if majority:
+                lines.append("       ONE fault affecting every site on this port. "
+                             "Raise a single ticket against {},".format(p["port"]))
+                lines.append("       not an IXC ticket per EVC.")
+            for host, iface, st in p["sites"][:12]:
+                lines.append("         {:<22} {:<16} {}".format(host[:22], iface, st))
+            if len(p["sites"]) > 12:
+                lines.append("         ... and {} more site(s)".format(
+                    len(p["sites"]) - 12))
+
+    # ── HISTORICAL PORT-CORRELATED LDP DROPS — chronic-review section ────────
+    # Different from PORT-LEVEL EVENTS above: that section is about the port
+    # RIGHT NOW; this one is about the past, for chronic-ticket review, since
+    # there's no device log to read the physical NNI's own Down/Up history
+    # from (confirmed 2026-09-14 -- see correlate_ldp_port_events docstring).
+    # Built instead from multiple sites' own LDP outage timestamps lining up
+    # on the same physical port.
+    if port_corr_events:
+        lines.append("")
+        lines.append(SEP)
+        lines.append("  HISTORICAL PORT-CORRELATED LDP DROPS ({}) -- for chronic/problem "
+                     "review".format(len(port_corr_events)))
+        lines.append("  Multiple sites on the same physical NNI dropped within "
+                     "{} min of each other at some point --".format(
+                         LDP_PORT_CORR_WINDOW_MIN))
+        lines.append("  check the port before re-investigating each site's circuit "
+                     "individually.")
+        lines.append(SEP)
+        for ev in port_corr_events:
+            lines.append("  {} {} -- {} site(s) correlated".format(
+                ev["hub"], ev["port"], len(ev["sites"])))
+            for host, rid, ts in ev["sites"][:12]:
+                lines.append("       {:<22} ({})  {}".format(host[:22], rid, ts))
+            if len(ev["sites"]) > 12:
+                lines.append("       ... and {} more site(s)".format(
+                    len(ev["sites"]) - 12))
 
     # Trust audit: how many rows have counts that contradict their own uptime.
     suspect = 0
@@ -1164,13 +2032,39 @@ def _build_slack_alert(new_drop_results, stamp):
     return "\n".join(lines)
 
 
+def _build_ldp_slack_alert(new_ldp_drop_results, stamp):
+    """
+    Build Slack message for runs with new LDP session down events.
+
+    new_ldp_drop_results is already deduped to one entry per router-id (see
+    call site in run()) -- a dual-homed site produces one row per hub leg,
+    but its new_ldp_down_events list is the same site-level list on every
+    leg, so counting per-leg would double- (or triple-) count the drops.
+    """
+    lines = ["*LDP Stability Alert* -- {}".format(stamp), ""]
+    for r in new_ldp_drop_results:
+        lines.append("• *{}* ({}) -- {} new LDP drop(s)  |  state: {}  |  uptime: {}".format(
+            r["hostname"], r["hub_1800"],
+            len(r["new_ldp_down_events"]), r["state"], r["uptime_str"]))
+    return "\n".join(lines)
+
+
 # ── Excel report builder ──────────────────────────────────────────────────────
-def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
+def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path,
+                port_corr_events=None):
     """
     Write OSPF stability data to an Excel workbook at out_path.
 
-    Columns: Hostname | Router-ID | Hub 1800 | State | Uptime |
-             24h Drops | 72h Drops | 7d Drops | 30d Drops | Last Drop | Last Poll
+    Three sheets:
+      "OSPF Stability" -- main data sheet, one row per adjacency leg.
+        Columns: Hostname | Router-ID | Hub 1800 | State | Uptime |
+                 24h Drops | 72h Drops | 7d Drops | 30d Drops | Last Drop | Last Poll
+      "LDP Outages" -- one row per SITE (not per outage -- summarized so the
+        same site never repeats across rows and sorting stays meaningful):
+        total outage count, 24h/72h/7d/30d drop counts, and the most recent
+        outage's Down/Up detail. The full per-outage list, unabridged, is in
+        the text report's LDP SESSION OUTAGE HISTORY section.
+      "Legend" -- color key + column notes for the main sheet.
 
     Row color coding (sorted: down first, then drop severity, then hostname):
       Red    (#FF9999)  -- state not Full (live session down)
@@ -1208,14 +2102,19 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
     BORDER      = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     COL_HEADERS = [
-        "Hostname", "Router-ID (Loopback)", "Hub 1800", "State",
-        "Uptime", "24h Drops", "72h Drops", "7d Drops", "30d Drops",
+        "Hostname", "Router-ID (Loopback)", "Hub 1800",
+        "Interface", "Legs", "State", "Uptime",
+        "Site 24h", "Site 72h", "Site 7d", "Site 30d",
         "Last Drop", "Count Trust", "Oldest Evt (d)", "Source", "Last Poll",
     ]
-    # Hub column is wide enough for two comma-joined hub names (dual-homed sites)
-    COL_WIDTHS = [26, 20, 26, 8, 14, 10, 10, 10, 10, 18, 13, 14, 14, 18]
-    # Columns (1-based) that should be centre-aligned in data rows
-    CTR_COLS = {4, 6, 7, 8, 9, 11, 12, 13}
+    # One row per ADJACENCY now, so Hub holds a single name and Interface -- the
+    # circuit identifier -- is exposed. Drop columns are prefixed "Site" because
+    # they remain site-scoped while State/Uptime/Interface are per-leg.
+    COL_WIDTHS = [26, 20, 15, 16, 14, 8, 14,
+                  10, 10, 10, 10, 18, 13, 14, 14, 18]
+    # Columns (1-based) that should be centre-aligned in data rows:
+    # Legs(5) State(6) Site counts(8-11) Count Trust(13) Oldest Evt(14)
+    CTR_COLS = {5, 6, 8, 9, 10, 11, 13, 14}
     NCOLS    = len(COL_HEADERS)          # 14 -> A..N
     LAST_COL = get_column_letter(NCOLS)  # "N"
 
@@ -1248,7 +2147,10 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
         # Unmeasured counts are None -- coerce so sorting never raises, and put
         # unreachable sites just below live-down ones so they are not buried.
         unknown = 1 if r["drop_24h"] is None else 0
-        return (down, -unknown, -(r["drop_24h"] or 0), r["hostname"].lower())
+        # Hub last so a dual-homed site's two legs sit next to each other, which
+        # is what makes the "legs together" / "legs differ" split readable.
+        return (down, -unknown, -(r["drop_24h"] or 0),
+                r["hostname"].lower(), r["hub_1800"])
 
     # ── Data rows ──
     for row_idx, r in enumerate(sorted(results, key=_sort_key), start=3):
@@ -1299,6 +2201,8 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
             r["hostname"],
             r["router_id"],
             r["hub_1800"],
+            r.get("interface") or "",
+            r.get("legs_pattern") or "",
             r["state"],
             _fmt_uptime(uptime_s),
             _cell(r["drop_24h"]),
@@ -1328,14 +2232,14 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
 
     # ── Summary section (columns P+, floats alongside the data rows) ─────────
     # Data occupies A..N, so column O is the spacer and the summary starts at P.
-    ws.column_dimensions["O"].width = 3
-    for col_letter in ("P", "Q", "R", "S", "T", "U", "V", "W"):
+    ws.column_dimensions["Q"].width = 3
+    for col_letter in ("R", "S", "T", "U", "V", "W", "X", "Y"):
         ws.column_dimensions[col_letter].width = 13
-    ws.column_dimensions["P"].width = 16
+    ws.column_dimensions["R"].width = 16
 
     # Row 2 (same as column header row): summary section title
-    ws.merge_cells("P2:W2")
-    sc = ws["P2"]
+    ws.merge_cells("R2:Y2")
+    sc = ws["R2"]
     sc.value     = "OSPF Stability — Summary"
     sc.font      = FONT_HDR
     sc.fill      = FILL_HDR
@@ -1343,8 +2247,8 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
     sc.border    = BORDER
 
     # Row 3: description
-    ws.merge_cells("P3:W5")
-    dc = ws["P3"]
+    ws.merge_cells("R3:Y5")
+    dc = ws["R3"]
     dc.value = (
         "Every NPT-1800 hub router in NetBox is polled for its OSPF adjacencies, "
         "identifying each connected 1250 CPE site and its current session state.\n"
@@ -1361,13 +2265,13 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
     ws.row_dimensions[3].height = 60   # room for the wrapped description
 
     # Row 6: run stats
-    ws.merge_cells("P6:W6")
-    rc = ws["P6"]
+    ws.merge_cells("R6:Y6")
+    rc = ws["R6"]
     n_meas   = sum(1 for r in results if r["source"] == "measured")
     n_proven = sum(1 for r in results if r["source"] == "proven_zero")
     n_unre   = sum(1 for r in results if r["source"] == "unreachable")
     rc.value = (
-        "Hubs: {}   |   Sites: {}   |   Measured: {}   |   Proven zero: {}   |   "
+        "Hubs: {}   |   Adjacencies: {}   |   Measured: {}   |   Proven zero: {}   |   "
         "Unreachable: {}   |   {}   |   {}s"
         .format(len(hub_names), len(results), n_meas, n_proven, n_unre,
                 stamp, int(elapsed_s))
@@ -1381,11 +2285,11 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
     DROW_HDR  = 8
     DROW_STAB = 9
     DROW_ISSU = 10
-    COL_SLICE = 16   # P -- row labels
-    COL_24H   = 17   # Q
-    COL_72H   = 18   # R
-    COL_7D    = 19   # S
-    COL_30D   = 20   # T
+    COL_SLICE = 18   # R -- row labels
+    COL_24H   = 19   # S
+    COL_72H   = 20   # T
+    COL_7D    = 21   # U
+    COL_30D   = 22   # V
 
     _hdr_font = Font(name="Arial", bold=True, size=9)
     _dat_font = Font(name="Arial", size=9)
@@ -1421,10 +2325,10 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
         from openpyxl.chart.series import DataPoint
 
         chart_configs = [
-            (COL_24H, "Stable — Last 24h", "P12"),
-            (COL_72H, "Stable — Last 72h", "U12"),
-            (COL_7D,  "Stable — Last 7d",  "P27"),
-            (COL_30D, "Stable — Last 30d", "U27"),
+            (COL_24H, "Stable — Last 24h", "R12"),
+            (COL_72H, "Stable — Last 72h", "W12"),
+            (COL_7D,  "Stable — Last 7d",  "R27"),
+            (COL_30D, "Stable — Last 30d", "W27"),
         ]
         for data_col, title, anchor in chart_configs:
             pie        = PieChart()
@@ -1457,6 +2361,249 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
     except Exception:
         pass   # charts are optional -- workbook is still valid without them
 
+    # ── LDP Outages sheet ────────────────────────────────────────────────────
+    # ONE ROW PER 1250 SITE (not per outage, not per adjacency leg) -- per
+    # pcapps (2026-09-14): one row per outage made the same site repeat across
+    # many rows, which broke sorting. Each site's full outage LIST still lives
+    # in the text report's "LDP SESSION OUTAGE HISTORY" section (unabridged);
+    # this sheet is the sortable/filterable summary -- total outage count,
+    # the 24h/72h/7d/30d counts, and the MOST RECENT outage's detail -- same
+    # "summarize, don't enumerate" choice the main sheet already makes with
+    # its own single "Last Drop" column instead of a full OSPF drop list.
+    ws3 = wb.create_sheet("LDP Outages")
+    ldp_widths = [26, 20, 15, 14, 12, 10, 10, 10, 10, 24, 24, 24, 26, 20]
+    ldp_cols   = ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N")
+    for col_letter, width in zip(ldp_cols, ldp_widths):
+        ws3.column_dimensions[col_letter].width = width
+    LDP_LAST_COL = ldp_cols[-1]   # "N"
+
+    ws3.row_dimensions[1].height = 22
+    ws3.merge_cells("A1:{}1".format(LDP_LAST_COL))
+    t3 = ws3["A1"]
+    t3.value = ("LDP Session Outage Summary  |  {}  |  one row per site -- full "
+                "outage list is in the text report  |  sourced from both the "
+                "1800 and the 1250".format(stamp))
+    t3.font      = FONT_TITLE
+    t3.alignment = ALIGN_LEFT
+
+    ldp_hdrs = ["Hostname", "Router-ID (Loopback)", "Hub 1800",
+                "Currently Down", "Total Outages",
+                "Site 24h", "Site 72h", "Site 7d", "Site 30d",
+                "Last Down Timestamp", "Uptime Before Last Drop",
+                "Last Up Timestamp", "Last Outage Duration",
+                "Any Port-Correlated Drop?" + ("" if LDP_PORT_CORR_ENABLED
+                                                else " (disabled)")]
+    ws3.row_dimensions[2].height = 18
+    for col, hdr in enumerate(ldp_hdrs, start=1):
+        cell = ws3.cell(row=2, column=col, value=hdr)
+        cell.font      = FONT_HDR
+        cell.fill      = FILL_HDR
+        cell.alignment = ALIGN_CTR
+        cell.border    = BORDER
+
+    # Dedup by router-id: ldp_outages is site-level, but `results` has one row
+    # per adjacency LEG for dual-homed sites (same reason the main sheet's
+    # "Row scope" legend note exists) -- collapse to one summary per site
+    # before rendering.
+    seen_rids_ldp = set()
+    ldp_site_rows = []
+    for r in results:
+        outages = r.get("ldp_outages") or []
+        if not outages or r["router_id"] in seen_rids_ldp:
+            continue
+        seen_rids_ldp.add(r["router_id"])
+        last = outages[-1]   # pair_ospf_outages returns them chronological
+        ldp_site_rows.append({
+            "hostname":      r["hostname"],
+            "router_id":     r["router_id"],
+            "hub_1800":      r["hub_1800"],
+            "still_down":    last["up_formatted"] is None,
+            "total_outages": len(outages),
+            "drop_24h":      r.get("ldp_drop_24h", 0),
+            "drop_72h":      r.get("ldp_drop_72h", 0),
+            "drop_7d":       r.get("ldp_drop_7d", 0),
+            "drop_30d":      r.get("ldp_drop_30d", 0),
+            "last":          last,
+            # True if ANY outage in this site's history (not just the most
+            # recent) was flagged by correlate_ldp_port_events() as lining
+            # up in time with a sibling site's drop on the same physical
+            # NNI port -- see that function's docstring for why this is
+            # inferred from cross-site timing rather than a port event log.
+            "port_correlated": any(o.get("port_correlated") for o in outages),
+        })
+
+    # Currently-down sites first, then most outages, then hostname -- same
+    # "surface problems first" ordering the main sheet uses.
+    ldp_site_rows.sort(key=lambda x: (0 if x["still_down"] else 1,
+                                      -x["total_outages"],
+                                      x["hostname"].lower()))
+
+    row_idx = 3
+    for site in ldp_site_rows:
+        last = site["last"]
+        row_vals = [
+            site["hostname"],
+            site["router_id"],
+            site["hub_1800"],
+            "YES" if site["still_down"] else "no",
+            site["total_outages"],
+            site["drop_24h"], site["drop_72h"], site["drop_7d"], site["drop_30d"],
+            last["down_formatted"],
+            last["uptime_before"],
+            last["up_formatted"] or "(not yet logged)",
+            last["downtime_before_up"],
+            # "n/a (disabled)" while LDP_PORT_CORR_ENABLED is False --
+            # deliberately not "no", so a disabled check is never misread as
+            # "confirmed not correlated". See that constant's comment.
+            (("YES" if site["port_correlated"] else "no")
+             if LDP_PORT_CORR_ENABLED else "n/a (disabled)"),
+        ]
+        ws3.row_dimensions[row_idx].height = 16
+        for col, val in enumerate(row_vals, start=1):
+            cell = ws3.cell(row=row_idx, column=col, value=val)
+            cell.font      = FONT_BODY
+            cell.border    = BORDER
+            cell.alignment = ALIGN_LEFT if col == 1 else ALIGN_CTR
+            if site["still_down"]:
+                cell.fill = FILL_RED   # ongoing outage -- no clearing Up yet
+            elif LDP_PORT_CORR_ENABLED and site["port_correlated"]:
+                # Not down right now, but at least one past drop lined up
+                # with a sibling site on the same physical port -- worth a
+                # second look before re-chasing this as a standalone circuit
+                # fault (see correlate_ldp_port_events).
+                cell.fill = FILL_AMBER
+        row_idx += 1
+
+    if row_idx > 3:
+        ws3.freeze_panes = "A3"
+        ws3.auto_filter.ref = "A2:{}{}".format(LDP_LAST_COL, row_idx - 1)
+    else:
+        nc = ws3.cell(row=3, column=1, value="No LDP outages recorded yet.")
+        nc.font = FONT_BODY
+
+    # ── LDP Outages summary section + pie charts ──────────────────────────────
+    # Same layout/purpose as the main sheet's own "OSPF Stability — Summary"
+    # block (per pcapps, 2026-09-14: "add this to the LDP page as well") --
+    # title, description, run stats, a Stable/Issues chart-data table, and
+    # four pie charts (24h/72h/7d/30d). Uses ALL measurable sites (not just
+    # ones with a recorded outage -- a site with zero LDP drops is exactly
+    # what "Stable" should count), same population rule the main sheet's own
+    # "measurable" list uses (measured/proven_zero/cached, deduped by
+    # router-id since `results` has one row per adjacency leg).
+    ws3.column_dimensions["N"].width = 3   # spacer
+    for col_letter in ("O", "P", "Q", "R", "S", "T", "U", "V"):
+        ws3.column_dimensions[col_letter].width = 13
+    ws3.column_dimensions["O"].width = 16
+
+    ws3.merge_cells("O2:V2")
+    lsc = ws3["O2"]
+    lsc.value     = "LDP Session Outages — Summary"
+    lsc.font      = FONT_HDR
+    lsc.fill      = FILL_HDR
+    lsc.alignment = ALIGN_CTR
+    lsc.border    = BORDER
+
+    ws3.merge_cells("O3:V5")
+    ldc = ws3["O3"]
+    ldc.value = (
+        "LDP session Down/Up events are read from BOTH ends of each session -- "
+        "the hub's (1800) own event log and the site's own 1250 event log -- "
+        "and merged into one paired outage history per site.\n"
+        "LDP is tracked as a more reliable indicator of an actual IXC outage "
+        "than OSPF adjacency state: traffic can keep routing on an intact LDP "
+        "session through an OSPF reconvergence, so an OSPF-only view can "
+        "overstate an outage that never actually affected traffic.\n"
+        "24h/72h/7d/30d counts are nested (a drop inside 24h also counts in "
+        "72h/7d/30d). 'Stable' = zero LDP drops in that window."
+    )
+    ldc.font      = Font(name="Arial", size=9, italic=True, color="595959")
+    ldc.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    ws3.row_dimensions[3].height = 60
+
+    ws3.merge_cells("O6:V6")
+    lrc = ws3["O6"]
+    seen_rids_ldp_all = set()
+    ldp_measurable = []
+    for r in results:
+        if r["router_id"] in seen_rids_ldp_all:
+            continue
+        if r["source"] not in ("measured", "proven_zero", "cached"):
+            continue
+        seen_rids_ldp_all.add(r["router_id"])
+        ldp_measurable.append(r)
+    n_ldp_outage_sites = len(ldp_site_rows)
+    n_ldp_down_now     = sum(1 for s in ldp_site_rows if s["still_down"])
+    lrc.value = (
+        "Sites measured: {}   |   Sites with any LDP outage: {}   |   "
+        "Currently down: {}   |   {}   |   {}s"
+        .format(len(ldp_measurable), n_ldp_outage_sites, n_ldp_down_now,
+                stamp, int(elapsed_s))
+    )
+    lrc.font      = Font(name="Arial", size=9, bold=True, color="1F4E79")
+    lrc.alignment = ALIGN_LEFT
+
+    LDROW_HDR, LDROW_STAB, LDROW_ISSU = 8, 9, 10
+    LCOL_SLICE, LCOL_24H, LCOL_72H, LCOL_7D, LCOL_30D = 15, 16, 17, 18, 19  # O,P,Q,R,S
+
+    for col, lbl in [(LCOL_SLICE, ""), (LCOL_24H, "Last 24h"),
+                     (LCOL_72H, "Last 72h"), (LCOL_7D, "Last 7d"),
+                     (LCOL_30D, "Last 30d")]:
+        c = ws3.cell(row=LDROW_HDR, column=col, value=lbl)
+        c.font   = _hdr_font
+        c.border = BORDER
+
+    for row, label in [(LDROW_STAB, "Stable"), (LDROW_ISSU, "Issues")]:
+        c = ws3.cell(row=row, column=LCOL_SLICE, value=label)
+        c.font = _dat_font
+
+    total_ldp = len(ldp_measurable)
+    for col, key in [(LCOL_24H, "ldp_drop_24h"), (LCOL_72H, "ldp_drop_72h"),
+                     (LCOL_7D, "ldp_drop_7d"),   (LCOL_30D, "ldp_drop_30d")]:
+        stable = sum(1 for r in ldp_measurable if r.get(key, 0) == 0)
+        for row, val in [(LDROW_STAB, stable), (LDROW_ISSU, total_ldp - stable)]:
+            c = ws3.cell(row=row, column=col, value=val)
+            c.font      = _dat_font
+            c.border    = BORDER
+            c.alignment = ALIGN_CTR
+
+    try:
+        from openpyxl.chart import PieChart as _LdpPieChart, Reference as _LdpRef
+        from openpyxl.chart.series import DataPoint as _LdpDataPoint
+
+        ldp_chart_configs = [
+            (LCOL_24H, "LDP Stable — Last 24h", "O12"),
+            (LCOL_72H, "LDP Stable — Last 72h", "T12"),
+            (LCOL_7D,  "LDP Stable — Last 7d",  "O27"),
+            (LCOL_30D, "LDP Stable — Last 30d", "T27"),
+        ]
+        for data_col, title, anchor in ldp_chart_configs:
+            pie        = _LdpPieChart()
+            pie.title  = title
+            pie.style  = 10
+            pie.width  = 11
+            pie.height = 8
+
+            data = _LdpRef(ws3, min_col=data_col, max_col=data_col,
+                           min_row=LDROW_HDR, max_row=LDROW_ISSU)
+            cats = _LdpRef(ws3, min_col=LCOL_SLICE, max_col=LCOL_SLICE,
+                           min_row=LDROW_STAB, max_row=LDROW_ISSU)
+            pie.add_data(data, titles_from_data=True)
+            pie.set_categories(cats)
+
+            try:
+                pt0 = _LdpDataPoint(idx=0)
+                pt0.graphicalProperties.solidFill = "92D050"   # green
+                pt1 = _LdpDataPoint(idx=1)
+                pt1.graphicalProperties.solidFill = "FF4444"   # red
+                pie.series[0].dPt = [pt0, pt1]
+            except Exception:
+                pass
+
+            ws3.add_chart(pie, anchor)
+
+    except Exception:
+        pass   # charts are optional -- sheet is still valid without them
+
     # ── Legend sheet ──
     ws2 = wb.create_sheet("Legend")
     ws2.column_dimensions["A"].width = 14
@@ -1483,9 +2630,26 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
     ws2.cell(row=notes_start, column=1, value="Column notes").font = Font(
         name="Arial", bold=True, size=11)
     col_notes = [
-        ("Uptime", "MINIMUM uptime across a site's adjacencies. A dual-homed "
-                   "site shows its least-stable leg so a recent bounce is never "
-                   "masked by a healthy second leg."),
+        ("Row scope", "ONE ROW PER ADJACENCY, not per site. A dual-homed site "
+                      "appears twice -- once per hub -- with its two legs "
+                      "adjacent. Hostname / Router-ID / Site* columns repeat; "
+                      "Hub / Interface / State / Uptime are that leg's own."),
+        ("Interface", "The hub-side interface carrying this adjacency, e.g. "
+                      "xe-ts16/1.10 -- the circuit identifier to act on."),
+        ("Uptime", "This leg's own uptime, exact from the hub. Was previously "
+                   "the MINIMUM across legs, which hid the healthy/unhealthy "
+                   "split on dual-homed sites."),
+        ("Legs", "single-homed = one adjacency. 'legs together' = both legs' "
+                 "uptimes agree within 2 min, so one event took both -- points "
+                 "at site transport, not either hub. 'legs differ' = "
+                 "independent, so hub- or path-specific."),
+        ("Site 24h/72h/7d/30d", "SITE-scoped drop counts, repeated on each of a "
+                                "site's rows. The device event log names its "
+                                "peer by router-id and the hub poll never learns "
+                                "each hub's own router-id, so per-leg "
+                                "attribution would be an inference this tool "
+                                "has no evidence for. Compare the two legs' "
+                                "UPTIMES instead -- see Legs."),
         ("Count Trust", "OK = drop counts are consistent with uptime. "
                         "SUSPECT = uptime shows the adjacency came up inside a "
                         "window whose count reads zero, which is impossible -- "
@@ -1502,6 +2666,32 @@ def _build_xlsx(results, state, hub_names, stamp, elapsed_s, out_path):
                    "possible. UNREACHABLE = not measured, counts blank."),
         ("Drop counts", "Windows are nested: a drop inside 24 h also counts in "
                         "72 h, 7 d and 30 d."),
+        ("LDP sheet colors", "The 'LDP Outages' tab reuses these same Red/Amber "
+                             "fills for a DIFFERENT meaning than above: Red = "
+                             "still down right now. Amber = not down right now, "
+                             "but 'Any Port-Correlated Drop?' is YES -- see next "
+                             "row."),
+        ("Any Port-Correlated Drop?",
+             ("DISABLED as of this build -- reads 'n/a (disabled)' on every "
+              "row. pcapps (2026-09-14): built, but held off pending "
+              "confirmation against a real NNI outage -- 'false flagging is "
+              "the worst.' The logic is unchanged and ready to switch back "
+              "on (LDP_PORT_CORR_ENABLED in ospf_stability.py); the "
+              "description below is what it will mean once re-enabled."
+              if not LDP_PORT_CORR_ENABLED else
+              "YES means at least one of this site's LDP outages happened "
+              "within {} min of a DIFFERENT site's own LDP drop on the SAME "
+              "physical NNI port.").format(LDP_PORT_CORR_WINDOW_MIN) +
+             " There is no device log of the physical port's own up/down "
+             "history to read directly (confirmed 2026-09-14 -- no protocol "
+             "runs across the NNI to the IXC, and no example found on the "
+             "hubs), so this is inferred from timing across sites instead. "
+             "For chronic/problem review: check the shared port before "
+             "re-investigating each flagged site's circuit as if it were a "
+             "standalone fault. Dual-homed sites whose outage couldn't be "
+             "attributed to one leg (see text report) are left out of this "
+             "correlation, so a 'no' there doesn't rule out a shared port "
+             "-- it means unproven, not clean."),
     ]
     for j, (name, desc) in enumerate(col_notes, start=notes_start + 1):
         a = ws2.cell(row=j, column=1, value=name)
@@ -1572,8 +2762,9 @@ def run(params, progress=print):
 
     # ── Load state + hostname map ─────────────────────────────────────────
     progress("\n[State] Loading...")
-    state = load_state()
-    progress("  {} sites in state file.".format(len(state)))
+    state = _migrate_state_schema(load_state(), progress)
+    progress("  {} sites in state file.".format(
+        sum(1 for k in state if k != _SCHEMA_KEY)))
 
     progress("[Hostnames] Building loopback->hostname map from existing reports...")
     lb_map = build_loopback_hostname_map()
@@ -1584,8 +2775,9 @@ def run(params, progress=print):
     # run_id marks every adjacency leg observed in this run, so aggregation can
     # distinguish live legs from stale historical ones in the state file.
     run_id            = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    seen_rids         = set()
-    new_events_by_rid = {}
+    seen_rids             = set()
+    new_events_by_rid     = {}
+    new_ldp_events_by_rid = {}
     results_lock      = threading.Lock()
     threads           = []
 
@@ -1595,6 +2787,7 @@ def run(params, progress=print):
             args=(hub_name, hub_ip, username, password,
                   lb_map, state, results_lock, seen_rids,
                   new_events_by_rid, run_id, progress),
+            kwargs={"new_ldp_events_by_rid": new_ldp_events_by_rid},
             daemon=True)
         threads.append(t)
         t.start()
@@ -1628,7 +2821,8 @@ def run(params, progress=print):
         progress("  Reading logs at {} concurrent session(s) "
                  "-- rough estimate {:.0f}s...".format(SWEEP_WORKERS, est))
         sweep_stats = _run_sweep(targets, username, password, state,
-                                 SWEEP_WORKERS, new_events_by_rid, progress)
+                                 SWEEP_WORKERS, new_events_by_rid, progress,
+                                 new_ldp_events_by_rid=new_ldp_events_by_rid)
         progress("  Sweep done: {} ok, {} unreachable, {} error(s), "
                  "{} new drop event(s) recorded.".format(
                      sweep_stats["ok"], sweep_stats["unreachable"],
@@ -1641,12 +2835,42 @@ def run(params, progress=print):
     # ── Aggregate: one row per site, after hubs AND sweep are complete ────
     results = _aggregate_results(state, seen_rids, new_events_by_rid, run_id,
                                  skipped_rids=proven_zero,
-                                 unchanged_rids=unchanged)
+                                 unchanged_rids=unchanged,
+                                 new_ldp_events_by_rid=new_ldp_events_by_rid)
 
-    elapsed = time.time() - t_start
-    dual    = sum(1 for r in results if r["hub_count"] > 1)
-    progress("\n[Poll] Complete -- {} unique site(s) in {:.0f}s "
-             "({} dual-homed).".format(len(results), elapsed, dual))
+    # Historical port correlation for chronic-ticket review (see
+    # correlate_ldp_port_events docstring): flags LDP outages that line up
+    # in time with a DIFFERENT site's outage on the same physical NNI port.
+    # Gated on LDP_PORT_CORR_ENABLED -- see that constant's comment: disabled
+    # until pcapps can confirm it against a real NNI outage.
+    if LDP_PORT_CORR_ENABLED:
+        hub_ip_to_name = {ip: name for name, ip in hub_targets}
+        port_corr_events = correlate_ldp_port_events(results, hub_ip_to_name)
+    else:
+        port_corr_events = []
+
+    elapsed   = time.time() - t_start
+    n_sites   = len({r["router_id"] for r in results})
+    n_dual    = len({r["router_id"] for r in results if r["hub_count"] > 1})
+    n_together = len({r["router_id"] for r in results
+                      if r.get("legs_pattern") == "legs together"})
+    progress("\n[Poll] Complete -- {} adjacency row(s) across {} unique site(s) "
+             "in {:.0f}s ({} dual-homed).".format(
+                 len(results), n_sites, elapsed, n_dual))
+    if n_together:
+        progress("  {} dual-homed site(s) have BOTH legs at matching uptime "
+                 "-- one event took both, so look at site transport rather "
+                 "than either hub.".format(n_together))
+
+    # Surface port-level outages in the live log too, not just the report --
+    # this is the finding that stops the NOC opening a ticket per EVC.
+    for p in port_rollup(results):
+        progress("  [!!] PORT EVENT {} {} -- {}/{} sub-interfaces DOWN ({:.0%}). "
+                 "{}".format(
+                     p["hub"], p["port"], p["down"], p["total"], p["down_share"],
+                     "ONE ticket against the port, not per EVC."
+                     if p["down_share"] >= 0.5 else
+                     "Check for a common upstream cause."))
 
     # ── Resolve hostnames via NetBox for any still-unresolved router-IDs ─
     # A site is "unresolved" when its hostname equals its router-ID (bare IP).
@@ -1671,11 +2895,13 @@ def run(params, progress=print):
 
     # ── Save state ────────────────────────────────────────────────────────
     save_state(state)
-    progress("[State] Saved ({} sites total).".format(len(state)))
+    progress("[State] Saved ({} sites total).".format(
+        sum(1 for k in state if k != _SCHEMA_KEY)))
 
     # ── Build text report (for progress log) ─────────────────────────────
     hub_names_polled = sorted(set(r["hub_1800"] for r in results))
-    report_text = _build_report(results, hub_names_polled, stamp, elapsed)
+    report_text = _build_report(results, hub_names_polled, stamp, elapsed,
+                                port_corr_events=port_corr_events)
     for line in report_text.splitlines():
         progress(line)
 
@@ -1685,7 +2911,8 @@ def run(params, progress=print):
     xlsx_path = os.path.join(OUTPUT_DIR, "OSPF_Stability_{}.xlsx".format(ts))
     out_path  = None
     progress("\n[Excel] Writing {}...".format(os.path.basename(xlsx_path)))
-    if _build_xlsx(results, state, hub_names_polled, stamp, elapsed, xlsx_path):
+    if _build_xlsx(results, state, hub_names_polled, stamp, elapsed, xlsx_path,
+                   port_corr_events=port_corr_events):
         out_path = xlsx_path
         progress("  Written: {}".format(xlsx_path))
     else:
@@ -1710,16 +2937,37 @@ def run(params, progress=print):
     # ── Slack alert ───────────────────────────────────────────────────────
     if slack_alert:
         new_drop_results = [r for r in results if r["new_events"]]
-        if new_drop_results:
+
+        # Dedup to one row per site: a dual-homed site produces one result
+        # row per hub leg, but new_ldp_down_events is the same site-level
+        # list on every leg (see _aggregate_results) -- counting per-leg
+        # would over-report the drop count in the alert.
+        seen_ldp_rids = set()
+        new_ldp_drop_results = []
+        for r in results:
+            if r.get("new_ldp_down_events") and r["router_id"] not in seen_ldp_rids:
+                seen_ldp_rids.add(r["router_id"])
+                new_ldp_drop_results.append(r)
+
+        if new_drop_results or new_ldp_drop_results:
             try:
                 cfg = load_config_silent()
                 webhook = cfg.get("SLACK_WEBHOOK", "")
             except Exception:
                 webhook = ""
             if webhook:
-                msg = _build_slack_alert(new_drop_results, stamp)
-                ok, slack_msg = post_slack(webhook, msg)
-                progress("[Slack] {}".format(slack_msg if ok else "FAILED: " + slack_msg))
+                if new_drop_results:
+                    msg = _build_slack_alert(new_drop_results, stamp)
+                    ok, slack_msg = post_slack(webhook, msg)
+                    progress("[Slack] OSPF: {}".format(slack_msg if ok else "FAILED: " + slack_msg))
+                else:
+                    progress("[Slack] No new OSPF drops this cycle -- no OSPF alert sent.")
+                if new_ldp_drop_results:
+                    ldp_msg = _build_ldp_slack_alert(new_ldp_drop_results, stamp)
+                    ok, slack_msg = post_slack(webhook, ldp_msg)
+                    progress("[Slack] LDP: {}".format(slack_msg if ok else "FAILED: " + slack_msg))
+                else:
+                    progress("[Slack] No new LDP drops this cycle -- no LDP alert sent.")
             else:
                 progress("[Slack] No webhook configured -- skipping alert.")
         else:

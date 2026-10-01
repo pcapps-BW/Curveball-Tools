@@ -14,6 +14,8 @@ Built by P. Capps.
 import re
 import sys
 
+import platform_paths
+
 try:
     import paramiko  # noqa: F401  (imported by device_base; ensures clear error)
 except ImportError:
@@ -149,7 +151,7 @@ def main():
     c.close()
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\NPT1250_porttest_{}_{}.txt".format(ts, c.hostname)
+    out_path = platform_paths.path("NPT1250_porttest_{}_{}.txt".format(ts, c.hostname))
     lines = ["1250 PORT TEST -- {} ({})".format(c.hostname, ip), ""]
     for ds1, info in ds1_map.items():
         lines.append("{}: MUSE {} | hub {} | loopback {}".format(

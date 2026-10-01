@@ -16,6 +16,8 @@ import re
 import os
 import datetime
 
+import platform_paths
+
 try:
     import paramiko  # noqa: F401
     _DEP_ERROR = None
@@ -253,6 +255,34 @@ def count_recent_down_events(down_events, days=7, now=None):
     return count
 
 
+def build_ospf_outage_events(ospf):
+    """
+    Convert this module's own down/full event lists (from _parse_ospf_events,
+    sourced from 'show ne events unreported' on the 1250) into the
+    {"dt", "kind", "formatted"} shape output_builders.pair_ospf_outages
+    expects -- using this module's own timestamp parser (_parse_event_dt), so
+    outage pairing for this tool stays sourced entirely from the 1250's own
+    log, with no additional device call and no need to touch the 1800.
+
+    Events with no parseable timestamp are skipped here (same rule
+    count_recent_down_events uses) -- they still appear in the raw
+    DOWN/FULL sections of the report, just can't be time-ordered for
+    pairing.
+    """
+    events = []
+    for raw_line in ospf.get("down", []):
+        dt = _parse_event_dt(raw_line)
+        if dt:
+            events.append({"dt": dt, "kind": "down",
+                           "formatted": _event_line(raw_line, "DOWN")})
+    for raw_line in ospf.get("full", []):
+        dt = _parse_event_dt(raw_line)
+        if dt:
+            events.append({"dt": dt, "kind": "up",
+                           "formatted": _event_line(raw_line, "FULL")})
+    return events
+
+
 def build_ospf_summary(ospf, light_lines=None):
     """
     Findings summary for the JIRA comment (always visible on the ticket):
@@ -385,6 +415,14 @@ def run(params):
             count_recent_down_events(ospf["down"])),
     ]
 
+    # Down/Up-paired outage summary -- deferred import to avoid a circular
+    # import (output_builders imports compute_ospf_uptime/parse_ldp_sessions
+    # from this module at its own module-load time).
+    from output_builders import pair_ospf_outages, format_ospf_outages
+    outages = pair_ospf_outages(build_ospf_outage_events(ospf))
+    lines.append("")
+    lines.append(format_ospf_outages(outages))
+
     lines += [
         "",
         "=" * 64,
@@ -470,7 +508,7 @@ def run(params):
 
     # Write output file.
     ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\ospf_events_{}_{}.txt".format(ts, host)
+    out_path = platform_paths.path("ospf_events_{}_{}.txt".format(ts, host))
     try:
         with open(out_path, "w") as f:
             f.write("\n".join(lines))
@@ -489,7 +527,8 @@ def run(params):
             "OSPF Events + Fiber Levels -- {}".format(host),
             "\n".join(lines),
             attach_path=out_path,
-            summary_text=build_ospf_summary(ospf, summary_lights))
+            summary_text=format_ospf_outages(outages) + "\n\n" +
+                         build_ospf_summary(ospf, summary_lights))
         print("[JIRA] {}".format(msg) if ok else "[JIRA] FAILED: {}".format(msg))
 
     if open_when_done:

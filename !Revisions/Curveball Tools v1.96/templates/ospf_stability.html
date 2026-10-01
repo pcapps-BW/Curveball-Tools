@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}OSPF Stability -- Curveball Tools{% endblock %}
+{% block content %}
+<h1>OSPF Stability Monitor</h1>
+<div class="sub">Polls all NPT-1800 hubs from NetBox and tracks OSPF adjacency stability per 1250 site.
+  Detects session bounces and alerts to Slack. State persists between runs -- drop counts accumulate over time.</div>
+
+<div class="panel">
+  <form id="runForm" data-run-url="/api/ospf-stability/run">
+
+    <div class="row">
+      <div>
+        <label for="infra_user">Infrastructure username</label>
+        <input type="text" id="infra_user" name="infra_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="infra_pass">Infrastructure password</label>
+        <input type="password" id="infra_pass" name="infra_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="slackAlert" name="slack_alert" checked>
+      <label for="slackAlert">Alert Slack on new drops</label>
+    </div>
+    <div class="hint">Uses the Slack webhook saved from a previous run. Configure it in Morning Check or Autotester first.</div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="openWhenDone" name="open_when_done">
+      <label for="openWhenDone">Open report when done (Excel)</label>
+    </div>
+    <div class="hint">Only works when this server is running on your own machine.</div>
+
+    <button type="submit">Run OSPF Stability Poll</button>
+    <div class="field-error" id="formError"></div>
+  </form>
+</div>
+
+{% include "_job_panels.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='job.js') }}"></script>
+<script>
+  initJobForm('runForm');
+</script>
+{% endblock %}

@@ -1,9 +1,10 @@
 {% extends "base.html" %}
-{% block title %}OSPF Stability -- Curveball Tools{% endblock %}
+{% block title %}OSPF & LDP Stability -- Curveball Tools{% endblock %}
 {% block content %}
-<h1>OSPF Stability Monitor</h1>
-<div class="sub">Polls all NPT-1800 hubs from NetBox and tracks OSPF adjacency stability per 1250 site.
-  Detects session bounces and alerts to Slack. State persists between runs -- drop counts accumulate over time.</div>
+<h1>OSPF & LDP Stability Monitor</h1>
+<div class="sub">Polls all NPT-1800 hubs from NetBox and tracks OSPF adjacency AND LDP session stability per 1250 site.
+  Detects session bounces and alerts to Slack. LDP outages are paired Down/Up with uptime and downtime durations,
+  sourced from both the 1800 and the 1250. State persists between runs -- drop counts accumulate over time.</div>
 
 <div class="panel">
   <form id="runForm" data-run-url="/api/ospf-stability/run">

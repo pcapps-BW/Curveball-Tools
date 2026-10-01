@@ -20,6 +20,8 @@ import json
 import subprocess
 import threading
 
+import platform_paths
+
 PLINK_CANDIDATES = [
     "plink",
     r"C:\Program Files\PuTTY\plink.exe",
@@ -32,7 +34,7 @@ READ_IDLE = 0.4
 
 # Local fingerprint store (Tier 1 TOFU + change detection). Upgradeable to
 # Netbox-sourced known-good fingerprints later (Tier 2).
-HOSTKEY_STORE = r"C:\Claude\gsx_hostkeys.json"
+HOSTKEY_STORE = platform_paths.path("gsx_hostkeys.json")
 
 
 def find_plink():
@@ -47,23 +49,93 @@ def find_plink():
 
 
 def ping_host(ip):
+    """
+    One-shot local-OS ping (NOT a device CLI command -- this runs on whatever
+    host the tool itself is executing on, to find the live GSX mgmt card
+    before SSHing in).
+
+    Flags are OS-specific and were Windows-only before 2026-09-11 (-n/-w),
+    silently broken the first time this ran on Linux (noe-util-01a) -- Linux
+    ping uses -c/-W with a different timeout unit (whole seconds, not ms).
+    Exit code is the primary success signal (0 = at least one reply, on both
+    platforms) since it's the one thing that doesn't depend on locale/output
+    format; the string checks are kept only as a belt-and-suspenders fallback.
+    """
     try:
-        result = subprocess.run(
-            ["ping", "-n", "1", "-w", str(PING_TIMEOUT_MS), ip],
-            capture_output=True, text=True, timeout=5)
-        out = result.stdout
-        return ("TTL=" in out) or ("Received = 1" in out)
+        if os.name == "nt":
+            cmd = ["ping", "-n", "1", "-w", str(PING_TIMEOUT_MS), ip]
+        else:
+            timeout_s = max(1, int(round(PING_TIMEOUT_MS / 1000.0)))
+            cmd = ["ping", "-c", "1", "-W", str(timeout_s), ip]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        out = result.stdout.lower()
+        return (result.returncode == 0) or ("ttl=" in out) or ("received = 1" in out)
     except Exception:
         return False
 
 
 def find_live_ip(cards):
-    """cards = {"1-1":[ips], "1-2":[ips]} -> (card_key, ip) or (None, None)."""
+    """cards = {"1-1":[ips], "1-2":[ips]} -> (card_key, ip) or (None, None).
+
+    PING ONLY. A GSX can answer ICMP and still refuse SSH ("Connection
+    refused" out of plink), so a pingable IP is not a usable IP. Callers that
+    are about to log in should use connect_first_live() instead; this remains
+    for callers that only need an address to print in a runbook.
+    """
     for card_key in sorted(cards.keys()):
         for ip in cards[card_key]:
             if ping_host(ip):
                 return card_key, ip
     return None, None
+
+
+def connect_first_live(cards, username, password, plink_path, progress=None):
+    """
+    Return (card_key, ip, connected_client) for the first mgmt IP that both
+    pings AND accepts SSH -- or (None, None, None) if none do.
+
+    WHY: ping success does not imply SSH. Observed 2026-10-01 on ATLGSX02
+    (192.168.40.5) -- ICMP fine, plink died at login with "Network error:
+    Connection refused", and because the old path committed to the first
+    PINGABLE address, every DS1 on that card failed with the same error
+    instead of trying the next management IP.
+
+    The successful client is returned OPEN so the caller reuses this
+    connection rather than logging in a second time. Failed attempts are
+    closed here. Nothing is cached to disk -- trial and error every run, by
+    request, so no address list can go stale.
+
+    `progress` (optional) is called with a one-line note per failed IP, so a
+    primary that is always refusing SSH is visible rather than silently
+    routed around.
+    """
+    tried = []
+    for card_key in sorted(cards.keys()):
+        for ip in cards[card_key]:
+            if not ping_host(ip):
+                tried.append("{} no ping".format(ip))
+                continue
+            c = GSXClient(ip, username, password, plink_path)
+            try:
+                c.connect()
+                if tried and progress:
+                    progress("     GSX {} reached on {} after skipping: {}"
+                             .format(card_key, ip, "; ".join(tried)))
+                return card_key, ip, c
+            except Exception as e:
+                tried.append("{} SSH failed ({})".format(
+                    ip, type(e).__name__))
+                if progress:
+                    progress("     [!] GSX {} pings but SSH failed: {} -- "
+                             "trying next mgmt IP".format(ip, e))
+                try:
+                    c.close()
+                except Exception:
+                    pass
+    if progress and tried:
+        progress("     [!] no usable GSX mgmt IP. Tried: {}".format(
+            "; ".join(tried)))
+    return None, None, None
 
 
 # ---- Tier 1 host-key fingerprint store (TOFU + change detection) ----
@@ -329,6 +401,41 @@ class GSXClient:
                     continue
             cleaned.append(s)
         return "\n".join(cleaned)
+
+    def get_t3_status(self, slot, port):
+        """
+        Pull just SHOW T3 STATUS for the parent T3 of a given slot/port.
+        Used by the autotester to distinguish T3-level outage from DS1-specific
+        failure (if T3 is DOWN, all 28 T1s on that port are affected by the
+        same root cause -- one ticket, not 28).
+        Returns the raw output string.
+        """
+        t3_id = "T3-1-{}-{}".format(slot, port)
+        try:
+            return self.run_command("SHOW T3 {} STATUS".format(t3_id))
+        except Exception as e:
+            return "[command error: {}]".format(e)
+
+    def pull_t3_stats(self, slot, port):
+        """
+        Pull the standard T3 command set for a given slot/port.
+        Returns list of (label, cmd, output).
+        """
+        t3_id = "T3-1-{}-{}".format(slot, port)
+        commands = [
+            ("STATUS",              "SHOW T3 {} STATUS".format(t3_id)),
+            ("STATISTICS",          "SHOW T3 {} STATISTICS".format(t3_id)),
+            ("PERFMON CURRENT DAY", "SHOW T3 {} PERFMON CURRENT DAY".format(t3_id)),
+            ("PERFMON THRESHOLDS",  "SHOW T3 {} PERFMON THRESHOLDS".format(t3_id)),
+        ]
+        out = []
+        for label, cmd in commands:
+            try:
+                res = self.run_command(cmd)
+            except Exception as e:
+                res = "[command error: {}]".format(e)
+            out.append((label, cmd, res))
+        return out
 
     def pull_t1_stats(self, slot, port, t1):
         """

@@ -18,6 +18,8 @@ Built by P. Capps.
 import os
 import datetime
 
+import platform_paths
+
 try:
     import paramiko  # noqa: F401
     _DEP_ERROR = None
@@ -164,61 +166,68 @@ def run(params):
     except Exception as e:
         print("[!] connect failed: {}: {}".format(type(e).__name__, e))
         return None
-    host = c.hostname
-    print("  host: {}".format(host))
+    try:
+        # try/finally added 2026-10-01: the body below is long, and any
+        # exception in it used to return without closing the session.
+        # Harmless for a one-shot CLI run (process exits, socket drops) but
+        # NOT in the long-lived Flask app, where the transport and its
+        # reader thread would survive until the device timed the session out.
+        host = c.hostname
+        print("  host: {}".format(host))
 
-    lines = []
-    lines.append("NPT-1250 DS1 PMs")
-    lines.append("Host: {}  IP: {}".format(host, ip))
-    lines.append("=" * 64)
-
-    def block(title, cmd):
-        raw = c.run(cmd + " | no-more")
-        lines.append("")
-        lines.append("  >> {}".format(title))
-        lines.append("  CMD: {}".format(cmd))
-        for ln in raw.splitlines():
-            clean = ln.rstrip()
-            if clean:
-                lines.append("    {}".format(clean))
-        return raw
-
-    findings = []   # per-DS1 one-liners for the JIRA summary
-    for ch, slot, ch_num in channels:
-        print("  collecting: {}".format(ch))
-        lines.append("")
+        lines = []
+        lines.append("NPT-1250 DS1 PMs")
+        lines.append("Host: {}  IP: {}".format(host, ip))
         lines.append("=" * 64)
-        lines.append("  -- {} --".format(ch))
-        lines.append("=" * 64)
-        raw_status = block("Physical Status",
-              'show interfaces physical status slot {} | grep "ds1/{} "'.format(slot, ch_num))
-        raw_alarms = block("NE Alarms", "show ne alarms | grep {}".format(ch))
-        block("Physical PM 24hr", "show interfaces physical pm 24hour {}".format(ch))
-        block("CES PM 24hr (Valid intervals)",
-              "show interfaces pm 24hour {} ces | grep Valid".format(ch))
-        block("CES PM 24hr (ES)",
-              "show interfaces pm 24hour {} ces | grep ES | except Stat".format(ch))
-        block("CES PM 24hr (UAS)",
-              "show interfaces pm 24hour {} ces | grep UAS".format(ch))
 
-        # One-liner per DS1: echo the device's own status row + alarm count.
-        status_row = next(
-            (l.strip() for l in raw_status.splitlines() if "ds1/" in l.lower()), "")
-        alarm_rows = [l.strip() for l in raw_alarms.splitlines()
-                      if ch in l and l.strip()]
-        finding = "{}  {}".format(ch, status_row if status_row
-                                  else "(no status row returned)")
-        if alarm_rows:
-            finding += "  |  {} alarm(s): {}".format(
-                len(alarm_rows), alarm_rows[0][:60])
-        else:
-            finding += "  |  no alarms"
-        findings.append(finding)
+        def block(title, cmd):
+            raw = c.run(cmd + " | no-more")
+            lines.append("")
+            lines.append("  >> {}".format(title))
+            lines.append("  CMD: {}".format(cmd))
+            for ln in raw.splitlines():
+                clean = ln.rstrip()
+                if clean:
+                    lines.append("    {}".format(clean))
+            return raw
 
-    c.close()
+        findings = []   # per-DS1 one-liners for the JIRA summary
+        for ch, slot, ch_num in channels:
+            print("  collecting: {}".format(ch))
+            lines.append("")
+            lines.append("=" * 64)
+            lines.append("  -- {} --".format(ch))
+            lines.append("=" * 64)
+            raw_status = block("Physical Status",
+                  'show interfaces physical status slot {} | grep "ds1/{} "'.format(slot, ch_num))
+            raw_alarms = block("NE Alarms", "show ne alarms | grep {}".format(ch))
+            block("Physical PM 24hr", "show interfaces physical pm 24hour {}".format(ch))
+            block("CES PM 24hr (Valid intervals)",
+                  "show interfaces pm 24hour {} ces | grep Valid".format(ch))
+            block("CES PM 24hr (ES)",
+                  "show interfaces pm 24hour {} ces | grep ES | except Stat".format(ch))
+            block("CES PM 24hr (UAS)",
+                  "show interfaces pm 24hour {} ces | grep UAS".format(ch))
+
+            # One-liner per DS1: echo the device's own status row + alarm count.
+            status_row = next(
+                (l.strip() for l in raw_status.splitlines() if "ds1/" in l.lower()), "")
+            alarm_rows = [l.strip() for l in raw_alarms.splitlines()
+                          if ch in l and l.strip()]
+            finding = "{}  {}".format(ch, status_row if status_row
+                                      else "(no status row returned)")
+            if alarm_rows:
+                finding += "  |  {} alarm(s): {}".format(
+                    len(alarm_rows), alarm_rows[0][:60])
+            else:
+                finding += "  |  no alarms"
+            findings.append(finding)
+
+    finally:
+        c.close()
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\DS1_PMs_{}_{}.txt".format(ts, host)
+    out_path = platform_paths.path("DS1_PMs_{}_{}.txt".format(ts, host))
     try:
         with open(out_path, "w") as f:
             f.write("\n".join(lines))

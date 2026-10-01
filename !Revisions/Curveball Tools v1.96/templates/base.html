@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{% block title %}Curveball Tools{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+{% block topbar %}
+<div class="topbar"><a href="/" class="home-link">&larr; Curveball Tools</a></div>
+{% endblock %}
+{% block content %}{% endblock %}
+<div class="watermark">Built by P. Capps &middot; {{ app_version }}</div>
+{% block scripts %}{% endblock %}
+</body>
+</html>

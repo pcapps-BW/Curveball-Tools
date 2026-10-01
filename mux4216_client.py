@@ -193,6 +193,8 @@ class MUX4216Client(BaseDeviceClient):
         mux_results = {}
         t3_stats    = {}
         errors      = {}
+        sonet_pm_cache = {}   # active_sonet iface -> raw "show controllers sonet" text
+                              # (dedupe: multiple DS1s often share the same SONET path)
 
         # Pull ACR groups once
         raw_acr = self.run("show acr group")
@@ -343,23 +345,69 @@ class MUX4216Client(BaseDeviceClient):
                             acr_num      = acr_groups[0]["acr"]
                             active_sonet = acr_groups[0]["active"]
 
-                # xconnect -> GSX CE interface + CEM id
+                # ---- xconnect -> GSX CE interface + CEM id ----
+                #
+                # Three bugs lived here, and together they returned a DIFFERENT
+                # circuit's endpoint. Observed 2026-09-01 on SLKCUTMA660 ts1/25:
+                # emitted LAXGSX04 / 11-2-28, actual LAXGSX01 / 12-2-12.
+                #
+                #   1. The old inner `break` exited only the INNER loop, so every
+                #      later matching line OVERWROTE the earlier result -- the LAST
+                #      match won, not the first. Never intended.
+                #   2. `if "CE{acr}:{cem}" in line` is an unanchored substring:
+                #      "CE16:1120" contains "CE16:112", so a neighbouring circuit
+                #      matches. Same flaw in the device-side `| i {acr}:{cem}`.
+                #   3. With (1) and (2) combined, several lines matched and the
+                #      last one's endpoint (8/2/10:128) was used. 128 % 100 = 28,
+                #      which is exactly the wrong T1 that was reported; the true
+                #      CEM id was 112 -> 112 % 100 = 12, the correct T1.
+                #
+                # Now: match the CE token anchored (no trailing digit), collect
+                # every distinct candidate, and refuse to pick silently when more
+                # than one survives.
                 raw_xc = self.run("show xconnect all | i {}:{}".format(acr_num, cem_group))
-                gsx_ce_iface = gsx_cem_id = None
+                ce_token_re = re.compile(
+                    r'CE{}:{}(?!\d)'.format(re.escape(str(acr_num)),
+                                            re.escape(str(cem_group))))
+                candidates = []          # [(ce_iface, ce_id), ...] distinct, in order
                 for line in raw_xc.splitlines():
-                    if "CE{}:{}".format(acr_num, cem_group) in line:
-                        ces = re.findall(r'CE([\d/]+):(\d+)', line)
-                        for ce_iface, ce_id in ces:
-                            if "/" in ce_iface:
-                                gsx_ce_iface = ce_iface
-                                gsx_cem_id   = ce_id
-                                break
-                if not gsx_ce_iface:
-                    raise RuntimeError("No GSX xconnect for ACR {}:{}".format(acr_num, cem_group))
+                    if not ce_token_re.search(line):
+                        continue          # line belongs to a different circuit
+                    for ce_iface, ce_id in re.findall(r'CE([\d/]+):(\d+)', line):
+                        if "/" not in ce_iface:
+                            continue      # ACR side (e.g. CE16:112), not the GSX side
+                        if (ce_iface, ce_id) not in candidates:
+                            candidates.append((ce_iface, ce_id))
+
+                gsx_xc_conflict = None
+                if not candidates:
+                    raise RuntimeError(
+                        "No GSX xconnect for ACR {}:{}. Raw output: {}".format(
+                            acr_num, cem_group, raw_xc.strip() or "(empty)"))
+                if len(candidates) == 1:
+                    gsx_ce_iface, gsx_cem_id = candidates[0]
+                else:
+                    # Prefer the endpoint whose CEM id equals the ACR-side CEM
+                    # group -- that held true in the one case verified against the
+                    # GSX. Still flagged, because one confirmed case is not a rule.
+                    exact = [c for c in candidates if c[1] == str(cem_group)]
+                    gsx_ce_iface, gsx_cem_id = exact[0] if len(exact) == 1 else candidates[0]
+                    gsx_xc_conflict = (
+                        "WARNING: {} GSX xconnect endpoints matched ACR {}:{} -- {}. "
+                        "Using CE{}:{}{}. The other endpoints belong to different "
+                        "circuits; verify on the GSX before acting. Raw xconnect: {}"
+                        .format(len(candidates), acr_num, cem_group,
+                                ", ".join("CE{}:{}".format(a, b) for a, b in candidates),
+                                gsx_ce_iface, gsx_cem_id,
+                                " (CEM id matches the ACR CEM group)"
+                                if len(exact) == 1 else " (first match; none matched"
+                                " the CEM group, so this is a guess)",
+                                raw_xc.strip().replace("\n", " | ") or "(empty)"))
 
                 # T3 description -> GSX node/slot/port
                 raw_t3 = self.run("show controllers t3 {} | inc [Dd]escription".format(gsx_ce_iface))
                 gsx_desc = gsx_node = gsx_slot = gsx_port = None
+                gsx_t1_desc = None
                 gsx_flag = None
                 for line in raw_t3.splitlines():
                     if "escription" in line:
@@ -371,6 +419,11 @@ class MUX4216Client(BaseDeviceClient):
                                 gsx_node = p[0]
                                 gsx_slot = p[1]
                                 gsx_port = p[2]
+                                # The description carries the T1 as its 4th field
+                                # (NODE-SLOT-PORT-T1, e.g. LAXGSX04-11-2-14).
+                                # It used to be discarded -- see gsx_t1 below.
+                                if len(p) >= 4:
+                                    gsx_t1_desc = p[3]
                             else:
                                 gsx_flag = (
                                     "WARNING: GSX T3 description on {} is '{}' -- doesn't "
@@ -388,12 +441,67 @@ class MUX4216Client(BaseDeviceClient):
                         "-- node/slot/port could not be derived. Raw output: {}".format(
                             gsx_ce_iface, raw_t3.strip() or "(empty)"))
 
-                gsx_t1 = str(int(gsx_cem_id) % 100) if gsx_cem_id else "?"
+                # ---- GSX T1: two independent sources, cross-checked ----
+                #
+                # There are two ways to get the T1 number and they can disagree:
+                #   (a) cem_id % 100      -- derived from the live xconnect CEM id
+                #   (b) description p[3]  -- the provisioned NODE-SLOT-PORT-T1 label
+                #
+                # (b) used to be parsed and then silently thrown away, so when the
+                # two disagreed the report showed (a) with no indication anything
+                # was ambiguous. Observed 2026-09-01: CE8/2/10:128 gave
+                # cem_id % 100 = 28, printing assignment "11-2-28", while the
+                # description on that controller ended in a different T1 -- so the
+                # emitted "SHOW T1 T1-1-11-2-28" pointed at the wrong circuit.
+                #
+                # Both are now kept and compared. Neither is assumed correct: on a
+                # mismatch the value is still (a) for backward compatibility, but
+                # gsx_t1_conflict carries both so the report can say so out loud
+                # rather than quietly picking a side.
+                gsx_t1_derived = str(int(gsx_cem_id) % 100) if gsx_cem_id else None
+                gsx_t1_conflict = None
+                if gsx_t1_desc and gsx_t1_derived and \
+                        gsx_t1_desc.lstrip("0") != gsx_t1_derived.lstrip("0"):
+                    gsx_t1_conflict = (
+                        "WARNING: GSX T1 mismatch on CE{}:{} -- controller description "
+                        "'{}' says T1 {}, but CEM id {} implies T1 {}. Assignment shown "
+                        "as {}-{}-{} using the CEM-derived value; verify on the GSX "
+                        "before acting, and note 'SHOW T1 T1-1-{}-{}-{}' may target the "
+                        "wrong circuit.".format(
+                            gsx_ce_iface, gsx_cem_id, gsx_desc, gsx_t1_desc,
+                            gsx_cem_id, gsx_t1_derived,
+                            gsx_slot or "?", gsx_port or "?", gsx_t1_derived,
+                            gsx_slot or "?", gsx_port or "?", gsx_t1_derived))
+                gsx_t1 = gsx_t1_derived or "?"
+
+                # ---- MUX-side SONET PM (facing the 1800) ----
+                # Direction 2026-09-02: the tool checked facility alarms, CEM
+                # connection state, and working/protect conflict on the MUX,
+                # but never actually pulled SONET PM error counters from the
+                # MUX's own side of the OC12/SONET-ACR path facing the 1800
+                # (the OC12_COUNTERS check elsewhere is sourced entirely from
+                # the 1800, not the MUX) -- confirmed gap, not a silent
+                # under-report. "| no-more" required even though this client
+                # already sends "terminal length 0" post-login -- this
+                # specific command's output is long enough that it still
+                # needs it (per live confirmation on jfk1-mux-02).
+                sonet_pm_raw = ""
+                if active_sonet:
+                    if active_sonet in sonet_pm_cache:
+                        sonet_pm_raw = sonet_pm_cache[active_sonet]
+                    else:
+                        try:
+                            sonet_pm_raw = self.run(
+                                "show controllers sonet {} | no-more".format(active_sonet))
+                        except Exception:
+                            sonet_pm_raw = ""
+                        sonet_pm_cache[active_sonet] = sonet_pm_raw
 
                 mux_results[ds1] = {
                     "mux_name":        mux_name,
                     "mux_ip":          mux_ip,
                     "active_sonet":    active_sonet,
+                    "sonet_pm":        sonet_pm_raw,
                     "netbox_conflict": netbox_conflict,
                     "acr_group":       acr_num,
                     "cem_group":       cem_group,
@@ -406,6 +514,9 @@ class MUX4216Client(BaseDeviceClient):
                     "gsx_slot":        gsx_slot,
                     "gsx_port":        gsx_port,
                     "gsx_t1":          gsx_t1,
+                    "gsx_t1_desc":     gsx_t1_desc,
+                    "gsx_t1_conflict": gsx_t1_conflict,
+                    "gsx_xc_conflict": gsx_xc_conflict,
                     "gsx_flag":        gsx_flag,
                 }
 

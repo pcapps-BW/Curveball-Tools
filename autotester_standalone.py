@@ -21,18 +21,21 @@ import sys
 import getpass
 import datetime
 
+import platform_paths
 from netbox_client import NetboxClient, load_netbox_config
 from npt1250_client import NPT1250Client
 from device_base import CredentialError, prompt_ip
-from npt1800_client import NPT1800Client, HUB_IPS
+from npt1800_client import NPT1800Client
 from mux4216_client import MUX4216Client
-from gsx_client import GSXClient, find_plink, find_live_ip
+from gsx_client import (GSXClient, find_plink, find_live_ip,
+                        connect_first_live)
 from output_builders import (
     build_route_block, build_peerless_block,
     build_diagnostic_summary, run_summary_line, SEP, SEP2,
     resolve_nni_from_description, build_jira_summary,
 )
 from jira_client import post_report, valid_ticket, post_slack, JIRA_BASE
+from ds1_util import expand_ds1_list
 
 # loc -> MUX (from SecureCRT LOC_TO_MUX)
 LOC_TO_MUX = {
@@ -68,7 +71,7 @@ def collect_inputs(session=None):
         ds1_list = list(default_ds1)
     else:
         # Normalize: lowercase + accept & as an alternate separator
-        ds1_list = [d.strip().lower() for d in ds1_raw.replace("&", ",").split(",") if d.strip()]
+        ds1_list, _ds1_notes = expand_ds1_list(ds1_raw)
     if not ip_1250 or not ds1_list:
         print("Need a 1250 IP and at least one DS1.")
         return None
@@ -205,9 +208,9 @@ def run(params):
             pm24 = c1250.run("show interfaces physical pm 24hour {} | no-more".format(port))
             pm15 = c1250.run("show interfaces physical pm 15min {} | no-more".format(port))
             laser = c1250.run(
-                "show chassis transceiver information slot {} port1 | grep laser".format(slot))
+                "show chassis transceiver information slot {} port1 | grep laser | no-more".format(slot))
             tca = c1250.run(
-                "show chassis transceiver tca slot {} port1".format(slot))
+                "show chassis transceiver tca slot {} port1 | no-more".format(slot))
             combined_pm = (pm24 or "") + "\n" + (pm15 or "")
             if combined_pm.strip() and "Monitored Seconds" in combined_pm:
                 fiber_results[port] = {"pm": combined_pm, "laser": laser or "",
@@ -377,7 +380,8 @@ def run(params):
     progress("  HOP 4 -- GSX")
     progress("=" * 64)
 
-    gsx_results = {}   # ds1 -> list of (label, cmd, output)
+    gsx_results    = {}   # ds1 -> list of (label, cmd, output)
+    gsx_t3_results = {}   # ds1 -> raw SHOW T3 STATUS output (parent T3 of the T1)
     if not plink_path:
         progress("  [!] plink not found -- skipping GSX hop.")
     else:
@@ -395,18 +399,23 @@ def run(params):
             if not cards:
                 progress("  {} -> no GSX mgmt IPs from Netbox for {}".format(ds1, gsx_dev))
                 continue
-            card_key, live_ip = find_live_ip(cards)
+            # Tries each mgmt IP until one both pings AND accepts SSH -- a GSX
+            # can answer ICMP and still refuse the login (ATLGSX02, 2026-10-01).
+            card_key, live_ip, g = connect_first_live(
+                cards, gsx_user, gsx_pass, plink_path, progress=progress)
             if not live_ip:
-                progress("  {} -> no reachable GSX mgmt IP".format(ds1))
+                progress("  {} -> no GSX mgmt IP that pings AND accepts SSH"
+                         .format(ds1))
                 continue
             r["gsx_ip"] = live_ip   # stash for the route block, even if the pull below fails
             progress("  {} -> GSX {} ({}) card {} -> T1-1-{}-{}-{}".format(
                 ds1, node, live_ip, card_key, slot, port, t1))
-            g = GSXClient(live_ip, gsx_user, gsx_pass, plink_path)
             try:
-                g.connect()
                 stats = g.pull_t1_stats(slot, port, t1)
                 gsx_results[ds1] = stats
+                # Pull parent T3 STATUS to distinguish T3-level outage from a
+                # DS1-specific failure in the run summary (one T3 ticket vs 28).
+                gsx_t3_results[ds1] = g.get_t3_status(slot, port)
             except Exception as e:
                 progress("     [!] GSX pull failed: {}: {}".format(type(e).__name__, e))
             finally:
@@ -415,13 +424,23 @@ def run(params):
     # ---------- STAGE B: POLISHED OUTPUT (SecureCRT order/format) ----------
     step1_errors_all = dict(step1_errors)  # ds1 -> error (1250 no-MUSE etc.)
 
+    # Flatten GSX per-DS1 stats into a single text blob per DS1 for counter
+    # review. Built here (before the run summary) so the summary line can also
+    # check GSX T1 Operational/Alarm Status -- previously this was built after
+    # run_summary_line was called, so those fields were never evaluated there.
+    gsx_pm_results = {}
+    for ds1, stats in gsx_results.items():
+        gsx_pm_results[ds1] = "\n".join(
+            "{}\n{}".format(cmd, out) for (label, cmd, out) in stats)
+
     # 1) RUN SUMMARY (fault-direction one-liners)
     run_summary_block = [SEP, "  RUN SUMMARY  --  {}".format(host_1250), SEP, ""]
     for ds1 in ds1_map:
         run_summary_block.append(run_summary_line(
             ds1, ds1_map, ds1_pms, oc12_results, hub_results,
             mux_results_all, oc12_stats_all, t3_stats_all, peerless_all,
-            fiber_results, evc_results))
+            fiber_results, evc_results, gsx_pm_results=gsx_pm_results,
+            gsx_t3_results=gsx_t3_results))
     run_summary_block += ["", SEP]
     for ln in run_summary_block:
         emit(ln)
@@ -430,11 +449,6 @@ def run(params):
     # Each DS1's full route is emitted immediately above that same DS1's own
     # diagnostic summary -- easier to digest than two separate combined
     # sections that each span every channel.
-    # Flatten GSX per-DS1 stats into a single text blob per DS1 for counter review.
-    gsx_pm_results = {}
-    for ds1, stats in gsx_results.items():
-        gsx_pm_results[ds1] = "\n".join(
-            "{}\n{}".format(cmd, out) for (label, cmd, out) in stats)
 
     diag_text_parts  = []
     route_diag_parts = []   # per-DS1 "Full T1 Route + Diagnostic Summary" only
@@ -468,7 +482,8 @@ def run(params):
             [ds1], ds1_map, ds1_pms, oc12_results,
             hub_results, mux_results_all, oc12_stats_all,
             t3_stats_all, peerless_all, step1_errors_all, gsx_pm_results,
-            fiber_results, evc_results, ospf_events_raw, ldp_session_raw)
+            fiber_results, evc_results, ospf_events_raw, ldp_session_raw,
+            gsx_t3_results=gsx_t3_results)
         emit(ds1_diag_text)
         emit("")
         diag_text_parts.append(ds1_diag_text)
@@ -651,7 +666,7 @@ def run(params):
 
 def _write(report, host="run"):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\Autotester_standalone_{}_{}.txt".format(ts, host)
+    out_path = platform_paths.path("Autotester_standalone_{}_{}.txt".format(ts, host))
     try:
         with open(out_path, "w") as f:
             f.write("\n".join(report))

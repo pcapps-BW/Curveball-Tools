@@ -1,0 +1,255 @@
+{% extends "base.html" %}
+{% block title %}DS1 Test Builder -- Curveball Tools{% endblock %}
+{% block content %}
+<h1>DS1 Test Builder (AIS / Loops to GSX)</h1>
+<div class="sub">Resolves the full route, runs live read-only prechecks, then generates a copy/paste test script: GSX counter clears, AIS or loopback commands, monitoring, back-out, postchecks. <strong>No config changes are ever executed by this tool.</strong></div>
+
+<div class="dual-col">
+<div class="col">
+<div class="panel">
+  <h1 style="font-size:16px;">Build Test Script</h1>
+  <form id="runForm" data-run-url="/api/ds1-gsx-test/run">
+    <label for="ip_1250">1250 IP</label>
+    <input type="text" id="ip_1250" name="ip_1250" placeholder="10.111.131.79" required>
+
+    <label for="ds1_list">DS1(s) -- comma or &amp; separated</label>
+    <input type="text" id="ds1_list" name="ds1_list" placeholder="ts1/1, ts1/2" required>
+
+    <div class="divider"></div>
+
+    <div class="row">
+      <div>
+        <label>Test device</label>
+        <div class="radio-item">
+          <input type="radio" id="dev1250" name="device" value="1250" checked>
+          <label for="dev1250">1250</label>
+        </div>
+        <div class="radio-item">
+          <input type="radio" id="dev1800" name="device" value="1800">
+          <label for="dev1800">1800</label>
+        </div>
+      </div>
+      <div>
+        <label>Test type</label>
+        <div class="radio-item">
+          <input type="radio" id="testAis" name="test" value="ais" checked>
+          <label for="testAis">AIS</label>
+        </div>
+        <div class="radio-item">
+          <input type="radio" id="testLoop" name="test" value="loop">
+          <label for="testLoop">Loop</label>
+        </div>
+      </div>
+    </div>
+
+    <label for="direction">Direction</label>
+    <select id="direction" name="direction" required></select>
+    <div class="hint" id="dirHint"></div>
+    <div class="hint" id="unverifiedWarn" style="color:var(--warn); display:none;">
+      1800 AIS command syntax is UNVERIFIED -- the script will carry a warning
+      banner; review each command against the device config before running.
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="addJira" name="add_jira">
+      <label for="addJira">Post script to JIRA</label>
+    </div>
+    <div id="jiraTicketWrap" style="display:none;">
+      <label for="jira_ticket">JIRA ticket (NOE-XXXX)</label>
+      <input type="text" id="jira_ticket" name="jira_ticket" placeholder="NOE-1234">
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="openWhenDone" name="open_when_done">
+      <label for="openWhenDone">Open script file when done (Notepad)</label>
+    </div>
+    <div class="hint">Only works when this server is running on your own machine.</div>
+
+    <div class="row">
+      <div>
+        <label for="infra_user">Infrastructure username (1250/1800/MUX)</label>
+        <input type="text" id="infra_user" name="infra_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="infra_pass">Infrastructure password</label>
+        <input type="password" id="infra_pass" name="infra_pass" required autocomplete="current-password">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="gsx_user">GSX username</label>
+        <input type="text" id="gsx_user" name="gsx_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="gsx_pass">GSX password</label>
+        <input type="password" id="gsx_pass" name="gsx_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <button type="submit">Build Test Script</button>
+    <div class="field-error" id="formError"></div>
+  </form>
+</div>
+{% set panel_suffix = 'build' %}
+{% include "_job_panels.html" %}
+</div>
+
+<div class="col">
+<div class="panel">
+  <h1 style="font-size:16px;">GSX Monitor (read-only by default)</h1>
+  <div class="sub" style="margin-bottom:8px;">Polls SHOW T1 &lt;id&gt; STATISTICS at a fixed interval and streams each snapshot into the log below -- watch the counters while your loop/AIS test runs. The IP, assignment, and GSX credentials auto-fill from the test build above once the route resolves.</div>
+  <div id="gsxTargets" style="display:none; margin-bottom:10px;">
+    <div class="hint" style="margin-left:0;">Resolved targets (click to fill):</div>
+    <div id="gsxTargetChips"></div>
+  </div>
+  <form id="monitorForm" data-run-url="/api/gsx-monitor/run">
+    <div class="row">
+      <div>
+        <label for="mon_gsx_ip">GSX IP</label>
+        <input type="text" id="mon_gsx_ip" name="gsx_ip" placeholder="192.168.45.3">
+      </div>
+      <div>
+        <label for="mon_t1_id">T1 assignment</label>
+        <input type="text" id="mon_t1_id" name="t1_id" placeholder="T1-1-7-2-2 or 7-2-2">
+        <div class="hint" style="margin-left:0;">Format: T1-1-{slot}-{port}-{DS1}, e.g. T1-1-9-2-8.</div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="mon_interval">Poll every (seconds, 5-300)</label>
+        <input type="text" id="mon_interval" name="interval" value="15">
+      </div>
+      <div>
+        <label for="mon_duration">For (seconds, 30-3600)</label>
+        <input type="text" id="mon_duration" name="duration" value="600">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="mon_gsx_user">GSX username (blank = reuse from above)</label>
+        <input type="text" id="mon_gsx_user" name="gsx_user" autocomplete="username">
+      </div>
+      <div>
+        <label for="mon_gsx_pass">GSX password (blank = reuse from above)</label>
+        <input type="password" id="mon_gsx_pass" name="gsx_pass" autocomplete="current-password">
+      </div>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="monClearFirst" name="clear_first">
+      <label for="monClearFirst">Clear counters before monitoring</label>
+    </div>
+    <div class="hint" style="color:var(--warn);">
+      This is a real config-write command -- CONFIGURE T1 &lt;id&gt; PERFMON
+      RESET COUNTERS ALL -- sent once right before polling starts. Leave
+      unchecked to stay fully read-only (matches STEP 2 of the generated
+      script, in case you'd rather run it there yourself).
+    </div>
+    <button type="submit">Start Monitoring</button>
+    <div class="field-error" id="monError"></div>
+  </form>
+</div>
+{% set panel_suffix = 'monitor' %}
+{% include "_job_panels.html" %}
+</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='job.js') }}"></script>
+<script>
+  initJiraToggle('addJira', 'jiraTicketWrap');
+  initJobForm('runForm', 'build');
+
+  // Carry GSX creds from the build form into the monitor form. MUST be
+  // registered BEFORE initJobForm('monitorForm') -- listeners on the same
+  // element fire in registration order, and job.js's submit handler reads
+  // the form data. (v1.41 had this after, so the copy ran too late and
+  // blank creds were submitted.)
+  document.getElementById('monitorForm').addEventListener('submit', () => {
+    const mu = document.getElementById('mon_gsx_user');
+    const mp = document.getElementById('mon_gsx_pass');
+    if (!mu.value) mu.value = document.getElementById('gsx_user').value;
+    if (!mp.value) mp.value = document.getElementById('gsx_pass').value;
+  });
+
+  initJobForm('monitorForm', 'monitor');
+
+  const DIRS = {
+    "1250|ais": [
+      ["toward_gsx", "AIS toward GSX (PSN side)"],
+      ["toward_lec", "AIS toward LEC (TDM side)"]
+    ],
+    "1800|ais": [
+      ["toward_1250", "AIS toward 1250 (PSN side)"],
+      ["toward_gsx", "AIS toward MUX/GSX (TDM side)"],
+      ["both", "Disable DS1 (AIS both directions)"]
+    ],
+    "1250|loop": [
+      ["facility", "Facility loop -- faces the LEC"],
+      ["terminal", "Terminal loop -- faces the BW core (toward GSX)"]
+    ],
+    "1800|loop": [
+      ["facility", "Facility loop -- typically toward MUX/GSX (verify orientation)"],
+      ["terminal", "Terminal loop -- typically toward 1250 (verify orientation)"]
+    ]
+  };
+
+  function updateDirections() {
+    const device = document.querySelector('input[name="device"]:checked').value;
+    const test = document.querySelector('input[name="test"]:checked').value;
+    const sel = document.getElementById('direction');
+    sel.innerHTML = '';
+    for (const [val, label] of DIRS[device + '|' + test]) {
+      const o = document.createElement('option');
+      o.value = val; o.textContent = label;
+      sel.appendChild(o);
+    }
+    document.getElementById('unverifiedWarn').style.display =
+      (device === '1800' && test === 'ais') ? 'block' : 'none';
+    document.getElementById('dirHint').textContent =
+      (test === 'loop') ? 'Loop up = set ... maintenance loopback <dir>; loop down = ... release.'
+                        : 'Turn-up = set; turn-down = delete of the same path.';
+  }
+  document.querySelectorAll('input[name="device"], input[name="test"]')
+    .forEach(r => r.addEventListener('change', updateDirections));
+  updateDirections();
+
+  // ---- GSX Monitor auto-fill --------------------------------------------
+  // The build job publishes resolved GSX targets mid-run (data.extras.
+  // gsx_targets); fill the monitor form so the user only ever types the
+  // 1250 + DS1(s). Multiple DS1s render as clickable chips.
+  function fillMonitor(t) {
+    if (t.ip) document.getElementById('mon_gsx_ip').value = t.ip;
+    document.getElementById('mon_t1_id').value = t.t1;
+  }
+  let renderedTargets = '';
+  window.onJobData = function (data) {
+    const targets = data.extras && data.extras.gsx_targets;
+    if (!targets || !targets.length) return;
+    // Auto-fill first target if fields are still empty.
+    const ipEl = document.getElementById('mon_gsx_ip');
+    const t1El = document.getElementById('mon_t1_id');
+    if (!ipEl.value && !t1El.value) fillMonitor(targets[0]);
+    // Render chips once per unique target set.
+    const key = JSON.stringify(targets);
+    if (key === renderedTargets) return;
+    renderedTargets = key;
+    const wrap = document.getElementById('gsxTargetChips');
+    wrap.innerHTML = '';
+    for (const t of targets) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.style.cssText = 'margin:4px 6px 0 0; padding:4px 10px; font-size:12px;' +
+        'background:var(--panel); color:var(--accent); border:1px solid var(--border);' +
+        'border-radius:5px; cursor:pointer;';
+      b.textContent = t.ds1 + ' -> ' + t.t1 + (t.ip ? (' @ ' + t.ip) : ' (no IP)');
+      b.addEventListener('click', () => fillMonitor(t));
+      wrap.appendChild(b);
+    }
+    document.getElementById('gsxTargets').style.display = 'block';
+  };
+
+</script>
+{% endblock %}

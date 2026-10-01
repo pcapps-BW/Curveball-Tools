@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Morning Check -- Curveball Tools{% endblock %}
+{% block content %}
+<h1>Morning Check</h1>
+<div class="sub">Scans your open NOE tickets, runs circuit health checks from description triggers, posts results to JIRA, and sends a Slack digest.</div>
+
+<div class="panel">
+  <form id="runForm" data-run-url="/api/morning-check/run">
+
+    <p class="section-hint">Trigger format (line 1 of JIRA description):</p>
+    <div class="hint">
+      Full suite (Autotester + Fiber + OSPF): &nbsp;<code>1250: 10.111.131.76 | ts1/7</code><br>
+      Lite check (Fiber + OSPF only): &nbsp;<code>1250: 10.111.131.76</code><br>
+      No trigger: posts a "scanned, nothing to action" comment.
+    </div>
+
+    <div class="divider"></div>
+
+    <label for="assignee_email">Your JIRA assignee email</label>
+    <input type="text" id="assignee_email" name="assignee_email" value="{{ saved_assignee_email }}"
+           placeholder="you@bandwidth.com" required autocomplete="email">
+    <div class="hint">Tickets queried: project = NOE, assignee = you, status = In Progress.</div>
+
+    <div class="divider"></div>
+    <p class="section-hint">Credentials</p>
+
+    <div class="row">
+      <div>
+        <label for="infra_user">Infrastructure username</label>
+        <input type="text" id="infra_user" name="infra_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="infra_pass">Infrastructure password</label>
+        <input type="password" id="infra_pass" name="infra_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="gsx_user">GSX username</label>
+        <input type="text" id="gsx_user" name="gsx_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="gsx_pass">GSX password</label>
+        <input type="password" id="gsx_pass" name="gsx_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="jira_email">JIRA email</label>
+        <input type="text" id="jira_email" name="jira_email" value="{{ saved_jira_email }}"
+               required autocomplete="email" placeholder="you@bandwidth.com">
+      </div>
+      <div>
+        <label for="jira_token">JIRA API token</label>
+        <input type="password" id="jira_token" name="jira_token"
+               autocomplete="current-password" placeholder="leave blank to use saved token">
+      </div>
+    </div>
+    <div class="hint">JIRA email/token: type a new token to update what's saved
+      (Windows Credential Manager); leave the token blank to reuse the saved
+      one. Unlike every other tool on this site, Morning Check DOES persist
+      these two plus the Slack webhook below -- retyping them daily wasn't
+      worth it. Infra/GSX device passwords are never saved, same as
+      everywhere else.</div>
+
+    <label for="slack_webhook">Slack webhook URL <span style="color:var(--muted);font-weight:normal;">(optional)</span></label>
+    <input type="text" id="slack_webhook" name="slack_webhook" value="{{ saved_slack_webhook }}"
+           placeholder="https://hooks.slack.com/services/...">
+    <div class="hint">Leave blank to skip the Slack digest -- or to reuse
+      whatever's already saved above. Enter a new URL to replace it.</div>
+
+    <div class="divider"></div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="dryRun" name="dry_run">
+      <label for="dryRun">Dry run — parse tickets and show triggers only, no tools executed</label>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="openWhenDone" name="open_when_done">
+      <label for="openWhenDone">Open the batch summary file when done (Notepad)</label>
+    </div>
+    <div class="hint">Opens the one consolidated summary file, not every
+      per-ticket/per-tool file. Only works when this server is running on
+      your own machine.</div>
+
+    <button type="submit">Run Morning Check</button>
+    <div class="field-error" id="formError"></div>
+  </form>
+</div>
+
+{% include "_job_panels.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='job.js') }}"></script>
+<script>
+  initJobForm('runForm');
+</script>
+{% endblock %}

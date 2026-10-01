@@ -15,6 +15,7 @@ Built by P. Capps.
 """
 
 import re
+import datetime
 import textwrap
 
 from ospf_events import compute_ospf_uptime, parse_ldp_sessions
@@ -627,6 +628,421 @@ def _fiber_laser_rx_tx(laser_text):
     return rx, tx
 
 
+# ---- 1250 loopback IP derivation from an 1800 sub-interface's own config --
+# Confirmed network convention (2026-09-09): the 1800 side of an NNI
+# point-to-point subnet is always the ODD address; the 1250 side is always
+# (1800's own 4th octet - 1) -- same rule the ping-target derivation already
+# uses (interface_check.py) -- which by design always lands on an EVEN
+# address. The 1250's own loopback then reuses that SAME first-two-octet
+# block (never hardcoded -- every example seen has been 10.111.x.x, but
+# that's this network's convention, not something to bake in), a FIXED
+# third octet of 130 (unrelated to whatever subnet the NNI itself lives in),
+# and a 4th octet of (1250 sub-int 4th octet / 2).
+
+def parse_subint_ip(cfg_text):
+    """
+    Extract a sub-interface's own IP from 'family inet address' in a
+    'show configuration interfaces ... | display-set' blob -- same field the
+    ping-target derivation already parses. Returns the IP string, or None.
+    """
+    m = re.search(r"family inet address (\d+\.\d+\.\d+\.\d+)/", cfg_text or "")
+    return m.group(1) if m else None
+
+
+def derive_1250_subint_ip(hub_subint_ip):
+    """1800 sub-int IP -> 1250 sub-int IP (4th octet - 1). Same rule the
+    existing ping-target derivation already uses."""
+    octets = hub_subint_ip.split(".")
+    octets[-1] = str(int(octets[-1]) - 1)
+    return ".".join(octets)
+
+
+def derive_1250_loopback(subint_1250_ip):
+    """
+    1250 sub-interface IP -> 1250 loopback IP, per confirmed convention
+    (2026-09-09): 1st/2nd octets carried over unchanged, 3rd octet forced to
+    130, 4th octet = sub-int's own 4th octet / 2 -- guaranteed to divide
+    evenly by network design (the 1250 side of an NNI subnet always lands on
+    an even address).
+
+    Returns the loopback IP string, or None if the 4th octet ISN'T evenly
+    divisible by 2 -- that means the addressing convention was violated
+    somewhere upstream (wrong interface, unusual subnet, bad input). Refuses
+    to guess rather than silently deriving the wrong site's loopback.
+    """
+    parts = (subint_1250_ip or "").split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        last = int(parts[3])
+    except ValueError:
+        return None
+    if last % 2 != 0:
+        return None
+    return "{}.{}.130.{}".format(parts[0], parts[1], last // 2)
+
+
+_RE_DOWN_TS = re.compile(
+    r'(\d{4})-(\d{2})-(\d{2}),(\d{2}):(\d{2}):(\d{2})')
+
+# Confirmed live 2026-09-14 (FARGNDBC636): 'show ne events' LDP-Session
+# entries embed a peerRouterID field, e.g.
+#   {router-id:X.X.X.55,peerRouterID:X.X.X.254,...}
+# -- lets a multi-peer log (a dual-homed 1250 running LDP to two different
+# hubs) be split back into one stream per peer before pairing.
+_RE_PEER_RTRID = re.compile(r'peerRouterID:([\d.]+)')
+
+
+def _ip_in_line(ip, line):
+    """
+    Exact-IP-token match within a line of raw device text -- NOT a substring
+    test. Confirmed live (2026-09-14, pcapps): 'show ldp session | grep .5'
+    on the 1800 hit peers '.5' AND '.50'-'.59' -- the same naive-substring
+    over-match this function replaces was silently pulling in a DIFFERENT
+    site's events any time one loopback's digits happened to be a prefix of
+    another's (e.g. filtering for '10.111.130.5' also matched
+    '10.111.130.50'..'59'). That's a worse bug than the same-site
+    cross-session mixing pair_ospf_outages_by_peer fixed: it can merge two
+    completely unrelated sites' outage histories together.
+
+    Requires the IP to be a genuinely standalone token in the line: not
+    immediately preceded or followed by another digit (which would mean it's
+    actually the middle/prefix of a longer address).
+    """
+    for m in re.finditer(re.escape(ip), line):
+        start, end = m.start(), m.end()
+        if start > 0 and line[start - 1].isdigit():
+            continue
+        if end < len(line) and line[end].isdigit():
+            continue
+        return True
+    return False
+
+
+def _us_eastern_is_dst(dt_utc):
+    """
+    True if dt_utc (a naive UTC datetime) falls in US Eastern daylight time.
+
+    Deliberately NOT using zoneinfo/pytz: this runs on the user's Windows
+    workstation, where stdlib zoneinfo has no IANA database unless the
+    'tzdata' package happens to be installed -- a dependency this tool
+    doesn't otherwise have and shouldn't silently require. US DST rule
+    (2007-present) is fixed and simple enough to compute directly: starts
+    2nd Sunday of March, ends 1st Sunday of November, both at 02:00 local.
+    Approximated here to the day (not the exact 2am transition hour) -- off
+    by at most a few hours right at the two transition boundaries per year,
+    which is immaterial for a "was this circuit event during EST or EDT"
+    label.
+    """
+    year = dt_utc.year
+    # 2nd Sunday of March
+    d = datetime.date(year, 3, 1)
+    first_sunday = 1 + (6 - d.weekday()) % 7
+    dst_start = datetime.date(year, 3, first_sunday + 7)
+    # 1st Sunday of November
+    d = datetime.date(year, 11, 1)
+    first_sunday = 1 + (6 - d.weekday()) % 7
+    dst_end = datetime.date(year, 11, first_sunday)
+    today = dt_utc.date()
+    return dst_start <= today < dst_end
+
+
+def format_down_event(dt_utc):
+    """
+    Format a UTC device timestamp as 'MM/DD/YY - HHMMZ, HHMMEST' (or EDT).
+
+    Changed 2026-09-14 from 'MM/YY' to 'MM/DD/YY' (per pcapps, after the
+    original format was mistaken for a future date at a glance) -- the day
+    was never actually in the display, only month and year, which is exactly
+    what made a run of same-month timestamps look suspicious. Confirmed
+    2026-09-09 display convention otherwise unchanged.
+
+    Eastern offset is DST-aware (see _us_eastern_is_dst) so the local time and
+    its EST/EDT label are actually correct, not just always labelled EST.
+    """
+    is_dst = _us_eastern_is_dst(dt_utc)
+    offset_h = 4 if is_dst else 5
+    local = dt_utc - datetime.timedelta(hours=offset_h)
+    tz_label = "EDT" if is_dst else "EST"
+    return "{:02d}/{:02d}/{:02d} - {}Z, {}{}".format(
+        dt_utc.month, dt_utc.day, dt_utc.year % 100,
+        dt_utc.strftime("%H%M"), local.strftime("%H%M"), tz_label)
+
+
+def check_down_history(raw_events, peer_ip):
+    """
+    LDP-Session-Down AND OSPF-adjacency-Down bounce history for a specific
+    peer IP, from the 1800's own 'show ne events | grep <peer-ip> | grep
+    Down' (confirmed 2026-09-09 -- 'show ne events', NOT 'show ne events
+    unreported', retains history far longer: 300+ days observed live, vs. the
+    'unreported' buffer that's been crowded out by unrelated noise in well
+    under an hour elsewhere in this tool -- see ospf_events.py/
+    compute_ospf_uptime).
+
+    Broad match on 'Down' (word-boundary, case-insensitive) rather than
+    'LDP-Session-Down' specifically, matching the original two-stage grep
+    (grep <ip>, then grep Down) -- catches OSPF adjacency-down entries for
+    this peer too, not LDP sessions alone.
+
+    Returns a list of dicts, most-recent-first (matches device log order):
+      {"detected_utc": datetime, "formatted": "MM/DD/YY - HHMMZ, HHMMEST"}
+    Caller decides how to render/count/flag -- this just parses, never
+    raises.
+    """
+    if not raw_events or not peer_ip:
+        return []
+    hits = []
+    for line in raw_events.splitlines():
+        if not _ip_in_line(peer_ip, line):
+            continue
+        if not re.search(r'\bDown\b', line, re.IGNORECASE):
+            continue
+        m = _RE_DOWN_TS.search(line)
+        if not m:
+            continue
+        dt_utc = datetime.datetime(*(int(g) for g in m.groups()))
+        hits.append({"detected_utc": dt_utc, "formatted": format_down_event(dt_utc)})
+    return hits
+
+
+# Back-compat alias: earlier name, LDP-only. New callers should use
+# check_down_history (broader match, structured return). Kept only until
+# every caller is confirmed migrated.
+def check_ldp_down_history(raw_events, peer_loopback_ip):
+    hits = check_down_history(raw_events, peer_loopback_ip)
+    return [h["detected_utc"].strftime("%Y-%m-%d %H:%M:%S") for h in hits]
+
+
+def check_ospf_outage_events(raw_events, peer_ip, protocol=None):
+    """
+    Down AND Up/Full events for a specific peer IP, from the 1800's own
+    'show ne events' (long-retention log -- see check_down_history for why
+    'unreported' is deliberately not used). Same broad word-boundary match
+    convention as check_down_history, but keeps the Up/Full side instead of
+    discarding it, so the two can be paired into outages (see
+    pair_ospf_outages).
+
+    protocol: None (default) -- match any Down/Up/Full event for this peer,
+              regardless of which protocol logged it (original behavior;
+              this is what mixes LDP-Session and OSPF-adjacency entries
+              together).
+              "ldp"  -- keep only lines containing 'LDP-Session', the
+                        confirmed literal event-name substring this suite
+                        already greps for on the 1800 (see
+                        ospf_stability.LDP_EVENT_CMD).
+              "ospf" -- keep only lines NOT containing 'LDP-Session'. This is
+                        a by-elimination match, not a confirmed OSPF-specific
+                        event name -- the two-stage grep this function
+                        replicates was confirmed (2026-09-09) to only ever
+                        match LDP-Session or OSPF-adjacency entries against a
+                        given peer IP line, so "not LDP" is a safe stand-in
+                        for "OSPF" until an OSPF-specific event-name keyword
+                        is confirmed on this platform. Documented here rather
+                        than assumed silently.
+
+    peer_ip may be None/"" to skip the IP filter entirely -- for use when
+    raw_events is already scoped to a single site's own log (e.g. querying a
+    1250 directly for its own LDP session events, rather than a hub's shared
+    log covering many peers by IP). IMPORTANT when peer_ip is None: a device
+    with more than one session of this type (e.g. a dual-homed 1250 running
+    LDP to two different hubs) will have events for BOTH sessions in the same
+    raw text -- each returned event carries a "peer" field (parsed from the
+    line's own peerRouterID, when present) specifically so the caller can
+    group by peer before pairing (see pair_ospf_outages_by_peer) instead of
+    pairing one flat stream that mixes two independent sessions together.
+
+    Returns a list of {"dt": datetime, "kind": "down"|"up", "formatted": str,
+    "peer": str} dicts, in whatever order they appear in raw_events --
+    pair_ospf_outages sorts them, so the caller does not need to pre-sort.
+    "peer" is the line's own peerRouterID when parseable, else peer_ip (so a
+    caller that already scoped the query to one peer -- passing a real
+    peer_ip -- gets a consistent, non-empty peer tag even on a raw-format
+    line with no embedded peerRouterID field), else "".
+    """
+    if not raw_events:
+        return []
+    out = []
+    for line in raw_events.splitlines():
+        if peer_ip and not _ip_in_line(peer_ip, line):
+            continue
+        is_ldp = "LDP-Session" in line
+        if protocol == "ldp" and not is_ldp:
+            continue
+        if protocol == "ospf" and is_ldp:
+            continue
+        m = _RE_DOWN_TS.search(line)
+        if not m:
+            continue
+        dt_utc = datetime.datetime(*(int(g) for g in m.groups()))
+        if re.search(r'\bDown\b', line, re.IGNORECASE):
+            kind = "down"
+        elif re.search(r'\b(?:Up|Full)\b', line, re.IGNORECASE):
+            kind = "up"
+        else:
+            continue
+        peer_m = _RE_PEER_RTRID.search(line)
+        peer = peer_m.group(1) if peer_m else (peer_ip or "")
+        out.append({"dt": dt_utc, "kind": kind, "formatted": format_down_event(dt_utc),
+                   "peer": peer})
+    return out
+
+
+def _fmt_outage_delta(delta):
+    """'2d 04h 17m' style duration string from a timedelta. Same style used
+    elsewhere in this tool suite (ospf_events._format_delta) -- duplicated
+    here (rather than imported) so this module's outage helpers don't
+    reach into another module's private helper."""
+    total_s = int(delta.total_seconds())
+    if total_s < 0:
+        total_s = 0
+    d, rem = divmod(total_s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append("{}d".format(d))
+    if d or h:
+        parts.append("{}h".format(h))
+    parts.append("{}m".format(m))
+    return " ".join(parts)
+
+
+def pair_ospf_outages(events):
+    """
+    Pair chronological down/up(-full) events into outages, computing the
+    uptime that preceded each drop and the downtime before each recovery.
+
+    events: list of {"dt": datetime, "kind": "down"|"up", "formatted": str}.
+    The "dt" values must be internally consistent (all local, or all UTC --
+    doesn't matter which, as long as they're all the same) since deltas are
+    computed directly between them; the "formatted" string is purely for
+    display, so this stays agnostic of any one source's timestamp
+    convention/format -- callers from different logs (1800 long-retention
+    event log, 1250 event log, etc.) can each supply their own.
+
+    Pairing rule: process chronologically. A "down" always opens a new
+    outage -- even if the previous one never saw a matching "up" in this log
+    window (the recovery event may simply have rolled off before the drop
+    did; that does not mean the site never recovered -- see the "unknown"/
+    "still down" labels below). An "up" closes the MOST RECENT open outage,
+    if one exists; an "up" with no open outage is dropped, since it means
+    the matching "down" already rolled off the log and there is nothing to
+    pair it to.
+
+    Returns a list of dicts, chronological, one per outage:
+      {
+        "down_formatted":     str,
+        "uptime_before":      str,  # duration since the previous recovery,
+                                     # or "unknown (no prior clear in log)"
+                                     # if there's no earlier "up" to measure
+                                     # from
+        "up_formatted":       str or None,   # None if still open
+        "downtime_before_up": str,  # duration of the outage, or
+                                     # "still down (not yet cleared)" if open
+      }
+    """
+    ev = sorted(events, key=lambda e: e["dt"])
+    outages = []
+    open_outage = None
+    last_up_dt = None
+    for e in ev:
+        if e["kind"] == "down":
+            if last_up_dt is not None:
+                uptime_before = _fmt_outage_delta(e["dt"] - last_up_dt)
+            else:
+                uptime_before = "unknown (no prior clear in log)"
+            open_outage = {
+                "down_dt":            e["dt"],
+                "down_formatted":     e["formatted"],
+                "uptime_before":      uptime_before,
+                "up_formatted":       None,
+                "downtime_before_up": "still down (not yet cleared)",
+            }
+            outages.append(open_outage)
+        else:  # "up"
+            last_up_dt = e["dt"]
+            if open_outage is not None and open_outage["up_formatted"] is None:
+                open_outage["up_formatted"] = e["formatted"]
+                open_outage["downtime_before_up"] = _fmt_outage_delta(
+                    e["dt"] - open_outage["down_dt"])
+                open_outage = None
+    return outages
+
+
+def pair_ospf_outages_by_peer(events):
+    """
+    Group events by their "peer" field (see check_ospf_outage_events) BEFORE
+    pairing, then merge the resulting per-peer outage lists back into one
+    chronological list.
+
+    WHY THIS EXISTS (bug found live 2026-09-14, PGHKNYSH133): a site can have
+    more than one independent session of the same type to track -- e.g. a
+    dual-homed 1250 running LDP to two different hubs (confirmed via 'show
+    ldp session' showing two Operational peers on one box). pair_ospf_outages
+    tracks only ONE "most recently opened, not yet closed" outage at a time.
+    Feeding it a flat, unscoped stream that actually contains TWO independent
+    sessions' events interleaved can cross-pair one session's Down with the
+    OTHER session's Up, or leave a real (already-cleared) outage looking
+    permanently open because the single open-outage slot got claimed by the
+    wrong session's event. That is exactly what happened on PGHKNYSH133: the
+    tool reported an LDP outage still open when the real device showed BOTH
+    LDP sessions Operational for over a month.
+
+    Events with no identifiable peer (peer is None/"" -- an older stored
+    event from before the "peer" field existed, or a raw line with no
+    parseable peerRouterID and no peer_ip to fall back to) are grouped
+    together as their own single stream, preserving prior behavior for that
+    case rather than silently dropping them.
+    """
+    groups = {}
+    for e in events:
+        groups.setdefault(e.get("peer") or "", []).append(e)
+    merged = []
+    for peer_key, grp in groups.items():
+        outs = pair_ospf_outages(grp)
+        # Tag each outage with the peer its group was keyed on. Every event
+        # in `grp` shares this same peer (that's the whole point of grouping
+        # before pairing), so it's a safe, cost-free thing to carry forward --
+        # added so a caller can attribute an outage back to which physical/
+        # logical session it happened on (e.g. ospf_stability.py correlating
+        # LDP outages across sites sharing a physical NNI port, added
+        # 2026-09-14). Empty string when the event had no identifiable peer,
+        # same as the grouping key above -- callers should treat "" as
+        # "unknown", not a real peer.
+        for o in outs:
+            o["peer"] = peer_key
+        merged.extend(outs)
+    merged.sort(key=lambda o: o["down_dt"])
+    return merged
+
+
+def format_ospf_outages(outages):
+    """
+    Render a paired outage list in the standard display format:
+
+      OSPF Outages: <n>
+      1) Down    -> <timestamp> -> Uptime before drop: <duration>
+      2) Up/Full -> <timestamp> -> Downtime before up: <duration>
+      3) Down    -> <timestamp> -> Uptime before drop: <duration>
+      4) Up/Full -> <timestamp> -> Downtime before up: <duration>
+      ...
+
+    <n> is the number of OUTAGES (not lines) -- each outage renders as two
+    numbered lines, and numbering runs sequentially across the whole list.
+    """
+    lines = ["OSPF Outages: {}".format(len(outages))]
+    n = 1
+    for o in outages:
+        lines.append("{}) Down    -> {} -> Uptime before drop: {}".format(
+            n, o["down_formatted"], o["uptime_before"]))
+        n += 1
+        up_ts = o["up_formatted"] if o["up_formatted"] else "(not yet logged)"
+        lines.append("{}) Up/Full -> {} -> Downtime before up: {}".format(
+            n, up_ts, o["downtime_before_up"]))
+        n += 1
+    return "\n".join(lines)
+
+
 def check_ospf_ldp_health(ospf_events_raw, ldp_session_raw):
     """
     OSPF adjacency uptime (derived from the NE event log -- this platform has
@@ -700,6 +1116,55 @@ def _parse_tca_thresholds(tca_text):
         try: out["tx_warn_low"] = float(tx_m.group(1))
         except ValueError: pass
     return out
+
+
+_MUX_SONET_STATE_FIELDS = ["Active Defects", "Detected Alarms", "Asserted/Active Alarms"]
+
+
+def check_mux_sonet_health(sonet_pm_raw):
+    """
+    MUX-side SONET health facing the 1800, from 'show controllers sonet
+    <iface> | no-more' on the NCS 4216. Added 2026-09-02 -- confirmed gap:
+    the tool checked MUX facility alarms, CEM connection state, and
+    working/protect conflict, but never pulled SONET PM/alarm data from the
+    MUX's own side of the OC12/SONET-ACR path facing the 1800 (the existing
+    OC12_COUNTERS check is sourced entirely from the 1800's side of that
+    same path, not the MUX's).
+
+    Uses the device's own current-state summary lines (Active Defects /
+    Detected Alarms / Asserted-Active Alarms) rather than the SECTION/LINE
+    LOS/LOF/AIS/RDI/REI counts printed above them -- those are cumulative
+    since-boot/since-clear event counts, not current state (same trap as a
+    "Num State Transitions" counter elsewhere in this tool), and would
+    false-flag a healthy circuit that had one blip in the past.
+
+    Returns (flags, info):
+      flags -- any of the three current-state fields reading other than "None"
+      info  -- the current (in-progress) 15-min interval's CV/ES/SES/SEFS
+               counts, if that table was found (context, not flagged --
+               a partial in-progress bin reading 0 doesn't mean much either
+               way)
+    """
+    flags, info = [], []
+    if not sonet_pm_raw:
+        return flags, info
+
+    for field in _MUX_SONET_STATE_FIELDS:
+        m = re.search(r'{}:\s*(.+)'.format(re.escape(field)), sonet_pm_raw)
+        if m:
+            val = m.group(1).strip()
+            if val and val.upper() != "NONE":
+                flags.append("SONET {}: {}".format(field, val))
+
+    m = re.search(
+        r'INTERVAL\s+CV\s+ES\s+SES\s+SEFS\s*\n\s*(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)',
+        sonet_pm_raw)
+    if m:
+        interval, cv, es, ses, sefs = m.groups()
+        info.append("SONET current interval ({}): CV {} / ES {} / SES {} / SEFS {}".format(
+            interval, cv, es, ses, sefs))
+
+    return flags, info
 
 
 def check_fiber_health(fiber_by_port):
@@ -868,6 +1333,29 @@ def build_route_block(ds1, host_1250, loopback_ip, muse_id,
         "    IP         : {}".format(mux_data.get("gsx_ip") or "?"),
         "    Assignment : {}".format(gsx_assign),
         "    T1 Command : SHOW T1 T1-1-{}".format(gsx_assign),
+    ]
+    # The T1 number has two independent sources (live CEM id vs the controller's
+    # provisioned description) which can disagree. When they do, say so right
+    # under the command rather than printing one silently -- an operator acting on
+    # a wrong T1 touches the wrong circuit.
+    if mux_data.get("gsx_xc_conflict"):
+        # Upstream ambiguity: more than one xconnect endpoint matched, so the
+        # NODE and SLOT may belong to a different circuit too -- not just the T1.
+        lines += [
+            "",
+            "    [!] GSX ENDPOINT AMBIGUOUS -- node/slot/port/T1 may all be wrong:",
+            "        {}".format(mux_data["gsx_xc_conflict"]),
+        ]
+    if mux_data.get("gsx_t1_conflict"):
+        lines += [
+            "",
+            "    [!] T1 SOURCE CONFLICT -- assignment above may be wrong:",
+            "        {}".format(mux_data["gsx_t1_conflict"]),
+        ]
+    elif mux_data.get("gsx_t1_desc"):
+        lines.append("    (T1 confirmed by controller description: {})".format(
+            mux_data.get("gsx_desc") or "?"))
+    lines += [
         "", SEP,
         "  SUMMARY",
         "  1250 {}  |  {}  |  {}".format(ds1, muse_id, oc12),
@@ -911,8 +1399,10 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
                              hub_results, mux_results, all_oc12_stats,
                              all_t3_stats, peerless, errors, gsx_pm_results=None,
                              fiber_results=None, evc_results=None,
-                             ospf_events_raw=None, ldp_session_raw=None):
-    gsx_pm_results = gsx_pm_results or {}
+                             ospf_events_raw=None, ldp_session_raw=None,
+                             gsx_t3_results=None):
+    gsx_pm_results  = gsx_pm_results or {}
+    gsx_t3_results  = gsx_t3_results or {}
     fiber_results = fiber_results or {}
     evc_results = evc_results or {}
     # Fiber uplink (NNI physical) + EVC (logical) health are per-1250 (shared by
@@ -1077,15 +1567,29 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         gsx_alarm_m = re.search(r'Alarm Status:\s*(\S+)', gsx_pm)
         gsx_alarm = gsx_alarm_m.group(1) if gsx_alarm_m else ""
         gsx_hits = _check_gsx_counters(gsx_pm)
+        # Check parent T3 status -- if T3 is DOWN, the DS1 is down because of
+        # the T3, not a DS1-specific issue. All 28 T1s on this port are affected.
+        gsx_t3_raw  = gsx_t3_results.get(ds1, "")
+        gsx_t3_down = bool(re.search(r'Operational Status:\s*DOWN', gsx_t3_raw, re.IGNORECASE))
+        gsx_t3_alarm_m = re.search(r'Alarm Status:\s*(\S+)', gsx_t3_raw)
+        gsx_t3_alarm   = gsx_t3_alarm_m.group(1) if gsx_t3_alarm_m else ""
 
-        lines.append("         GSX  --  {}  (current 15 min / 24 hr)".format(gsx_node))
+        lines.append("         GSX  --  {}  ({})  (current 15 min / 24 hr)".format(
+            gsx_node, mux.get("gsx_ip", "?")))
+        if gsx_t3_down:
+            lines.append("  [ !! ] GSX T3 DOWN{}  <-- root cause; all T1s on this port affected".format(
+                " ({})".format(gsx_t3_alarm) if gsx_t3_alarm and gsx_t3_alarm.upper() != "NONE" else ""))
         if gsx_down:
-            lines.append("  [ !! ] GSX DOWN-DS1ALARM{}".format(
-                " ({})".format(gsx_alarm) if gsx_alarm and gsx_alarm.upper() != "NONE" else ""))
+            if gsx_t3_down:
+                lines.append("  [ !! ] GSX T1 DOWN{}  (caused by T3 above)".format(
+                    " ({})".format(gsx_alarm) if gsx_alarm and gsx_alarm.upper() != "NONE" else ""))
+            else:
+                lines.append("  [ !! ] GSX DOWN-DS1ALARM{}".format(
+                    " ({})".format(gsx_alarm) if gsx_alarm and gsx_alarm.upper() != "NONE" else ""))
         if gsx_hits:
             for e in gsx_hits:
                 lines.append("  [ !! ] GSX {}".format(e))
-        if not gsx_down and not gsx_hits:
+        if not gsx_t3_down and not gsx_down and not gsx_hits:
             lines.append("  [ OK ] GSX PMs clean")
         lines.append("         {}".format(gsx_assign))
         lines.append("")
@@ -1105,7 +1609,8 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
             lines.append("  [ OK ] T3 clean")
         lines.append("         CE{}:{}".format(
             t3_iface, mux.get("gsx_cem_id", "?")))
-        lines.append("         MUX  --  {}".format(mux.get("mux_name", "?")))
+        lines.append("         MUX  --  {}  ({})".format(
+            mux.get("mux_name", "?"), mux.get("mux_ip", "?")))
         lines.append("         {} | SONET {}  ACR {}  CEM {}".format(
             oc12, mux.get("active_sonet", "?"), mux.get("acr_group", "?"),
             mux.get("cem_group", "?")))
@@ -1143,6 +1648,17 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         nb_conflict = mux.get("netbox_conflict")
         if nb_conflict:
             lines.append("  [ !! ] {}".format(nb_conflict))
+
+        # MUX-side SONET PM facing the 1800 (added 2026-09-02 -- previously
+        # unchecked; see check_mux_sonet_health() for why).
+        sonet_flags, sonet_info = check_mux_sonet_health(mux.get("sonet_pm", ""))
+        if sonet_flags:
+            for f in sonet_flags:
+                lines.append("  [ !! ] {}".format(f))
+        elif mux.get("sonet_pm"):
+            lines.append("  [ OK ] SONET PMs clean")
+        for i in sonet_info:
+            lines.append("         {}".format(i))
 
         # CEM circuit health (item 14). Pkts Missing / Failure Counts / Lbits /
         # Rbits are cumulative-since-last-"clear cem circuit" (see the CEM
@@ -1247,7 +1763,8 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
 # ---- RUN SUMMARY ONE-LINER (standardized Clean/Dirty per hop/side) ----
 def run_summary_line(ds1, ds1_map, pm_results, oc12_results,
                      hub_results, mux_results, all_oc12_stats, all_t3_stats,
-                     peerless, fiber_results=None, evc_results=None):
+                     peerless, fiber_results=None, evc_results=None,
+                     gsx_pm_results=None, gsx_t3_results=None):
     """
     One-liner per DS1: Clean/Dirty per hop, split by direction where a hop
     has two distinct sides:
@@ -1346,10 +1863,30 @@ def run_summary_line(ds1, ds1_map, pm_results, oc12_results,
             ds1.upper(), ", ".join(missing))
 
     # ---- MUX: 1800-side (facility alarms + connection state) / GSX-side (T3) ----
-    t3_iface = mux.get("gsx_ce_iface", "")
-    t3_stat  = all_t3_stats.get(t3_iface, "")
-    t3_errs  = _check_counters(t3_stat, T3_COUNTERS)
-    side_gsx_cd = _cd(bool(t3_errs), t3_errs[0].split(":")[0].strip() if t3_errs else None)
+    t3_iface   = mux.get("gsx_ce_iface", "")
+    t3_stat    = all_t3_stats.get(t3_iface, "")
+    t3_errs    = _check_counters(t3_stat, T3_COUNTERS)
+    # Check GSX T3 status first -- if the parent T3 is DOWN, all 28 T1s on that
+    # port are affected by the same root cause. Flag as T3-DOWN (one ticket, not
+    # 28) rather than T1-DOWN. Fall through to T1 operational/alarm status for
+    # DS1-specific failures, then T3 PM counters.
+    gsx_t3_raw  = (gsx_t3_results or {}).get(ds1, "")
+    gsx_t3_down = bool(re.search(r'Operational Status:\s*DOWN', gsx_t3_raw, re.IGNORECASE))
+    gsx_pm      = (gsx_pm_results or {}).get(ds1, "")
+    gsx_t1_down  = bool(re.search(r'Operational Status:\s*DOWN', gsx_pm, re.IGNORECASE))
+    gsx_alarm_m  = re.search(r'Alarm Status:\s*(\S+)', gsx_pm)
+    gsx_alarm    = gsx_alarm_m.group(1) if gsx_alarm_m else ""
+    gsx_t1_alarm = bool(gsx_alarm and gsx_alarm.upper() not in ("NONE", "NOALARM"))
+    if gsx_t3_down:
+        side_gsx_cd = _cd(True, "T3-DOWN")     # root cause -- all T1s on port affected
+    elif gsx_t1_down:
+        side_gsx_cd = _cd(True, "T1-DOWN")     # DS1-specific failure
+    elif gsx_t1_alarm:
+        side_gsx_cd = _cd(True, gsx_alarm)
+    elif t3_errs:
+        side_gsx_cd = _cd(True, t3_errs[0].split(":")[0].strip())
+    else:
+        side_gsx_cd = _cd(False)
 
     fa_alarms = mux.get("facility_alarms") or []
     cem_h = mux.get("cem_health") or {}

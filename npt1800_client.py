@@ -29,15 +29,32 @@ except ImportError:
 from device_base import BaseDeviceClient
 
 HUB_IPS = {
-    "10.111.132.255": {"name": "ATL-1800", "ip": "10.111.132.255"},
-    "10.111.132.254": {"name": "ATL-1800", "ip": "10.111.132.254"},
-    "10.111.130.255": {"name": "JFK-1800", "ip": "10.111.130.255"},
-    "10.111.130.254": {"name": "ATL-1800", "ip": "10.111.130.254"},
-    "10.111.131.255": {"name": "DFW-1800", "ip": "10.111.131.255"},
-    "10.111.131.254": {"name": "DFW-1800", "ip": "10.111.131.254"},
-    "10.111.135.255": {"name": "LAX-1800", "ip": "10.111.135.255"},
-    "10.111.135.254": {"name": "LAX-1800", "ip": "10.111.135.254"},
+    # DEPRECATED -- do not edit this dict and do not add entries to it.
+    #
+    # The hub map now lives in hub_registry.py, which resolves from NetBox and
+    # falls back to a single verified table. This literal is kept only so that
+    # `from npt1800_client import HUB_IPS` keeps working; it is REPLACED at import
+    # time by hub_registry.build_hub_ips() (see below the class).
+    #
+    # History: this table had 10.111.131.254 labelled "DFW-1800" when that box is
+    # LAX. The same fact also lived in interface_check.SITE_TO_1800, which was
+    # corrected on 2026-07-08 while this copy was not -- so LAX circuits were
+    # reported as DFW for ~2 months. Two copies of one fact is the bug; one table
+    # sourced from NetBox is the fix.
+    # Deliberately EMPTY. Populated below from hub_registry.build_hub_ips().
+    # Keeping verified IPs here as well would recreate the two-copies-of-one-fact
+    # bug this refactor exists to remove.
 }
+
+
+# Replace the deprecated literal above with the registry-backed view, so there is
+# exactly ONE hub table in the codebase. Import is guarded: if hub_registry or
+# NetBox is unavailable the literal stands as-is and nothing breaks.
+try:
+    import hub_registry as _hub_registry
+    HUB_IPS = _hub_registry.build_hub_ips()
+except Exception:                                       # pragma: no cover
+    _hub_registry = None
 
 
 class NPT1800Client(BaseDeviceClient):
@@ -50,9 +67,14 @@ class NPT1800Client(BaseDeviceClient):
 
     def _capture_hostname(self):
         super()._capture_hostname()
-        m2 = re.search(r'(atl|jfk|dfw|lax)', self.hostname, re.IGNORECASE)
-        if m2:
-            self.loc_code = m2.group(1).lower()
+        # Was its own hardcoded (atl|jfk|dfw|lax) regex -- a second copy of
+        # the exact fact hub_registry.py exists to be the one source of
+        # truth for (see that module's docstring). Consolidated 2026-09-11
+        # while adding the LAB site, so a future new site only ever needs
+        # updating in one place.
+        site = _hub_registry.site_from_hostname(self.hostname) if _hub_registry else None
+        if site:
+            self.loc_code = site.lower()
 
     def _muse_lookup_batch(self, muse_ids, timeout):
         """
@@ -85,12 +107,24 @@ class NPT1800Client(BaseDeviceClient):
 
     def query_batch(self, hub_ip, ds1_map):
         """Returns identical 7-tuple to SecureCRT query_1800_batch."""
-        hub_info = HUB_IPS.get(hub_ip)
-        if not hub_info:
+        # Hub NAME resolution, most authoritative first:
+        #   1. this device's own hostname -- it cannot be stale
+        #   2. hub_registry (NetBox, then the single verified fallback table)
+        # The old code went straight to a hardcoded IP->name dict, which is how
+        # LAX got reported as DFW for ~2 months.
+        hub_name = _hub_registry.name_from_hostname(self.hostname) \
+            if _hub_registry else None
+        if not hub_name and _hub_registry:
+            hub_name, _src, _warns = _hub_registry.ip_to_name(hub_ip)
+        if not hub_name:
+            hub_name = (HUB_IPS.get(hub_ip) or {}).get("name")
+        if not hub_name:
             return {}, {}, "?", "?", "?", {
-                ds1: "Hub IP {} not in HUB_IPS map".format(hub_ip)
+                ds1: "Hub IP {} could not be resolved to a hub name "
+                     "(not in NetBox, not in the verified fallback map)".format(hub_ip)
                 for ds1 in ds1_map
             }, {}
+        hub_info = {"name": hub_name, "ip": hub_ip}
 
         # One render for the whole hub group (was: one render PER DS1).
         muse_lookup_timeout = 150
@@ -180,13 +214,26 @@ def main():
     print("  NPT-1800 CLIENT -- connection test (interface_check cmds)")
     print("=" * 60)
 
-    hub_ip = input("1800 hub IP [10.111.131.254]: ").strip() or "10.111.131.254"
-    iface  = input("Interface (e.g. xe-ts13/3.624): ").strip()
-    if not iface or "." not in iface:
-        print("Invalid interface -- must include a dot for the VLAN.")
+    # Default comes from the registry rather than a hardcoded literal, so this
+    # test harness can't drift from the real map either.
+    default_ip = ""
+    if _hub_registry:
+        hubs, src, _ = _hub_registry.refresh()
+        print("  known hubs ({}):".format(src))
+        for s in sorted(hubs):
+            print("    {:<4} {}".format(s, hubs[s]["ip"]))
+        atl = hubs.get("ATL")
+        default_ip = atl["ip"] if atl else ""
+    prompt = "1800 hub IP{}: ".format(" [{}]".format(default_ip) if default_ip else "")
+    hub_ip = input(prompt).strip() or default_ip
+    if not hub_ip:
+        print("A hub IP is required.")
         return
-    nni  = iface.split(".")[0]
-    vlan = iface.split(".")[1]
+    iface  = input("Interface (e.g. xe-ts13/3.624): ").strip()
+    if not iface or "/" not in iface or "." not in iface:
+        print("Invalid interface -- expected <nni>/<port>.<vlan>, e.g. xe-ts13/3.624.")
+        return
+    nni, vlan = iface.rsplit(".", 1)
 
     user = input("1800 username: ").strip()
     pw   = getpass.getpass("1800 password: ")
@@ -222,7 +269,9 @@ def main():
 
     cfg = captured.get(
         "show configuration interfaces {} unit {} | display-set".format(nni, vlan), "")
-    m = re.search(r"set family inet address (\d+\.\d+\.\d+\.\d+)/", cfg)
+    # See interface_check.py for why this dropped the "set" prefix (never
+    # matched real display-set output -- confirmed 2026-09-02).
+    m = re.search(r"family inet address (\d+\.\d+\.\d+\.\d+)/", cfg)
     if m:
         ip = m.group(1)
         octets = ip.split(".")

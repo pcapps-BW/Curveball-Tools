@@ -23,13 +23,15 @@ import base64
 import datetime
 import threading
 
+import platform_paths
+
 try:
     import requests
 except ImportError:
     print("ERROR: requests not installed. Run:  pip install requests")
     sys.exit(1)
 
-CONFIG_PATH = r"C:\Claude\autotester_config.txt"
+CONFIG_PATH = platform_paths.path("autotester_config.txt")
 JIRA_BASE   = "https://bandwidth-jira.atlassian.net"
 TICKET_RE   = re.compile(r'^NOE-\d{4}$')
 

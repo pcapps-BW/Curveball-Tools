@@ -20,6 +20,7 @@ import getpass
 import datetime
 import re
 
+import platform_paths
 from netbox_client import NetboxClient, load_netbox_config
 from device_base import CredentialError, prompt_ip, ANSI_ESCAPE
 from output_builders import resolve_nni_from_description
@@ -27,7 +28,7 @@ from jira_client import post_comment, valid_ticket
 
 # Reuse existing client classes
 from npt1250_client import NPT1250Client
-from npt1800_client import NPT1800Client, HUB_IPS
+from npt1800_client import NPT1800Client
 from mux4216_client import MUX4216Client
 from gsx_client import GSXClient, find_plink, find_live_ip
 
@@ -503,6 +504,9 @@ def _run_from_1250(params):
         g = GSXClient(gsx_ip_actual, gsx_user, gsx_pass, plink_path)
         try:
             g.connect()
+            gsx_t3_full = "T3-1-{}-{}".format(gsx_slot, gsx_port)
+            pairs_gsx.append(_capture(g, "SHOW T3 {} STATUS".format(gsx_t3_full),
+                note="← T3 parent status (DOWN here = all T1s on this port affected)"))
             pairs_gsx.append(_capture(
                 g, "SHOW T1 {} STATUS".format(gsx_t1_full),
                 note="← record UP -- baseline state"))
@@ -518,7 +522,10 @@ def _run_from_1250(params):
         circuit["gsx_ip"] = gsx_ip_actual
     else:
         print("  [GSX] plink not available or IP not resolved -- generating commands only")
+        gsx_t3_full = "T3-1-{}-{}".format(gsx_slot, gsx_port)
         pairs_gsx.append(("# GSX IP could not be resolved -- run these commands manually:", ""))
+        pairs_gsx.append(("SHOW T3 {} STATUS".format(gsx_t3_full),
+                          "← T3 parent status (DOWN here = all T1s on this port affected)"))
         pairs_gsx.append(("SHOW T1 {} STATUS".format(gsx_t1_full),
                           "← record UP -- baseline state"))
         pairs_gsx.append(("SHOW T1 {} ADMIN".format(gsx_t1_full), ""))
@@ -964,7 +971,7 @@ def _build_script(circuit, precheck_sections):
 def _write(script_text, circuit_id):
     safe = re.sub(r'[^\w.-]', '_', circuit_id)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\MUX_Loop_Script_{}_{}.txt".format(safe, ts)
+    out_path = platform_paths.path("MUX_Loop_Script_{}_{}.txt".format(safe, ts))
     try:
         with open(out_path, "w") as f:
             f.write(script_text)

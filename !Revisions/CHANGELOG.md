@@ -2,6 +2,1581 @@
 
 ---
 
+## Deployment Status
+
+Tracks which version is actually live on each host -- update this whenever a
+zip is deployed (not just built). Prevents the "which copy is stale" drift
+that's bitten this project before.
+
+| Host                              | Version | Notes |
+|------------------------------------|---------|-------|
+| pcapps's local Windows machine     | v2.13   | Working folder -- always current, this is where dev happens |
+| noe-util-01a.lab1.bwnet.us (Linux) | v1.96   | Confirmed working (NetBox/JIRA/Slack all verified live 2026-09-11) at `/usr/local/scripts/NOEIP/Curveball`, `curveball.service` (systemd), `CURVEBALL_HOME=/usr/local/scripts/NOEIP/Curveball` set via drop-in override. Hand-edit to `hub_registry.py` (LAB site) has been superseded by the real v1.96 deploy. Needs v1.97+ next -- v1.97 adds INTRUSIVE_COMMANDS.md (no functional change), v1.98 adds OSPF outage pairing, v1.99 splits IXC Check's outage summary into LDP + OSPF, v2.00 adds a 1250-side LDP source to ospf_stability.py, v2.01 adds an LDP Outages Excel tab + updates the tool card, v2.02 renames the tool to "OSPF & LDP Stability", v2.03 adds 24h/72h/7d/30d LDP drop-count columns, v2.04 collapses the LDP Outages sheet to one row per site, v2.05 fixes the outage timestamp format to include the day, v2.06 fixes a real false-"still down" bug on dual-homed sites, v2.07 closes two gaps in that fix, v2.08 fixes a naive-IP-substring-match bug that could cross-contaminate DIFFERENT sites' events + a one-time state migration, v2.09 adds the summary/pie-chart block to the LDP Outages sheet, v2.10 adds an "LDP Stability Alert" Slack message, v2.11 adds historical NNI-port correlation for chronic review + fixes the web UI showing raw binary for Excel-output tools, v2.12 disables the NNI-port correlation flag by default pending real-world confirmation (functional changes -- see below), v2.13 adds T3 status awareness to all GSX tools + fixes silent GSX-side Clean bug in the autotester run summary |
+
+---
+
+## v2.14 — 2026-10-01
+
+### DS1 card expansion, GSX SSH failover, and skipping 96 pulls of zeros
+
+Three independent fixes from the 2026-10-01 bug list, plus a new `circuit_audit`
+column. Nothing in this release changes what is sent to a device except the
+GSX login sequence; all commands remain read-only.
+
+**`ds1_util.py` (new)**
+
+A bare card name now means every DS1 on it: `ts1` -> `ts1/1 .. ts1/28`,
+`ts1, ts3, ts5, ts8` -> 112 DS1s. Mixed forms work (`ts1, ts3/4` -> 29) and a
+card plus one of its own ports does not duplicate that port. Every DS1 is
+returned whether or not it is provisioned — checking all of them is the point,
+and an unprovisioned port is a finding rather than something to pre-filter.
+The operator gets a note naming what expanded before a one-word input turns
+into 28 device logins.
+
+Put in a shared module because five call sites were parsing DS1 input with the
+same inline one-liner (`autotester_standalone`, `app.py` x3, `ds1_gsx_test`).
+Adding expansion to each would have been five copies of one rule — the
+drift-by-accretion shape that had LAX circuits reported as DFW for two months.
+All five now call `expand_ds1_list()`. 15 self-tests (`python ds1_util.py`).
+
+**`gsx_client.py` — `connect_first_live()`**
+
+`find_live_ip()` only pings, and a GSX can answer ICMP while refusing SSH.
+Observed on ATLGSX02 (192.168.40.5): ping fine, plink died at login with
+`FATAL ERROR: Network error: Connection refused`, and because the old path
+committed to the first *pingable* address, every DS1 on that card failed with
+the same error instead of trying the next management IP.
+
+`connect_first_live()` walks the NetBox mgmt IPs and returns the first that
+both pings **and** accepts SSH, handing back the already-open client so the
+caller does not log in twice. Failed attempts are closed. Nothing is cached to
+disk — trial and error every run, by request, so no address list can go stale.
+Each skip is logged, so an address that always refuses SSH stays visible
+rather than being silently routed around. `find_live_ip()` is kept, with a
+docstring saying it is ping-only, for the callers that just need an address to
+print in a runbook.
+
+Wired into `autotester_standalone.py`; the existing `finally: g.close()` is
+unchanged.
+
+**`gsx_perfmon.py` — skip the 96 interval pulls when the 24h bin is clean**
+
+If the 24-hour bin is clean there is no value in 96 round trips returning
+zeros. Both the T3 and T1 blocks now check `PERFMON CURRENT DAY` first and, if
+clean, write a short "intervals skipped" section instead of pulling them.
+
+The first attempt at this was wrong and is worth recording: it looked for
+abbreviated counter names (`CV` / `ES` / `SES` / `UAS`). The real output spells
+them out in full — `Code Violations:`, `Unavailable Seconds:` — so the pattern
+matched zero counters and the skip could never have fired. It would have sat in
+the "could not determine" branch forever: dead code that looks like a feature.
+Fixed against verbatim output captured from ATLGSX02 T1-1-7-1-16, which is now
+the in-tree fixture.
+
+The check fails toward work, deliberately. It skips only when at least three
+numeric counters are found and every one is zero. `N/A` rows are ignored rather
+than read as zero — a parameter the device does not measure is not evidence of
+health. Unparsed output, a command error, or an all-`N/A` bin pulls every
+interval exactly as before and prints why. `Elapsed Time: 4574` is anchored out
+so it cannot be mistaken for a counter. 10 self-tests
+(`python gsx_perfmon.py --self-test`).
+
+**`circuit_audit.py` / `netbox_client.py` — EVC circuit IDs**
+
+`EVC Circuit ID` column added to the AUDIT and CIRCUIT LIST sheets, showing the
+NetBox interface description verbatim. No parsing: two formats were already in
+the wild (`Zayo: ETYX/389224//ZYO` on WHPLNYWP132, `ZAYO - ETYX/420953//ZYO` on
+DIXNILXA364) and every parse rule added its own gap, where anything unmatched
+came out blank and read as "no circuit" rather than "could not read".
+
+Picking the right circuit per row is done by identity, not inference, in this
+order: the hub's OSPF neighbour address matched against the 1250's NetBox
+interface IP (needs no device login, and resolves same-carrier pairs such as
+FTMYFLXA939's two Zayo legs); then the 1250's own hub-facing leg via link
+addressing; then the carrier named in the description, but only when exactly
+one description mentions it. Failing all of those it shows every description,
+labelled and flagged, rather than choosing one — a plausible wrong circuit ID
+in front of a NOC engineer is the LAXGSX04 failure in a different column.
+
+`netbox_client.device_interface_descriptions()` now also fetches interface IPs
+from IPAM, which is what makes the first match possible.
+
+Also: the 1250's own prompt is now authoritative for its hostname
+(`pcapps@CLEVOH62320>` -> `CLEVOH62320`), replacing the CLLI+VLAN derivation,
+which is demonstrably wrong for some sites. The derivation remains as a
+fallback for unreachable devices and those cells are marked unverified. Where
+the two disagree the device wins and the disagreement is reported — that list
+is the map of where the naming convention breaks.
+
+**Known gaps carried forward**
+
+- Autotester summary reporting `completed successfully` alongside
+  `CES Disabled`, and DS3-only PMs — not yet diagnosed, needs full run output.
+- `set interfaces ds1-ts3/4 unit 0 pm-monitor-enable` deliberately NOT added to
+  any script. It is a configuration command and every tool in this suite is
+  read-only; `INTRUSIVE_COMMANDS.md` asserts that. Pending a decision on
+  runbook-text versus documentation only.
+- Reverse autotester (GSX -> 1250) and the SoR site remain unscoped.
+
+---
+
+## v2.13 — 2026-09-17
+
+### GSX: T3 status awareness + DS1 vs. T3 outage distinction across all tools
+
+**Problem:** The autotester run summary was reporting `GSX-side Clean` even when
+the GSX T1 was hard down with `Operational Status: DOWN` / `Alarm Status:
+AISFAILURE`. Root cause: `gsx_pm_results` (the flattened GSX T1 data blob) was
+being built *after* `run_summary_line` was called, so the summary never had
+access to GSX T1 status fields — it could only check MUX-side T3 PM counters,
+which were within threshold even though the T1 was dead.
+
+**Second problem:** Even with that fixed, the summary couldn't distinguish between
+a DS1-specific outage (`T1-DOWN`) and a T3-level outage that takes all 28 T1s on
+a port down together (`T3-DOWN`). These need different ticket responses — one T3
+ticket, not 28 DS1 tickets.
+
+**Changes:**
+
+`gsx_client.py`
+- Added `get_t3_status(slot, port)` — pulls `SHOW T3 T3-1-{slot}-{port} STATUS`
+  from the GSX; used by the autotester to check parent T3 health per DS1.
+- Added `pull_t3_stats(slot, port)` — full T3 command set (STATUS, ADMIN,
+  STATISTICS, PERFMON CURRENT DAY, PERFMON THRESHOLDS, 96 fifteen-minute
+  intervals) for use by `gsx_perfmon.py`.
+
+`gsx_perfmon.py`
+- Now collects T3 data (STATUS, ADMIN, STATISTICS, PERFMON CURRENT DAY,
+  PERFMON THRESHOLDS, 96 intervals) in addition to the existing T1 data. T3
+  ID is derived automatically from the T1 ID the user already entered
+  (`T1-1-7-2-2` → `T3-1-7-2`); no extra input needed.
+- Report header now shows both T3 and T1 IDs.
+- JIRA summary now includes T3 Operational Status and Alarm Status, prefixed
+  `T3 ...` / `T1 ...` for clarity (e.g. `T1 Operational Status: DOWN-DS1ALARM`
+  instead of the raw unprefixed line).
+
+`autotester_standalone.py`
+- Moved `gsx_pm_results` construction to before the run summary block (was after
+  it -- the root cause of the silent-clean bug).
+- GSX collection loop now also calls `get_t3_status()` per DS1 and stores results
+  in `gsx_t3_results`.
+- Both `run_summary_line` and `build_diagnostic_summary` now receive
+  `gsx_t3_results`.
+
+`output_builders.py` — `run_summary_line`
+- GSX-side verdict now checks in priority order:
+  1. T3 `Operational Status: DOWN` → `Dirty (T3-DOWN)` (root cause; all T1s
+     on that port affected by same failure — one ticket)
+  2. T1 `Operational Status: DOWN` → `Dirty (T1-DOWN)` (DS1-specific)
+  3. T1 alarm status (non-NONE) → `Dirty ({alarm})` e.g. `Dirty (AISFAILURE)`
+  4. MUX-side T3 PM counters → `Dirty ({counter})`
+  5. All clear → `Clean`
+
+`output_builders.py` — `build_diagnostic_summary`
+- Added `gsx_t3_results` parameter.
+- GSX section now shows T3 DOWN with a note ("root cause; all T1s on this port
+  affected") and labels the T1 DOWN line as "caused by T3 above" when the T3 is
+  also down, so the tech immediately knows the scope of the failure.
+
+`ds1_gsx_test.py`
+- Precheck section now runs `SHOW T3 STATUS` before the T1 commands, giving
+  the tech T3 health context before starting the test.
+
+`mux_loop_script.py`
+- Both the live and commands-only precheck paths now include `SHOW T3 STATUS`
+  with an explanatory note. T3 ID derived from the GSX slot/port already in scope.
+
+---
+
+## v2.12 — 2026-09-14
+
+### LDP port correlation: disabled by default pending confirmation against a real NNI outage
+
+pcapps reviewed v2.11's "Any Port-Correlated Drop?" flags and asked how a
+"YES" was actually reached, since the column doesn't show which sibling
+site each flag paired with. After explaining the mechanism (cross-site
+timing correlation, not a real port-down log -- see v2.11's notes), pcapps's
+call: "keep the tooling written somewhere but disable it until we get
+another NNI outage and I can be certain. false flagging is the worst."
+
+Added `LDP_PORT_CORR_ENABLED = False` as a single kill switch in
+`ospf_stability.py`. All the v2.11 correlation code is untouched and still
+runs its own internal logic correctly (verified again this version) --
+this just gates whether `run()` ever calls it:
+
+- While disabled: `correlate_ldp_port_events()` is never invoked, so no
+  outage is ever marked `port_correlated`, and the text report's
+  "HISTORICAL PORT-CORRELATED LDP DROPS" section never appears.
+- The Excel column header reads "Any Port-Correlated Drop? (disabled)" and
+  every row reads "n/a (disabled)" -- deliberately NOT "no", so a disabled
+  check can never be misread as "confirmed not correlated" (worse than no
+  flag at all, per pcapps's concern about false flagging).
+- Legend sheet and the tool's own description both call out that this is
+  built but held off pending real-world confirmation.
+
+To re-enable: flip `LDP_PORT_CORR_ENABLED` to `True` once a real NNI outage
+happens and pcapps can confirm the flagged sites actually match what went
+down. No other code changes needed.
+
+Verified: with the flag off, a synthetic 2-site same-port/close-in-time
+fixture (the same one v2.11 confirmed WOULD correlate) produces no
+"[PORT EVENT?]" text, no rollup section, and "n/a (disabled)" on every
+Excel row.
+
+---
+
+## v2.11 — 2026-09-14
+
+### LDP Outages: flag drops that correlate in time with a sibling site on the same physical NNI port (chronic-ticket review)
+
+pcapps asked: for chronic/problem review, is there a way to check the 1800
+logs for the NNI dropping in the same timeframe as the sub-int/EVC, so
+repeat review time isn't wasted re-solving what's actually one upstream
+fault. Checked the hubs directly -- confirmed there's no protocol running
+between the 1800 and the IXC across the NNI itself, and no example of a
+port-level Down/Up line anywhere in the event log. So there is no device log
+of the physical port's own history to read.
+
+Instead of a port log, this correlates ACROSS sites: every site's own LDP
+outage history is already trustworthy (`pair_ospf_outages_by_peer`, hardened
+in v2.06-v2.08), and every site's physical port is already known (the same
+`hub_state[hub]["interface"]` data `port_rollup()` uses for the live
+blast-radius check). If two DIFFERENT sites sharing a physical port both
+dropped within 5 minutes of each other (pcapps's call -- tight window,
+minimize coincidental false positives), that's treated as one correlated
+port event rather than two unrelated circuit faults.
+
+Added `output_builders.pair_ospf_outages_by_peer()`: now tags each returned
+outage with `"peer"` (the hub loopback IP its group was keyed on) -- a
+one-line, backward-compatible addition, since every event in a peer group
+already shares that value.
+
+Added to `ospf_stability.py`:
+- `correlate_ldp_port_events()` -- buckets every site's LDP outages by
+  (hub, physical port) using the outage's `peer` field, clusters them by
+  time, and marks `outage["port_correlated"] = True` on any cluster
+  spanning 2+ distinct sites within the 5-minute window. Dual-homed sites
+  whose outage can't be attributed to one leg (missing/legacy peer tag) are
+  left out of correlation rather than guessed onto either port.
+- `_format_ldp_outages_with_flags()` -- same rendering as the shared
+  `format_ospf_outages()`, plus a `[PORT EVENT?]` suffix on flagged Down
+  lines. Kept local since `interface_check.py`/`ospf_events.py` don't need
+  port correlation.
+- Text report: new "HISTORICAL PORT-CORRELATED LDP DROPS" section listing
+  every correlated cluster (hub, port, sites, timestamps).
+- LDP Outages Excel sheet: new "Any Port-Correlated Drop?" column
+  (YES/no), amber-filled when YES and the site isn't currently down (red
+  still wins for an ongoing outage). Legend sheet documents both the new
+  column and that the LDP sheet's Red/Amber now mean something different
+  from the main sheet's.
+
+LIMITATION, documented in the code and the legend: this is inferred from
+timing, not a direct port-down event -- a "no" on a dual-homed site whose
+outage couldn't be attributed to one leg means unproven, not clean.
+
+Verified with a synthetic 4-site fixture: two sites sharing a port 2 minutes
+apart correctly flagged as correlated; a third site on the same port but 40
+minutes later, and a fourth site entirely on a different port, both
+correctly left unflagged.
+
+### Web UI: fixed the report panel showing raw binary for Excel-output tools
+
+pcapps flagged (screenshot): the OSPF & LDP Stability page's report panel
+showed unreadable garbage text with a "Download .txt" link, for a tool that
+actually outputs an .xlsx workbook. Root cause: `app.py`'s generic
+`_run_job()` opened every tool's out_path with `open(path, "r")` regardless
+of file type -- for a binary .xlsx this decodes the raw zip/XML bytes as
+text and both displays and downloads-as garbage-labeled content.
+
+Fixed for any tool whose out_path is one of `.xlsx/.xls/.docx/.pdf/.zip`:
+`_run_job()` no longer reads the binary file as text -- it reuses the
+readable text already streamed to the live log via `progress()`/`print()`
+during the run (piped through the existing `_JobStdoutTee`), so the report
+panel shows the same readable report a user watched scroll by live. Added
+`download_ext` to the job-status API response; `job.js` now sets the
+download link's label to the real extension (`Download .xlsx` for OSPF &
+LDP Stability, `Download .txt` for every other tool) instead of a hardcoded,
+sometimes-wrong "Download .txt".
+
+Scoped to Excel-output pages only, per pcapps -- every other tool's out_path
+is still a plain .txt report, read and displayed exactly as before.
+
+---
+
+## v2.10 — 2026-09-14
+
+### Slack: added a separate "LDP Stability Alert" alongside the existing OSPF alert
+
+pcapps asked: "on the Slack output, include a 'LDP Stability Alert -- xxxx-xx-xx
+xx:xx' section." The existing Slack alert only fired on new OSPF drop events
+(`new_events_by_rid`, populated by `merge_drop_events`'s "added" count). LDP's
+event-map merge in `_poll_hub` / `_sweep_1250` had no equivalent "was this
+genuinely new this run" tracking -- it just merged into `ldp_event_map` /
+`ldp_event_map_1250` unconditionally.
+
+Added the same fresh-event detection LDP needs: both `_poll_hub` and
+`_sweep_1250` now compute `set(new_events) - set(prior_map)` BEFORE merging,
+and record any fresh Down (not Up -- a recovery isn't alert-worthy) into a new
+`new_ldp_events_by_rid` dict, threaded through `_run_sweep` and the hub-poll
+thread launch in `run()` the same way `new_events_by_rid` already is.
+
+`_aggregate_results` now accepts `new_ldp_events_by_rid` and exposes
+`new_ldp_down_events` on each result row (site-level, so identical across a
+dual-homed site's per-leg rows -- same pattern as `ldp_outages`).
+
+Added `_build_ldp_slack_alert(new_ldp_drop_results, stamp)`, mirroring
+`_build_slack_alert`'s format but headed `"*LDP Stability Alert* -- {stamp}"`.
+`run()`'s Slack block now dedups `new_ldp_down_events` by router-id (a
+dual-homed site's two leg-rows carry the same site-level list -- counting
+both would double the reported drop count), and sends the LDP alert as its
+own Slack message, separate from the OSPF alert, only when there's something
+new to report. Each alert (OSPF, LDP) is now announced independently in the
+progress log too, instead of one combined "no new drops" line.
+
+Verified with a synthetic 3-row result set (a dual-homed site with 1 new LDP
+drop duplicated across its 2 hub-leg rows, plus an unrelated site with no new
+LDP drops): the dedup step correctly produced exactly one alert line for the
+dual-homed site reading "1 new LDP drop(s)", not two, and the unrelated site
+did not appear.
+
+---
+
+## v2.09 — 2026-09-14
+
+### LDP Outages sheet: added the same Summary + pie-chart block the main sheet has
+
+pcapps confirmed v2.08's fix resolved the dual-homed/cross-site bugs, then
+asked for the main "OSPF Stability — Summary" section (description, run
+stats, and four Stable/Issues pie charts for 24h/72h/7d/30d) to be added to
+the "LDP Outages" sheet too.
+
+Added a matching "LDP Session Outages — Summary" block: description of how
+LDP outages are sourced (both the 1800 and the 1250) and why LDP is tracked
+as the better outage indicator, a run-stats line (sites measured / sites
+with any LDP outage / currently down), and the same four pie charts using
+`ldp_drop_24h/72h/7d/30d` instead of the OSPF drop counts. "Stable" here
+means zero LDP drops in that window -- computed over ALL measurable sites
+(not just ones with a recorded outage), same population rule the main
+sheet's own chart data already uses, deduped by router-id since `results`
+carries one row per adjacency leg.
+
+Verified against a 3-site mix (one always-stable, one with a drop 2 hours
+ago, one with a drop 10 days ago): Stable/Issues counts came out exactly as
+expected in all four windows, and all four charts render.
+
+---
+
+## v2.08 — 2026-09-14
+
+### Bugfix: naive IP-substring matching could mix in a DIFFERENT site's events entirely
+
+pcapps found this one too, from direct device experience: "is it because the
+1800 gets multiple hits when filtering by the .5? `show ldp session | grep
+.5` gives hits for .5, .50-.59." Correct -- and our Python-side filtering had
+the identical bug, one level worse than the v2.06/v2.07 dual-homed fix: not
+mixing two sessions of the SAME site, but mixing in a COMPLETELY DIFFERENT
+site's events.
+
+Root cause: `check_down_history()` and `check_ospf_outage_events()` filtered
+lines with a plain `peer_ip in line` substring test. Filtering for
+`10.111.130.5` also matched any line containing `10.111.130.50`-`.59`,
+`110.111.130.5`, etc. -- any IP that has the target IP as a numeric prefix or
+suffix. This matters most in `ospf_stability.py`'s `_poll_hub`, which filters
+a HUB's shared, multi-site event log down to one site by its loopback -- a
+false match there attributes a different site entirely's Down/Up event to
+the wrong site's stored history.
+
+Fix: new `output_builders._ip_in_line()` -- an exact-token match that
+requires the IP not be immediately preceded or followed by another digit,
+so `10.111.130.5` no longer matches `.50`-`.59` or a longer address it's
+embedded in. Verified against the exact scenario: a log with events for both
+`10.111.130.5` and `10.111.130.55` now correctly returns only the `.5`
+events when filtering for `.5`.
+
+**State migration**: unlike the missing-"peer"-field issue from v2.07 (which
+self-heals per entry because a bad entry is structurally identifiable), a
+contaminated `ldp_event_map` entry looks IDENTICAL to a correct one -- same
+shape, real timestamp, just attributed to the wrong site. There's no way to
+tell after storage which entries came from a different site's log line. Added
+a one-time schema migration (`_migrate_state_schema`, tracked via a
+`_schema_version` key in the state file) that clears `ldp_event_map` on
+every site the first time this version runs, letting it rebuild from the
+hub polls using the corrected exact-IP match. LDP full-log retention is
+300+ days confirmed on the 1800 side, so nothing is permanently lost.
+
+Confirmed this bug could NOT have affected `ldp_event_map_1250` (the
+1250-side source added in v2.00) -- that call passes `peer_ip=None` since
+it's already scoped to one device by the SSH session itself, so no IP
+filtering happens there at all.
+
+---
+
+## v2.07 — 2026-09-14
+
+### Follow-up fix: v2.06's dual-homed fix had two remaining gaps
+
+pcapps pushed back on v2.06 ("you sure its fixed? both ldp sessions there
+have been up for 1m+") rather than taking the synthetic test as sufficient
+proof, which was the right call -- there were two more real problems:
+
+1. **Peer-key mismatch between the two data sources.** `_poll_hub` (1800
+   side) was tagging events with `hub_name` (a string, e.g. "ces01.atl1"),
+   while `_sweep_1250` (1250 side) tags with the hub's own loopback IP
+   (parsed from the line's peerRouterID field). Same session, two different
+   identifier spaces -- `pair_ospf_outages_by_peer` would never have grouped
+   the two sources' views of the SAME session together. Fixed: `_poll_hub`
+   now tags with `hub_ip` instead, matching the 1250 side's identifier space.
+
+2. **Legacy state poisoning.** Events already persisted in `state.json`
+   from before v2.06 have no `"peer"` key at all (the field didn't exist
+   yet). Defaulting a missing peer to `""` -- which is what v2.06 shipped --
+   would put ALL untagged legacy events for a site into one shared bucket
+   and silently reproduce the exact cross-session bug, just on old data
+   instead of new. Fixed: `_ldp_events_from_map` now DROPS any stored event
+   with no `"peer"` key entirely, rather than defaulting it. Because the
+   stored map is keyed on `"<timestamp>|<kind>"`, a fresh poll that
+   re-captures the same still-logged event will overwrite the old untagged
+   entry in place with a correctly peer-tagged one -- so this self-heals on
+   the next poll, no manual state cleanup needed. LDP full-log retention is
+   300+ days confirmed on the 1800 side, so the underlying event data isn't
+   lost, just temporarily excluded from pairing until re-collected.
+
+Verified end-to-end with the exact reported scenario reconstructed as a
+legacy (untagged) state: 0 events survive the drop, then after simulating
+one fresh re-poll with correct peer tags, both sessions pair correctly and
+"Currently Down" reads "no" -- matching the real device's confirmed
+Operational state on both LDP sessions.
+
+Practical note for pcapps: after this version is deployed and a fresh poll
+runs, expect the previously-affected site's outage count to momentarily
+show fewer/zero outages (the untagged legacy history was dropped), then
+repopulate correctly-tagged on the next poll.
+
+---
+
+## v2.06 — 2026-09-14
+
+### Bugfix: phantom "still down" outages on dual-homed sites (both LDP and OSPF)
+
+Found live by pcapps: PGHKNYSH133 showed "Currently Down: YES" with a Down
+timestamp from the day before, while the real device (`show ldp session`)
+showed BOTH of its LDP sessions Operational for over a month.
+
+Root cause: `pair_ospf_outages()` tracks only ONE "currently open outage"
+slot. `PGHKNYSH133` is dual-homed -- it runs two independent LDP sessions
+(to two different hub router-ids) -- and the events for both sessions were
+being merged into a single flat timeline before pairing. When session A goes
+down, then session B goes down before A recovers, the single open-outage
+slot gets reassigned to B -- A's outage is orphaned as "still down" forever,
+and A's real recovery event ends up incorrectly closing B's outage instead.
+Reproduced exactly with a synthetic two-peer interleaved sequence (see the
+new `pair_ospf_outages_by_peer` docstring) and confirmed the fix resolves it.
+
+This affected any dual-homed site (a substantial fraction of the fleet, per
+this codebase's own existing comments on dual-homed sites) on BOTH the LDP
+pipeline and, it turns out, the OSPF adjacency pipeline for the same
+underlying reason (a dual-homed 1250 peers OSPF with two different hub
+router-ids too).
+
+Fix: new `output_builders.pair_ospf_outages_by_peer()` groups events by their
+session identity (the OTHER end's router-id) BEFORE pairing, then merges the
+resulting per-session outage lists back into one chronological list.
+`check_ospf_outage_events()` now returns a "peer" field per event, and
+`ospf_stability.py`'s stored event maps (`ldp_event_map`, `ldp_event_map_1250`,
+`ospf_transitions`) now persist that field too. Care was needed on which
+field actually distinguishes the two sessions: on the 1800 hub's own log
+(`_poll_hub`), the peerRouterID field is the SITE's loopback -- constant
+across both of the site's hubs -- so the hub's own identity (`hub_name`) is
+used instead; on the 1250's own log (`_sweep_1250`), peerRouterID correctly
+is the hub's loopback and differs between sessions, so the parsed value is
+used directly. `interface_check.py`'s LDP/OSPF calls were also switched to
+the new grouped function for consistency (no behavior change there -- that
+call site is already scoped to one session by construction).
+
+No new device commands, no new device calls -- same data, correctly paired.
+
+---
+
+## v2.05 — 2026-09-14
+
+### Bugfix: outage timestamps were missing the day entirely
+
+`output_builders.format_down_event()` was rendering `MM/YY` (month/year) --
+the day was never in the display at all, despite the function's own
+docstring claiming `MM/DD/YY`. This produced strings like `09/26 - ...`,
+which reads as "September 2026" and made a run of same-day events look like
+they spanned into next year at a glance (pcapps: "you can pull logs from the
+future???"). Fixed to `MM/DD/YY`, e.g. `09/07/26 - 1301Z, 0901EDT`.
+
+This is the single shared timestamp formatter behind every outage summary
+built since v1.98, so the fix applies everywhere at once: `interface_check.py`
+(LDP + OSPF Outages), `ospf_stability.py` (LDP SESSION OUTAGE HISTORY, text
+report + Excel), and `ospf_events.py`'s own outage block.
+
+---
+
+## v2.04 — 2026-09-14
+
+### ospf_stability.py: LDP Outages sheet is now one row per site
+
+Per pcapps: one row per outage meant the same site repeated across many
+rows, which broke sorting. Redesigned the "LDP Outages" Excel sheet to one
+row per 1250, same "summarize, don't enumerate" choice the main sheet
+already makes with its own single "Last Drop" column instead of a full drop
+list.
+
+New columns: Hostname | Router-ID | Hub 1800 | **Currently Down** | **Total
+Outages** | Site 24h/72h/7d/30d | Last Down Timestamp | Uptime Before Last
+Drop | Last Up Timestamp | Last Outage Duration. Rows are sorted
+currently-down sites first, then most total outages, then hostname -- same
+"surface problems first" ordering the main sheet uses -- and a currently-down
+site's row is highlighted red.
+
+The full, unabridged per-outage list (every Down/Up pair, not just the most
+recent) is unchanged and still lives in the text report's "LDP SESSION
+OUTAGE HISTORY" section -- this sheet is the sortable summary, that section
+is the complete record.
+
+---
+
+## v2.03 — 2026-09-14
+
+### ospf_stability.py: LDP drop counts, same 24h/72h/7d/30d windows as OSPF
+
+New `count_ldp_drops_since()`, parallel to the existing `count_drops_since()`
+used for OSPF -- counts LDP Down events (from a `pair_ospf_outages()` list,
+using each outage's own `down_dt`) within a rolling window, converting the
+UTC device timestamp to local first (same `_device_dt_to_local` conversion
+already used everywhere else in this tool) so a bounce right at a window
+boundary isn't miscounted by the UTC/Eastern offset. Windows are nested by
+construction, same as the OSPF counts.
+
+Site-level (not per-outage), computed once in `_aggregate_results` alongside
+`ldp_outages` and carried as `ldp_drop_24h` / `_72h` / `_7d` / `_30d` on every
+row.
+
+Surfaced in two places:
+- Text report's "LDP SESSION OUTAGE HISTORY" per-site line now reads
+  `... -- N outage(s)  |  24h: X  72h: Y  7d: Z  30d: W`.
+- Excel "LDP Outages" sheet gained four new columns -- "Site 24h" / "Site
+  72h" / "Site 7d" / "Site 30d" -- positioned right after "Hub 1800", same
+  naming convention as the main sheet's own OSPF drop columns. Repeated on
+  every outage row for a site, same pattern the main sheet already uses.
+
+---
+
+## v2.02 — 2026-09-14
+
+### ospf_stability.py: renamed to "OSPF & LDP Stability"
+
+Quick follow-up to v2.01's card-text update: the tool's NAME (not just its
+description) still read "OSPF Stability" everywhere it's surfaced, which
+undersold what it now does. Changed `TOOL_INFO['name']` (drives the home
+page card title) and the tool's own page (`templates/ospf_stability.html`
+`<title>` and `<h1>`) to "OSPF & LDP Stability". Cosmetic only -- no
+behavior change.
+
+---
+
+## v2.01 — 2026-09-14
+
+### ospf_stability.py: LDP Outages now has its own Excel tab; tool card updated
+
+Two follow-ups from the LDP outage work in v1.98-v2.00, both prompted by
+pcapps noticing the Excel export and the tool's own web page still only
+described OSPF:
+
+- **New "LDP Outages" worksheet** in the Excel export (`_build_xlsx`), one
+  row per outage (Down + matching Up/Full side by side, so it's directly
+  sortable/filterable by duration or date) -- the same `pair_ospf_outages()`
+  data the text report's "LDP SESSION OUTAGE HISTORY" section already
+  renders, merged from both the 1800 and the 1250. Rows for an outage still
+  open (no clearing Up yet) are highlighted red, same convention as the main
+  sheet's "session currently down" row color. Deduplicated by router-id for
+  the same reason the main sheet and the text report both are (a dual-homed
+  site would otherwise show its outage list twice).
+- **Tool card / description updated** in two places that had gone stale
+  after the LDP work: `ospf_stability.py`'s `TOOL_INFO['desc']` (used
+  wherever the launcher/home page lists this tool) and the `<div
+  class="sub">` blurb on `templates/ospf_stability.html` (the page shown in
+  the screenshot pcapps flagged) -- both now mention LDP session tracking
+  and the paired outage format, not just OSPF adjacency.
+
+---
+
+## v2.00 — 2026-09-14
+
+### ospf_stability.py: LDP Outage History now sourced from BOTH ends of the session
+
+Per pcapps: LDP is a better indicator of an actual IXC outage than OSPF
+adjacency state, since traffic can keep routing on an intact LDP session
+through an OSPF reconvergence -- and both the 1800 and the 1250 run LDP, so
+both sides' event logs are worth checking.
+
+Previously, `ospf_stability.py`'s "LDP SESSION OUTAGE HISTORY" section was
+sourced only from the hub's (1800) own event log. Confirmed live
+(2026-09-14, FARGNDBC636) that a 1250 logs its own LDP-Session-Down/Up
+events too, in the exact same format already parsed for the 1800 side
+(`YYYY-MM-DD,HH:MM:SS` timestamps, same `LDP-Session-Down`/`LDP-Session-Up`
+event names) -- so the same command (`LDP_EVENT_CMD`) and the same parser
+(`check_ospf_outage_events`, now accepting `peer_ip=None` to skip the IP
+filter when the log is already scoped to one site) now also run directly
+against each 1250 during the existing sweep, no new device-query pattern
+needed. Confirmed the 1250's clock is UTC (same as the 1800), so the
+existing UTC-in/Eastern-out timestamp formatting applies unchanged.
+
+The LDP fetch on the 1250 is best-effort, same as the existing hub-side LDP
+fetch: a failure there does not take down the OSPF sweep. Events from both
+sources are merged (deduplicated by timestamp+kind) before pairing, so
+either side's log can cover a gap in the other's retention -- same
+"coverage grows over time" philosophy `merge_drop_events` already uses for
+OSPF drops.
+
+State file note: `ospf_stability.py`'s persisted state gains one more key
+per site (`ldp_event_map_1250`), alongside the `ldp_event_map` (1800-side)
+and `ospf_transitions` keys added in v1.98.
+
+Also fixed in v1.99 (same day, prior to this entry): IXC Check's merged
+outage summary was split into separate "LDP Outages" and "OSPF Outages"
+blocks -- see that entry below for detail.
+
+---
+
+## v1.99 — 2026-09-14
+
+### IXC Check: split the merged outage summary into separate LDP and OSPF summaries
+
+`interface_check.py` was pulling one event list from the 1800 (`show ne
+events | grep <loopback>`) and bucketing every Down/Up into a single "OSPF
+Outages" block -- which silently mixed in LDP-Session events too, just
+unlabeled as such.
+
+Reasoning for the split (per pcapps): LDP session state and OSPF adjacency
+state are two different protocols riding the same link, and traffic can
+keep routing on an intact LDP session even while OSPF reconverges -- so an
+OSPF-only view can overstate an outage that never actually affected
+traffic. LDP is the better proxy for an actual IXC outage.
+
+No new device call -- same already-fetched event text, now split
+client-side in `output_builders.check_ospf_outage_events()` via a new
+`protocol` argument ("ldp" keeps lines containing the confirmed literal
+`LDP-Session` event-name substring; "ospf" keeps everything else -- a
+by-elimination match, documented in the function's docstring as not a
+confirmed OSPF-specific event name, since no OSPF-specific keyword has been
+seen in real 1800 event-log output). `interface_check.py` now prints both
+"LDP Outages: N" and "OSPF Outages: N" blocks, and both are included in the
+JIRA findings summary.
+
+**Not yet done, blocked on real device output**: pcapps also asked for a
+1250-side LDP check (`ospf_stability.py` already sources OSPF adjacency
+drops authoritatively from each 1250's own event log -- doing the same for
+LDP would be more authoritative than the current 1800-side-only source).
+Holding off on writing that parser until a real `show ne events [unreported]
+| grep LDP` sample from an actual 1250 is available, per this codebase's
+standing rule against guessing device output formats.
+
+---
+
+## v1.98 — 2026-09-14
+
+### New: OSPF Outages summary -- Down/Up paired, with uptime and downtime durations
+
+Every place this suite reports an OSPF/LDP drop count now also reports a
+paired outage history in one standard format:
+
+    OSPF Outages: <n>
+    1) Down    -> <timestamp> -> Uptime before drop: <duration>
+    2) Up/Full -> <timestamp> -> Downtime before up: <duration>
+    3) Down    -> <timestamp> -> Uptime before drop: <duration>
+    4) Up/Full -> <timestamp> -> Downtime before up: <duration>
+
+Previously, the "OSPF Drops" line in `interface_check.py` and the "LDP
+SESSION-DOWN HISTORY" section in `ospf_stability.py` only ever listed Down
+timestamps -- the matching Up/Full recovery was never captured, so there
+was no way to see how long an outage actually lasted or how long the
+circuit had been stable before it dropped.
+
+New shared helpers in `output_builders.py`: `pair_ospf_outages()` (pairs
+chronological Down/Up events into outages, computing both durations) and
+`format_ospf_outages()` (renders the standard block above). A Down with no
+earlier Up in the log window shows "unknown (no prior clear in log)"
+instead of guessing; a trailing Down with no clearing Up yet shows "still
+down (not yet cleared)".
+
+Updated to use it:
+- **`interface_check.py`** (IXC Check) -- the 1800-side device command
+  dropped its `| grep Down` filter (now pulls the peer's full event
+  history, not down-only) so the Up/Full side is available to pair against.
+- **`ospf_stability.py`**, LDP pipeline -- `LDP_EVENT_CMD` broadened from
+  `grep LDP-Session-Down` to `grep LDP-Session` for the same reason. Section
+  renamed "LDP SESSION-DOWN HISTORY" -> "LDP SESSION OUTAGE HISTORY", and
+  now deduplicated by router-id (a dual-homed site's identical history no
+  longer prints once per hub leg).
+- **`ospf_stability.py`**, OSPF adjacency pipeline (the fleet's
+  authoritative drop-count source, read straight from each 1250's own event
+  log) -- added `parse_ne_events_ospf_transitions()`, a sibling to the
+  existing `parse_ne_events_ospf_down()` that also keeps the Full/recovery
+  side. No additional device call: reuses the same `DEVICE_EVENT_CMD`
+  output already fetched for the drop-count columns. New "OSPF ADJACENCY
+  OUTAGE HISTORY" report section, site-level (same per-leg attribution
+  limitation the drop counts already have, documented inline).
+- **`ospf_events.py`** (standalone, 1250-side) -- paired its own
+  already-collected Down/Full event lists into the same outage format,
+  sourced entirely from the 1250, no 1800 involved. Added to both the report
+  and the JIRA summary.
+
+State file note: `ospf_stability.py`'s persisted state gains two new keys
+per site (`ldp_event_map`, `ospf_transitions`); the old `ldp_down_hits` /
+`ldp_down_hits_map` keys are no longer written (left alone, unused, in any
+state file that already has them from a prior version).
+
+No new device commands introduced -- existing greps were broadened to stop
+excluding the Up/Full side of the same read-only `show ne events` command
+already in use. `INTRUSIVE_COMMANDS.md` unaffected.
+
+---
+
+## v1.97 — 2026-09-11
+
+### New: INTRUSIVE_COMMANDS.md -- documented, will ship in every revision
+
+Prompted by a direct question worth having a durable answer to: does any
+tool in this suite send a command that changes a device's configuration?
+Audited every device-command call site across the whole codebase (~70 call
+sites) by reading each command string at its source, not assuming from
+function/variable names. Verdict, and full per-script breakdown, now lives
+in `INTRUSIVE_COMMANDS.md`.
+
+Short version: every command any tool actually EXECUTES against a device is
+read-only (`show`/`SHOW`/`ping`/session-display-only). Two tools --
+`ds1_gsx_test.py` (DS1 Test Builder) and `mux_loop_script.py` (MUX Loop
+Script) -- generate the literal TEXT of intrusive commands (AIS/loopback
+set-delete pairs, MUX `configure terminal`/`commit`/`clear cem circuit`) as
+part of a copy/paste runbook for a NOC engineer to run and reverse by hand;
+traced every one of those builder functions and confirmed the generated text
+only ever lands in a report string, never back into a `.run()` call.
+
+No functional code changed in this version -- documentation only. Ship this
+file going forward and keep it current whenever a new tool or device command
+is added (noted at the top of the file itself as a standing instruction).
+
+---
+
+## v1.96 — 2026-09-11
+
+### Added LAB as a fifth 1800 hub site
+
+`noe-util-01a` testing needed a lab 1800 (`ces01.lab3`, `10.255.41.255`) that
+isn't one of the four production hubs NetBox hub discovery returns. Added as
+`LAB` in `hub_registry.py`'s `VERIFIED_HUBS` fallback table (it will only
+ever resolve from there, never from NetBox, since NetBox doesn't track it)
+and added `lab` to `_SITE_RE` so both authorities that matter -- the device's
+own hostname once connected, and NetBox's own hostname parsing -- recognize
+it, not just the hardcoded table.
+
+While in there, consolidated a second copy of the same site-detection regex
+that `npt1800_client.py` had been maintaining independently (`_capture_hostname()`
+had its own literal `(atl|jfk|dfw|lax)` pattern for deriving `loc_code`) --
+now calls `hub_registry.site_from_hostname()` instead, so a future new site
+only needs updating in one place, per this module's own stated purpose.
+
+Updated the IXC Check web form's site dropdown (was a static, hardcoded
+`<option>` list -- the actual functional gap for the web UI specifically,
+since the backend validation already flows through `hub_registry` and would
+have accepted `LAB` either way) plus the cosmetic display strings elsewhere
+that listed the four sites.
+
+Note: this exact change was hand-applied directly on `noe-util-01a` before
+this version existed, to unblock same-day testing. This version supersedes
+that hand-edit with the same change, source-controlled -- deploy v1.96 there
+to replace it.
+
+---
+
+## v1.95 — 2026-09-11
+
+### Repackage fix -- v1.94.zip had a stray artifact in it, do not distribute it
+
+While testing the v1.94 portability fix (forcing `os.name = 'nt'` in a
+throwaway interpreter session to confirm Windows behavior was unchanged --
+see v1.94 entry below), `platform_paths.py`'s eager `os.makedirs(BASE_DIR,
+exist_ok=True)` ran against that forced value on a real POSIX filesystem,
+which doesn't treat `\` or `:` as path separators -- so it created a literal
+directory named `C:\Claude` inside the working folder instead of a Windows
+path. `zip -r .` then swept it into `v1.94.zip`. Harmless in practice (`:`
+and `\` aren't legal Windows filename characters, so it likely couldn't have
+extracted cleanly on a real Windows host, and it contained no credentials --
+just two old leftover test-run text files), but not something to ship.
+
+Fixed by excluding it from the zip build and rebuilding clean; verified with
+`unzip -l` that no `C:*` entries remain. **v1.94.zip should be discarded, not
+extracted, if it was already copied anywhere** -- use v1.95 instead. No code
+changes beyond the version bump; this is a packaging-only fix.
+
+---
+
+## v1.94 — 2026-09-11
+
+### Cross-platform portability -- the suite now runs on Linux, not just Windows
+
+First real run on noe-util-01a.lab1.bwnet.us (the Linux lab VM standing in
+for the eventual SNOW-automation host) failed immediately: NetBox showed
+"failed" and a 1250 Health Check produced `[JIRA] FAILED: Missing JIRA
+credentials`. Root cause was the same everywhere -- every credential/state
+path in this codebase was a hardcoded literal Windows path
+(`C:\Claude\autotester_config.txt`, plus every tool's `.txt` report output,
+`ospf_stability_state.json`, `gsx_hostkeys.json`), scattered across 18 files.
+On Linux that path simply doesn't exist, so every config read came back
+empty. This was already a known backlog item ("configurable paths / remove
+hardcoded C:\Claude") that had never been load-bearing until now.
+
+**New `platform_paths.py`** -- single source of truth for where the suite
+reads/writes. Resolution order: `CURVEBALL_HOME` env var override, else
+`C:\Claude` on Windows (unchanged -- pcapps's own machine needs zero
+migration), else `~/.claude` on Linux. Every one of the 18 files now builds
+its paths through `platform_paths.path(...)` / `platform_paths.BASE_DIR`
+instead of a literal string. Directory is created eagerly at import time
+(`exist_ok=True`, never raises).
+
+**`secure_config.py` -- keyring on Linux.** `JIRA_TOKEN`/`INFRA_PASS`/
+`GSX_PASS` went through `keyring` (Windows Credential Manager) with no
+fallback -- on a headless Linux VM with no desktop session, there's no
+Secret Service/KWallet daemon for keyring to talk to, so every secure key
+was silently forgotten between runs (re-prompting every time, never actually
+persisting). Fixed: `_keyring_backend_usable()` does a real set/get/delete
+round-trip probe (not just "is keyring installed") once per process; if that
+fails, falls back to a local JSON file (`~/.claude/.secure_fallback.json`,
+chmod 600 best-effort). Still plaintext -- explicitly a lab/demo posture,
+not a long-term one, and the code says so at the point it kicks in. Windows
+never touches this path; Credential Manager is always usable there.
+
+**`gsx_client.py` -- local OS `ping` was Windows-only.** `ping_host()` (used
+to find the live GSX mgmt card before SSHing in) hardcoded `-n`/`-w` flags,
+which don't exist on Linux `ping` (`-c`/`-W`, different units). Fixed with an
+`os.name` branch; success detection now trusts the process exit code first
+(portable) with the old string-matching kept only as a fallback.
+`HOSTKEY_STORE` also moved off the hardcoded path. `find_plink()` was
+already cross-platform-safe (tries bare `plink` via PATH first) -- no change
+needed there, though whether a Linux GSX path exists at all (no `plink` on
+Linux, and paramiko can't do the GSX's DSA-512 host key either) is still an
+open question, parked for live testing on the lab box.
+
+Compiled and round-trip tested (fake `CURVEBALL_HOME`, Windows-path logic
+forced via `os.name` override, keyring fallback file exercised end-to-end
+including permission bits) before packaging. All 18 files plus the new
+`platform_paths.py` compile clean.
+
+---
+
+## v1.93 — 2026-09-09
+
+### NNI/blast-radius: real traffic-passing check, and a terminology fix
+
+Live report showed `[NNI] NNI xe-ts16/3.548 is UP (OSPF Full)`. Two separate
+problems raised:
+  1. Wording conflated a sub-interface's OSPF adjacency (protocol-layer up)
+     with "the NNI is up" -- a sub-interface being OSPF Full says nothing
+     about whether traffic is actually passing. Also inconsistent with this
+     codebase's own convention elsewhere (see `autotester_standalone.py`),
+     which reserves "NNI" for the physical port and calls the sub-interface
+     the EVC/circuit.
+  2. No check ever confirmed traffic was actually moving -- only OSPF
+     adjacency state.
+
+Fixed both in `nni_check.py`:
+
+Wording -- `check_nni()`'s headlines for the "up" and "circuit-specific"
+verdicts now say "Sub-interface X is OSPF Full on physical NNI Y" instead of
+"NNI X is UP", and explicitly note this is protocol state only, not a
+traffic confirmation.
+
+Traffic check -- new, entirely separate section, queried against the
+PHYSICAL port (never the sub-interface): `show interfaces physical pm 15min
+<parent> | no-more`. Real output confirmed live 2026-09-09 (ces01.dfw1
+xe-ts16/3) already reports device-computed Average/Current pps and bps over
+the monitored window, so no need to poll twice and compute a delta
+ourselves. New `parse_interface_pm_15min()` parses it; new
+`assess_nni_traffic()` classifies AVERAGE pps (not Current -- a single
+sample can catch a momentary lull or burst, Average reflects the whole
+window) into:
+  - **no-traffic** -- flat zero pps both directions
+  - **keepalive** -- both directions <= 5 pps (user's rough call: "if its
+    something like 5pps just mark it as keepalive") -- protocol hellos only,
+    not real data
+  - **asymmetric** -- one direction real traffic, other <= 5 pps -- flags
+    possible one-way loss rather than being silently called "fine"
+  - **passing** -- both directions above the keepalive floor
+  - **unknown** -- command failed or output didn't parse; never guessed
+
+Reported as its own "TRAFFIC:" block in `render_block()`, never blended into
+the OSPF headline, and pushed into `assurance` findings independently
+(`to_findings()`) so a Full-but-keepalive-only or Full-but-asymmetric circuit
+surfaces as a real finding instead of reading clean.
+
+`check_nni()` gained an optional `pm_raw` param (same pattern as
+`alarms_raw`/`iface_raw`) so callers/tests can supply pre-fetched output.
+`interface_check.py` needs no change -- it already calls `check_nni()` with
+just `c`/`iface`/`hub_name`, so the new PM query and section come along
+automatically.
+
+---
+
+## v1.92 — 2026-09-09
+
+### IXC Check: fixed a real bug hiding the new OSPF/LDP drop check, then reworked its format
+
+Live run surfaced "LDP Session-Down history: skipped -- no IP found in
+interface config" on an interface that genuinely had one. Root cause: the
+interface-config command was stored in the `captured` dict keyed by the full
+command string INCLUDING its trailing `| no-more`, but the later lookup for
+that config blob was built without it -- the keys never matched, `cfg` was
+always empty, and BOTH ping and the v1.91 drop check silently skipped on
+every single run, not just this one. Fixed the lookup key to match exactly
+what was stored.
+
+Also reworked the check itself per direction:
+  - Broadened the match from LDP-Session-Down only to LDP-Session-Down OR
+    OSPF-adjacency-Down for the peer, matching the original two-stage grep
+    (`grep <peer-ip> | grep Down`) rather than the narrower LDP-only filter
+    v1.91 shipped with. New shared function `check_down_history()` in
+    `output_builders.py` replaces `check_ldp_down_history()` (kept as a
+    back-compat alias) -- word-boundary match on "Down" so "shutdown" text
+    doesn't false-positive.
+  - New timestamp format: `MM/YY - HHMMZ, HHMMEST` (or EDT), e.g.
+    `09/26 - 1307Z, 0907EDT`. Device timestamp is UTC (confirmed for the
+    1250 earlier this session; 1800 assumed the same NE-platform
+    convention). Eastern offset is DST-aware via a small hand-rolled US-DST
+    calculator (`_us_eastern_is_dst()`) rather than `zoneinfo`/`pytz` --
+    deliberately avoided a dependency on the `tzdata` package, which Windows
+    Python does not ship with by default and this tool has never otherwise
+    required.
+  - Moved to the bottom of the interface's own report block, single line:
+    `OSPF Drops: <count>, <timestamp>, <timestamp>, ...` -- both in the
+    detail section and the JIRA findings summary.
+
+Applied the same `check_down_history()` upgrade to `ospf_stability.py`'s LDP
+section (dedup/sort now keyed on the UTC timestamp, not the formatted
+display string, since `MM/YY` text sorts wrong across a year boundary).
+Deliberately did NOT broaden `ospf_stability.py`'s hub-side grep to a bare
+`Down` filter the way `interface_check.py`'s was broadened: that tool already
+tracks OSPF adjacency drops separately and more authoritatively from each
+1250's own event log (`drop_events` / the existing 24h-72h-7d-30d columns),
+and a bare `Down` grep against a hub's full 300+-day log with no per-site
+filter would be a much larger transfer than this tool's existing
+per-event-type greps, for data it already has from a better source.
+
+---
+
+## v1.91 — 2026-09-09
+
+### IXC-side (1800) tools: LDP session-down bounce history
+
+Question raised from live device output: "for fiber/ixc circuit checks, are
+we running `show ne events | grep <peer-loopback> | grep Down` in all the
+tools?" Answer was no -- reviewed every tool that does IXC-side (1800) OSPF/
+LDP checks and pushed the same check to each one that was missing it.
+
+New shared helpers in `output_builders.py`:
+  - `parse_subint_ip()` -- pulls a sub-interface's own IP out of
+    `show configuration interfaces ... | display-set` output.
+  - `derive_1250_subint_ip()` -- 1800 sub-int IP -> 1250 sub-int IP (4th
+    octet - 1; the 1800 side is always odd by design, so this always lands
+    on an even octet -- confirmed, not assumed).
+  - `derive_1250_loopback()` -- 1250 sub-int IP -> 1250 loopback IP. First
+    two octets carried over UNCHANGED (never hardcoded), third forced to
+    `130`, fourth = sub-int's own 4th octet / 2. Refuses to guess and
+    returns `None` if that octet isn't evenly divisible by 2, rather than
+    producing a wrong IP silently.
+  - `check_ldp_down_history()` -- parses `LDP-Session-Down` events for a
+    specific peer loopback out of a `show ne events` blob into a list of
+    timestamps.
+
+Deliberately reads the FULL `show ne events` log, not `| unreported` --
+confirmed live that `unreported` gets crowded out by unrelated churn within
+roughly an hour to a day, while the full log held matching entries 300+
+days old.
+
+Applied to:
+  - `interface_check.py` (IXC Check) -- derives the peer's loopback from the
+    sub-interface config already being pulled, runs the grep, and reports
+    hit count + timestamps in both the detail output and findings summary.
+    Skips cleanly (not guessing) when the sub-int has no IP or the derived
+    octet isn't evenly divisible.
+  - `ospf_stability.py` -- simpler case, already keyed by loopback IP (=
+    router-ID) with no derivation needed. Pulls `show ne events | grep
+    LDP-Session-Down` once per hub poll (covers every site on that hub in
+    one call), matches each site's hits client-side, and reports them in a
+    new "LDP SESSION-DOWN HISTORY" section. Kept as its own field --
+    deliberately NOT merged into the existing OSPF `drop_events` / drop-count
+    columns, since that pipeline is sourced from a different device (the
+    1250's own log) with its own timestamp format; conflating the two would
+    risk corrupting an already-relied-on counting/provenance model. Merged
+    (not overwritten) across hub polls so a dual-homed site's two legs, each
+    logged independently by its own hub, don't clobber each other.
+
+`nni_check.py` deliberately excluded -- it's built around whole-port
+blast-radius across many siblings' OSPF states, not a single peer's LDP
+history, so this check doesn't have a natural home there.
+
+---
+
+## v1.90 — 2026-09-03
+
+### NNI/blast-radius: disambiguate "not in OSPF neighbour table" with a direct probe
+Question: does 'show ospf interface <iface>' (Nbr column) give a more
+direct read on OSPF status than inferring from an empty neighbour-table
+lookup? Confirmed live: yes -- Nbr is a direct adjacency-count signal, and
+the command explicitly confirms whether OSPF is even configured on that
+interface (rules out "typo'd/wrong interface" and "OSPF not configured
+here" as causes, which a bare neighbour-table miss can't distinguish).
+
+Kept the existing `show ospf neighbor` design as the primary check --
+that's a deliberate one-call-gets-the-whole-port-plus-siblings design the
+blast-radius feature depends on, not something to replace. Added
+`show ospf interface <iface>` as a single targeted fallback probe, fired
+ONLY when the primary lookup doesn't find the target at all:
+  - Nbr == 0 confirmed -> treated as a confirmed DOWN, fed into the normal
+    down-handling verdict branches (V_CIRCUIT/V_MULTI/V_PORT_EVENT) so
+    blast-radius awareness still applies, instead of a generic "unknown."
+  - Interface not listed by the probe either -> distinct headline: OSPF
+    likely isn't configured on this NNI at all (not necessarily a fault).
+  - Interface listed with Nbr > 0 despite being absent from the neighbour
+    table -> flagged as a genuine inconsistency between the two commands,
+    not silently trusted either way.
+  - Probe unavailable (no device / probe call failed) -> original hedge
+    message, unchanged.
+
+Bug caught in testing: the confirmed-down target was never added to
+`siblings` (only populated from the neighbour-table scan that didn't find
+it), so `total_on_port`/`down_on_port` undercounted it by one and the "N
+other sub-interface(s)" headline went negative. Fixed by inserting the
+target into `siblings` and recomputing port counts when the probe confirms
+Nbr 0.
+
+Tested: reproduced the real report's exact shape (44 Full siblings, target
+absent from `show ospf neighbor`, probe confirms Nbr 0) -- now correctly
+reports 45 total / 1 down, verdict `circuit-specific`, instead of `unknown`
+/ "cannot confirm." Also verified the not-found and inconsistent-Nbr
+branches, and confirmed the no-probe-available path is byte-identical to
+the prior hedge message.
+
+---
+
+## v1.89 — 2026-09-03
+
+### Job poller: stop silently polling a dead job forever
+Observed live: the Flask dev server's file-watcher reloaded mid-run (a code
+change saved while an Autotester job was active), which wipes the in-memory
+`JOBS` dict on restart. The browser kept polling the now-unknown job id
+every 2s -- server correctly answered 404 with `{"error": "Unknown job
+id."}`, but that body has no `status` field, so `pollStatus()` in
+`static/job.js` (only handles `status === running|done|error`) fell through
+every branch silently. Result: infinite dead polling, UI frozen on stale
+"Running..." with zero indication anything went wrong.
+
+Fixed: `pollStatus()` now checks `!res.ok` before touching `data.status`,
+stops the poll timer, and shows "Lost this job -- the server likely
+restarted while it was running (...). Please re-run." This isn't
+reload-specific -- any real crash/restart mid-run would hit the same dead
+end, so this covers that case too, not just live-dev edits.
+
+Verified: `node --check` on the modified file.
+
+---
+
+## v1.88 — 2026-09-02
+
+### IXC Check ping-skip bug: regex never matched real config, not a missing IP
+Reported: NNI sub-interface config genuinely has an IP (visible in the same
+report's own Interface Config dump), but the tool printed "interface config
+read OK but contains no 'family inet address' -- skipping ping."
+
+Root cause confirmed: `re.search(r"set family inet address (...)"...)`
+required "set" and "family inet address" to be contiguous. Real Junos
+display-set output is `set interfaces xe-ts16/2 unit 330 family inet
+address 10.111.130.11/30` -- the interface name and unit number sit
+between "set" and "family", so this pattern could never match real output,
+in either place it existed (`interface_check.py`, `npt1800_client.py`'s
+standalone test harness). The endpoint-derivation logic right below it
+(local IP, last octet -1 -- confirmed correct, matches the documented
+convention) was fine and simply never ran because the match never fired.
+
+Fixed both: dropped the "set" prefix requirement --
+`re.search(r"family inet address (...)"...)`. Verified against the exact
+line shape from the live report (`...unit 330 family inet address
+10.111.130.11/30`) -- now matches and correctly derives the 10.111.130.10
+ping target.
+
+---
+
+## v1.87 — 2026-09-02
+
+### MUX-side SONET PM check (facing the 1800) -- confirmed gap, now covered
+Direction: does the tool check MUX PMs facing the 1800? Answer was no --
+confirmed a real gap, not silent under-reporting. The MUX block checked
+facility alarms, CEM connection state, and working/protect conflict, but
+the only SONET PM error-counter check anywhere (`OC12_COUNTERS`) was
+sourced entirely from the **1800**'s own `show interfaces physical pm`, not
+the MUX's side of that same OC12/SONET-ACR path.
+
+- `mux4216_client.py`: `query_batch()` now pulls `show controllers sonet
+  <active_sonet> | no-more` once `active_sonet` is resolved (cached per
+  unique interface within a run -- DS1s sharing a SONET path don't repeat
+  the call), stashed as `mux_results[ds1]["sonet_pm"]`. `| no-more`
+  required even though this client already sends `terminal length 0`
+  post-login -- this specific command's output is long enough to still
+  need it (confirmed live on jfk1-mux-02).
+- `output_builders.py`: new `check_mux_sonet_health()` reads the device's
+  own current-state summary (`Active Defects` / `Detected Alarms` /
+  `Asserted/Active Alarms`), NOT the SECTION/LINE LOS/LOF/AIS/RDI/REI
+  counts above them -- those are cumulative since-boot/since-clear counts,
+  not current state, and would false-flag a healthy circuit that had one
+  historical blip. Current 15-min interval's CV/ES/SES/SEFS shown as
+  context, not flagged (a partial in-progress bin reading 0 doesn't mean
+  much either way).
+- Wired into the MUX block of `build_diagnostic_summary()`'s full-route
+  branch, between the facility-alarm/Netbox-conflict lines and CEM
+  connection state (matches the existing read order).
+
+Tested: fed `check_mux_sonet_health()` the user's live jfk1-mux-02 output
+(clean) and a synthetic dirty variant (`Detected Alarms: LRDI`) --
+correctly clean on the real sample, correctly flags on the dirty one.
+
+### Diagnostic Summary: GSX and MUX sections now show IP
+Direction: 1250 and 1800 already show their IP in this report; GSX and MUX
+didn't. Both already had the IP sitting in already-collected data
+(`mux.get("mux_ip")`, `mux.get("gsx_ip")` -- the latter already stashed by
+`autotester_standalone.py`'s GSX-hop resolution) -- no new collection
+needed, just added to the existing name lines:
+`GSX  --  <node>  (<ip>)  (current 15 min / 24 hr)` and
+`MUX  --  <name>  (<ip>)`.
+
+---
+
+## v1.86 — 2026-09-01
+
+### NNI / blast-radius check — "one ticket, not fifty"
+
+**The problem.** When circuits fail, the NOC works the queue ticket by ticket and
+opens an IXC ticket per EVC. If the NNI carrying those circuits is down, every
+one of those tickets is the same outage reported N times — effort wasted, and the
+actual fault (one port) buried under its symptoms (many circuits). Any tool
+reporting circuit status should look ONE LEVEL UP: a circuit-down report is only
+actionable if its NNI is up.
+
+**Two levels of blast radius.** An 1800 NNI is a sub-interface — `xe-ts16/2.111`
+is one 1250 site, and every EVC at that site rides it. Its physical parent
+`xe-ts16/2` carries many such sub-interfaces, i.e. many sites. So:
+
+```
+sub-interface down  ->  every circuit at that one site
+physical port down  ->  every circuit at every site on that port   <- one ticket
+```
+
+**Built from proven commands only.** Deliberately no new device syntax, because
+guessing at output format is what produced the LAXGSX04 / 11-2-28 wrong-circuit
+report:
+
+- `show ospf neighbor | no-more` — one call lists every 1250 on the hub with its
+  interface and adjacency state, parsed by the already-verified
+  `parse_ospf_neighbors()`. That single call yields the target NNI's state **and**
+  every sibling on the same physical port — the blast radius, free.
+- `show ne alarms | match "<parent>" | no-more` — row presence means alarm (the
+  convention already used in this codebase). Rows are **counted, never
+  column-parsed**, so no format is assumed.
+
+Anything not obtainable from those two is reported as `unknown` rather than guessed.
+
+**New `nni_check.py`** — `check_nni()` returns one of five verdicts:
+
+| Verdict | Meaning |
+|---|---|
+| `nni-up` | NNI Full — a circuit fault here is genuine |
+| `circuit-specific` | this NNI down, its siblings Full — ticket it |
+| `multiple-circuits` | ≥2 down but not a majority — look for a common cause first |
+| `port-event` | ≥2 down **and** ≥50% of the port — **ONE ticket, not per EVC** |
+| `unknown` | not in the neighbour table; state not confirmable from OSPF alone |
+
+Thresholds are explicit constants (`PORT_EVENT_MIN_DOWN=2`,
+`PORT_EVENT_MIN_SHARE=0.5`). Integrates with `assurance.py`, categorising a
+port-level event as `partial-application` — reporting one circuit as faulty while
+its whole port is down is a true statement that gives a false picture.
+`check_nni()` never raises for device or parse reasons.
+
+**OSPF Stability: port rollup at zero cost.** It already polls
+`show ospf neighbor detail` on every hub, so every interface and state is
+in hand — `port_rollup()` groups by physical port with **no extra device calls**.
+A new `PORT-LEVEL EVENTS` section sits high in the report footer (*"read these
+BEFORE ticketing circuits"*), listing each affected port, its down/total share,
+and the affected sites. Port events also print in the live progress log. Ports are
+keyed per-hub, so the same port name on two hubs never merges.
+
+**Interface Check:** now runs the full NNI/blast-radius block (one extra command)
+and renders it in the report.
+
+**Scope note — TDM tools not yet covered.** `autotester_standalone`,
+`site_sweep`, `health_check` and `ds1_gsx_test` trace *TDM* circuits whose 1800
+hop is an **OC12** toward the MUX, not an Ethernet `xe-` NNI. That needs a
+different check against different commands, and it is not attempted here rather
+than pretending this one applies.
+
+**Verified:** 46 checks on `nni_check` (every verdict path, alarm counting,
+threshold boundaries, and that bad input — an IP, a physical-only interface,
+empty/garbage output, a dead SSH session — is reported and never raised) plus 21
+on the OSPF port rollup.
+
+---
+
+## v1.85 — 2026-09-01
+
+### OSPF Stability: one row per ADJACENCY, not per site (+ Interface column)
+
+The report was one row per site, which forced two lossy aggregations on the ~68
+dual-homed sites: **state = worst leg** and **uptime = minimum leg**. A site with
+a healthy 9-day leg and a leg that came up 30 seconds ago rendered as a single
+row reading `Init / 30s` — the healthy leg was invisible. And the **interface**,
+the actual circuit identifier an engineer acts on, was parsed and then discarded.
+
+Now one row per adjacency. State, uptime and interface are per-leg and **exact**.
+A dual-homed site appears twice with its legs on adjacent rows (sort is
+hostname, then hub).
+
+**16 columns** (was 14): `Hostname · Router-ID · Hub 1800 · Interface · Legs ·
+State · Uptime · Site 24h · Site 72h · Site 7d · Site 30d · Last Drop ·
+Count Trust · Oldest Evt (d) · Source · Last Poll`.
+
+**New `Legs` column — a diagnostic the drop counts cannot give.** Comparing the
+two legs' *uptimes* answers whether one event took both adjacencies:
+
+- `legs together` — uptimes agree within `LEG_SYNC_TOLERANCE_S` (120 s), so both
+  came up in the same event, so both went **down** in the same event. Points at
+  the site's transport, not either hub. Observed on DLTHMNME624, where 3 of 4
+  drops hit both hubs in the same second.
+- `legs differ` — independent, so hub- or path-specific.
+- `single-homed` / `unknown` (a leg's uptime didn't parse).
+
+Derived purely from hub-reported uptime, which is exact. Nothing inferred.
+
+**Drop counts stay SITE-scoped, and the headers now say so** (`Site 24h` etc.).
+The device event log identifies its peer by router-id, and the hub poll never
+learns each hub's own router-id, so attributing an event to one leg would need an
+inference this tool has no evidence for. Rather than guess, the columns are
+labelled and the `Legs` column carries the per-leg signal instead.
+
+**`Count Trust` is now sharper.** It previously compared *minimum uptime across
+legs* against site-aggregated drops — a mushy comparison on dual-homed sites. Now
+each leg's own uptime is checked, so a young leg on an otherwise-stable site is
+caught. **Expect the fleet SUSPECT count to differ from a per-site baseline;
+this is the check getting more sensitive, not a regression.**
+
+**Also:** progress log and report header now distinguish adjacency rows from
+unique sites, and the run reports how many dual-homed sites show
+`legs together`. Excel summary block and charts moved right (data now spans
+A–P, spacer Q, summary R–Y).
+
+**Verified:** 33 checks. Two real bugs caught by the tests during development —
+a duplicated `State` header that pushed `Last Poll` off the end, and
+mis-mapped centre-alignment columns. A third "failure" turned out to be the
+test's expectation being wrong and the code right: a 9-day leg on a site whose
+log shows no drops in 30 days **is** a genuine contradiction and correctly flags
+SUSPECT.
+
+---
+
+## v1.84 — 2026-09-01
+
+### New `assurance.py` — shared machinery for failing loudly on prod gear
+
+Every serious bug found in this suite has had the same shape: it failed
+**silently** and produced output that looked structurally valid. None threw an
+exception; none looked broken. What caught nearly all of them was not diligence
+— it was that two independent numbers had to agree and something compared them.
+
+This module makes that pattern the path of least resistance instead of something
+re-invented per tool. Before it: ~120 ad-hoc `[!]` markers, 25 `_conflict`
+fields, 9 `WARNING:` strings and 7 `_flag` variables across four files, each with
+its own convention.
+
+**Nine failure categories** as `CAT_*` constants, so the taxonomy lives in code
+rather than a document nobody opens: `never-armed`, `self-retiring`,
+`reporting-into-void`, `partial-application`, `fails-as-success`,
+`structurally-blind`, `never-proven`, `drift-by-accretion`, `lost-tooling`.
+Eight of the nine were hit for real in this suite during 2026-08/09.
+
+**Seven mechanisms:**
+
+| Mechanism | Counters | Real bug it would have caught |
+|---|---|---|
+| `contradiction()` | fails-as-success, partial, blind, drift | paginated read: uptime said 6 h, log said 0 drops in 24 h |
+| `assert_fresh()` | self-retiring | stale hub map rendering identically to a fresh one |
+| `Coverage` | partial-application | *"read 1 page of 47"* instead of silence |
+| `suppression()` | never-armed | a permanent mute is indistinguishable from a broken check |
+| `record_delivery()` | reporting-into-void | Slack armed in the UI, silently no-op with no webhook |
+| `require_artifact()` | lost-tooling | v1.81 in the UI with no zip on disk |
+| `self_test()` | never-armed, never-proven | proves the ALARM fires, not just that the check passes |
+
+`contradiction()` is the highest-value one and the cheapest: unlike a delivery
+receipt or a clock it needs **no external oracle**, only two paths to the same
+answer.
+
+**Provenance** tags every reported value — `measured` / `cached` / `proven-zero`
+/ `inferred` / `fallback` / `unreachable` — and `untrusted_share()` reports what
+fraction is not directly observed. A number with no stated source is how
+fails-as-success hides.
+
+`footer()` renders one standard block (coverage, provenance, delivery, findings,
+verdict), replacing the four hand-rolled versions in the suite.
+
+**Deliberately not adopted anywhere yet.** Retrofitting OSPF Stability would mean
+re-validating two days of hard-won verification against a refactor for cosmetic
+gain. Adoption is for new tools, and opportunistic when a tool is already being
+touched. Stdlib only — an assurance layer that breaks on a missing dependency is
+its own failure mode.
+
+**Verified:** 46 checks. Every mechanism is tested to both stay silent on good
+input *and* fire on bad — including the module's own `self_test()` being caught
+out by a check that never fires, a check that false-alarms, and a check that
+raises. `python assurance.py` prints a worked example seeded with the five real
+defects from this suite.
+
+---
+
+## v1.83 — 2026-09-01
+
+### Consolidated hub identity onto NetBox — new `hub_registry.py`
+
+Removes the *cause* of the v1.82 LAX/DFW mislabel rather than the instance. The
+same fact — which 1800 hub is at which management IP and what it's called — was
+hardcoded in **two** places:
+
+```
+npt1800_client.HUB_IPS         IP   -> {name, ip}
+interface_check.SITE_TO_1800   SITE -> IP
+```
+
+On 2026-07-08 the mapping was verified live and `SITE_TO_1800` was corrected.
+`HUB_IPS` was not. Two copies of one fact, one updated — LAX reported as DFW for
+~2 months. Anything fixed in one copy can rot in the other, so the second copy
+is now gone.
+
+**New `hub_registry.py` — authority order:**
+
+1. **The device itself.** Once connected, the hub's own hostname (`ces01.lax1`)
+   states where it is. Nothing can drift from that, so it always wins —
+   `name_from_hostname()`. Note `npt1800_client._capture_hostname()` was already
+   deriving `loc_code` this way; the authoritative answer was on the box the
+   whole time, just not used for the hub *name*.
+2. **NetBox.** Needed for site → IP, since the IP must be known before we can
+   connect and ask. OSPF Stability already discovers hubs this way and has never
+   been wrong about hub identity.
+3. **`VERIFIED_HUBS` in `hub_registry.py`** — fallback only, so a NetBox outage
+   can't take these tools offline. Used **with a visible warning**, never silently.
+
+**Drift detection.** When NetBox and the fallback disagree, both values are
+reported and NetBox wins — the disagreement is never resolved quietly. This is
+the check that would have caught the original bug:
+
+```
+[!] DRIFT for LAX: NetBox says 10.111.140.99 but hub_registry fallback
+    says 10.111.131.254 -- one is stale, NetBox is authoritative
+```
+
+Sites present in the fallback but missing from NetBox are also reported, and the
+fallback fills the gap rather than dropping the site.
+
+**Changes:**
+- `npt1800_client.HUB_IPS` literal is now **empty**, populated at import from
+  `hub_registry.build_hub_ips()`. Kept as a name only for backward compatibility.
+- `query_batch()` resolves the hub name hostname-first, then registry, then the
+  legacy dict — and its error message no longer says "not in HUB_IPS map".
+- `interface_check.SITE_TO_1800` is built from `hub_registry.build_site_to_ip()`;
+  `run()` resolves live via `site_to_ip()` and prints the provenance.
+- `interface_check` now **cross-checks the requested site against the site the
+  device reports**, emitting `[!] SITE MISMATCH` when they differ — the same
+  two-source principle as OSPF Stability's `Count Trust`.
+- `npt1800_client.main()`'s hardcoded `[10.111.131.254]` prompt default now comes
+  from the registry and lists all known hubs. Its interface parsing also picked
+  up the `rsplit(".", 1)` and `/` checks from v1.82's `interface_check` fix.
+- Dropped dead `HUB_IPS` imports from `autotester_standalone.py` and
+  `mux_loop_script.py` (imported, never used).
+- Legacy `132.x` / `135.x` IPs live in `hub_registry.LEGACY_IPS`, resolve with
+  source `"legacy"` and an "unverified" name, so they can't be quoted as fact.
+
+**Verified:** 27 checks across five scenarios — NetBox down (fallback + warning),
+NetBox agrees (no warnings), NetBox disagrees (drift reported, NetBox wins),
+NetBox partial (missing sites reported, fallback fills), and device hostname
+correct even when the map is deliberately drifted. Plus a codebase scan
+confirming no hub-IP mapping literals remain outside `hub_registry.py`.
+
+---
+
+## v1.82 — 2026-09-01
+
+### FIXED: LAX circuits reported as DFW for ~2 months (HUB_IPS mislabel)
+
+`npt1800_client.py` `HUB_IPS` mapped `10.111.131.254` to `"DFW-1800"`. That box
+is **LAX** (`ces01.lax1`). Every tool reading `HUB_IPS` for a hub *name*
+inherited the error — the IP used for connection was correct, only the label
+was wrong, so nothing failed loudly.
+
+Surfaced by a **Morning Check** FULL T1 ROUTE for `SLKCUTMA660 ts1/25`, showing
+`HOP 2 Hub: DFW-1800 (10.111.131.254)` feeding `HOP 3 MUX: LAX1-MUX-02`. The MUX
+was right; the hub label was not.
+
+This was already diagnosed on **2026-07-08** (TODO.md: *"Definitive SITE -> 1800
+IP map ... clears the old HUB_IPS 'DFW-1800' mislabel"*) and corrected in
+`interface_check.py`'s `SITE_TO_1800`, but **the fix was never applied to
+`HUB_IPS` itself**. Two maps of the same fact, one updated.
+
+Verified four hubs are now:
+```
+10.111.130.254  ATL-1800      10.111.131.254  LAX-1800   <-- was DFW-1800
+10.111.130.255  JFK-1800      10.111.131.255  DFW-1800
+```
+The unverified `132.x` / `135.x` entries are absent from the definitive map and
+are not returned by NetBox hub discovery (which finds exactly the four above).
+Retained so existing lookups don't start returning `None`, but renamed to
+`"... (unverified)"` so they can't be quoted as fact. **NetBox is authoritative;
+these hardcoded maps drift.**
+
+### FIXED: wrong GSX endpoint selected — node, slot AND T1 all from another circuit
+
+**This is the real cause of the bad HOP 4 data.** Reported on
+`SLKCUTMA660 ts1/25` (ACR 16, CEM 112): tool emitted `LAXGSX04 / 11-2-28`,
+truth is `LAXGSX01 / 12-2-12`. Node, slot and T1 all wrong — port 2 matched only
+by coincidence.
+
+Since node and slot come from `p[0]`/`p[1]` of the T3 controller *description*,
+both being wrong meant the tool had read **a different circuit's controller** —
+i.e. `gsx_ce_iface` itself was wrong. Three compounding bugs in the xconnect
+parse (`mux4216_client.py`):
+
+1. **The inner `break` exited only the inner loop.** The outer `for line` loop
+   continued, so each later matching line **overwrote** the earlier result —
+   **the last match won, not the first.** Never intended.
+2. **`if "CE{acr}:{cem}" in line` is an unanchored substring.** `CE16:1120`
+   contains `CE16:112`, so a neighbouring circuit's line matched. The device-side
+   `| i {acr}:{cem}` has the same flaw, so several lines came back to iterate.
+3. Together: multiple lines matched and the last one's endpoint
+   (`CE8/2/10:128`) was used. `128 % 100 = 28` — exactly the wrong T1 reported.
+   The true CEM id is `112`, and `112 % 100 = 12` — the correct T1.
+
+Now:
+- CE token matched with an **anchored** regex (`CE{acr}:{cem}(?!\d)`), so
+  neighbouring circuits can't match
+- **all distinct candidate endpoints collected**, first-match-wins deterministically
+- a single candidate is used silently; **more than one raises a
+  `[!] GSX ENDPOINT AMBIGUOUS` banner** listing every candidate plus the raw
+  xconnect output, warning that node/slot/port/T1 may *all* belong to another circuit
+- on ambiguity, prefers the endpoint whose CEM id equals the ACR-side CEM group
+  (held true in the one case verified against the GSX) but still flags it —
+  one confirmed case is not a rule
+- `RuntimeError` on no match now includes the raw output
+
+Verified by replaying the reported case: old logic reproduces `CE8/2/10:128` →
+T1 28; new logic selects the `:112` endpoint → T1 12. Anchoring rejects both
+`CE16:1120` and `CE116:112`.
+
+**VERIFIED LIVE 2026-09-01** — same circuit re-run after the fix, every field now
+matches the GSX:
+
+| Field | Before | After | Truth |
+|---|---|---|---|
+| Hub | DFW-1800 | LAX-1800 | ✓ |
+| GSX CE | CE8/2/10:128 | CE8/0/19:112 | ✓ |
+| Node | LAXGSX04 | LAXGSX01 | ✓ |
+| GSX IP | 192.168.45.20 | 192.168.45.3 | ✓ |
+| Assignment | 11-2-28 | 12-2-12 | ✓ |
+| T1 Command | T1-1-11-2-28 | T1-1-12-2-12 | ✓ |
+
+No ambiguity banner raised — after anchoring exactly one candidate matched, so the
+correct endpoint was selected outright. The real CE interface is `8/0/19`; the
+`:112` CEM id was predicted correctly, the interface portion was not (the
+pre-fix test fixture guessed `12/2/12`).
+
+Note: the "two T1 sources disagree" symptom was itself caused by this
+wrong-endpoint bug. With the correct endpoint, `112 % 100 = 12` and the
+controller description's `-12` agree, so `T1 SOURCE CONFLICT` stays silent. The
+cross-check is retained as a guard, but the open question of which source wins is
+resolved — they agree when the endpoint is right.
+
+### Also FIXED: GSX T1 had two sources, one silently discarded
+
+`mux4216_client.py` parsed the T3 controller description as
+`NODE-SLOT-PORT-T1` (e.g. `LAXGSX04-11-2-14`), took node/slot/port from
+`p[0..2]`, then **discarded `p[3]` — the T1** — and derived T1 from
+`int(gsx_cem_id) % 100` instead.
+
+When the two sources disagree the report showed only the CEM-derived value with
+no indication of ambiguity. In the reported run `CE8/2/10:128` gave
+`128 % 100 = 28`, printing `Assignment: 11-2-28` and
+`T1 Command: SHOW T1 T1-1-11-2-28` — a command that may point at the wrong
+circuit.
+
+Both sources are now parsed and compared:
+- new `gsx_t1_desc` (from the description) and `gsx_t1_conflict` in `mux_results`
+- `build_route_block()` prints a `[!] T1 SOURCE CONFLICT` banner under the T1
+  command when they disagree, quoting both values
+- when they agree it prints `(T1 confirmed by controller description: ...)`
+
+The emitted value is unchanged (still CEM-derived) pending a live run to
+establish which source is authoritative — deliberately not guessing, since
+picking wrong would swap one silent error for another.
+
+### Added `| no-more` to 6 remaining Ribbon commands (audit)
+
+Full audit of every `.run("show ...")` in the suite, prompted by this bug class
+appearing twice in two days (`ospf_stability.py` v1.81, `interface_check.py`
+below). 44 show-style calls found; 27 already correct.
+
+Fixed (Ribbon/NPT — needs per-command `| no-more`):
+- `ds1_gsx_test.py` L313, L387 — `show configuration | display-set | match ...`
+  (**real risk**: config output paginates)
+- `autotester_standalone.py` L207, L209 — transceiver info / TCA
+- `site_sweep.py` L126, L129 — transceiver info / TCA
+
+**Not** changed: the 11 hits in `mux4216_client.py`. That is a Cisco NCS 4216
+which disables paging session-wide with `terminal length 0` post-login (L76);
+`| no-more` is not valid Cisco syntax and would break those commands.
+
+Re-audit: **0 Ribbon `show` commands remain without `| no-more`.**
+
+### FIXED: interface_check.py — four bugs
+
+Triggered by a report run against `ces01.jfk1` with interface `10.111.135.100`.
+
+1. **An IP was accepted as an interface name.** Validation was
+   `if "." not in iface`, which an IP satisfies. `split(".")` then yielded
+   `nni="10"`, `vlan="111"` (the first two octets), producing
+   `show configuration interfaces 10 unit 111` and a device syntax-error dump.
+   → new `validate_iface()` rejects IPs (naming the correct format), plus
+   missing `/`, missing `.vlan`, non-numeric VLAN. Split is now
+   `rsplit(".", 1)`.
+2. **No `| no-more` on any of the 5 commands.** Once a `---More---` prompt
+   appeared, the session fed the *next* command's characters to the **pager**
+   instead of the CLI — origin of `Can't open help file`, `No previous regular
+   expression`, stray `[Press 'h' for instructions.]`, and a trailing
+   `> 111 / syntax error`. Worse, **OSPF neighbour output ran past the pager
+   into the LDP section**, so the LDP heading sat above OSPF data.
+3. **`grep <vlan>` matched almost everything.** On 10.111.x.x, `111` hits the
+   second octet of nearly every address plus uptimes like `11m:51s` — one
+   interface check returned ~100 neighbours. Filters now use the full interface
+   name (measured: bare `111` matched 3/3 sample lines, `xe-ts16/2.111` → 1/3).
+4. **Misleading closing note.** *"No IP address found in interface config --
+   skipping ping"* read as a clean negative when the config command had
+   **errored**. New `_cmd_failed()` marks sections `[!] FAILED`, adds a failure
+   summary block, and distinguishes "config read OK, no inet address" from
+   "config command never ran".
+
+**Not yet run against a live device** — unit-tested only (23 checks).
+
+### Note on versioning
+`v1.81` (OSPF Stability tool + `| no-more` fix) was set in `app.py` but never
+zipped to `!Revisions`, so the tool page showed a version with no artifact.
+`v1.82` supersedes it and should be zipped.
+
+---
+
 ## v1.80 — 2026-08-17
 
 ### T1 assignment field: added a visible format example

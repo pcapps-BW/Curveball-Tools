@@ -224,6 +224,21 @@ function initJobForm(formId, panelSuffix) {
       return;
     }
 
+    // The 404 body ({"error": "Unknown job id."}) has no `status` field, so
+    // it fell through every branch below silently -- the poller kept hitting
+    // a dead job id every 2s forever with the UI frozen on stale "Running...".
+    // Most common cause: the dev server's file-watcher reloaded mid-run
+    // (e.g. a code change saved while a job was active), which wipes the
+    // in-memory job registry. Surfaced explicitly now instead of silently
+    // polling nothing (confirmed live 2026-09-03).
+    if (!res.ok) {
+      clearInterval(pollTimer);
+      statusMsg.textContent = 'Lost this job -- the server likely restarted while it was running ' +
+        '(' + (data.error || ('HTTP ' + res.status)) + '). Please re-run.';
+      statusWarning.style.display = 'none';
+      return;
+    }
+
     appendLog(data.log);
 
     // Page-specific hook: lets a template react to job data each poll
@@ -244,6 +259,10 @@ function initJobForm(formId, panelSuffix) {
       reportPanel.style.display = 'block';
       renderReport(data.report);
       downloadLink.href = data.download_url;
+      // Label matches the actual file being downloaded (.txt for a plain
+      // report, .xlsx for a workbook like OSPF & LDP Stability) instead of
+      // a hardcoded "Download .txt" that was wrong for Excel-output tools.
+      downloadLink.textContent = 'Download ' + (data.download_ext || '.txt');
       if (data.verdict) {
         const flagged = data.verdict.flagged || [];
         verdictBadge.style.display = 'inline-block';

@@ -43,6 +43,7 @@ import re
 import getpass
 import datetime
 
+import platform_paths
 from netbox_client import NetboxClient, load_netbox_config
 from device_base import CredentialError, prompt_ip
 from jira_client import post_report, valid_ticket
@@ -54,6 +55,7 @@ from gsx_client import GSXClient, find_plink, find_live_ip
 
 # Same MUX mapping the loop tool uses.
 from mux_loop_script import LOC_TO_MUX, _capture, _section, _ds1_parts
+from ds1_util import expand_ds1_list
 
 TOOL_INFO = {
     'name':     'DS1 Test Builder (AIS / Loops to GSX)',
@@ -192,7 +194,7 @@ def collect_inputs(session=None):
     if not ip_1250:
         return None
     ds1_raw = input("DS1(s) (e.g. ts1/1, ts1/2): ").strip().lower()
-    ds1_list = [d.strip() for d in ds1_raw.replace("&", ",").split(",") if d.strip()]
+    ds1_list, _ds1_notes = expand_ds1_list(ds1_raw)
     if not ds1_list:
         print("Need at least one DS1.")
         return None
@@ -311,7 +313,7 @@ def run(params, result_sink=None):
     cfg_1250 = ""
     for slot in slots:
         cfg_1250 += c1250.run(
-            'show configuration | display-set | match "chassis slot {} ces-card" '
+            'show configuration | display-set | match "chassis slot {} ces-card" | no-more '
             '| no-more'.format(slot)) + "\n"
 
     chassis_1250 = {}   # ds1 -> (card, verified_line)
@@ -385,7 +387,7 @@ def run(params, result_sink=None):
         m = re.search(r'(ts\d+)/(\d+)', oc_base)
         oc_slot = m.group(1) if m else None
         cfg = c1800.run(
-            'show configuration | display-set | match "chassis slot {} ces-card" '
+            'show configuration | display-set | match "chassis slot {} ces-card" | no-more '
             '| no-more'.format(oc_slot)) if oc_slot else ""
         # Narrow to this DS1's sts/vt line.
         entry = extract_1800_chassis(cfg, expect_sts=sts, expect_vt=vt)
@@ -478,7 +480,9 @@ def run(params, result_sink=None):
                 for d, v in gsx_assignments.items():
                     if v["gsx_node"] != node:
                         continue
-                    for cmd in ("SHOW T1 {} STATUS".format(v["t1_full"]),
+                    t3_full = "T3-1-{}-{}".format(v.get("gsx_slot","?"), v.get("gsx_port","?"))
+                for cmd in ("SHOW T3 {} STATUS".format(t3_full),
+                                "SHOW T1 {} STATUS".format(v["t1_full"]),
                                 "SHOW T1 {} STATISTICS".format(v["t1_full"])):
                         try:
                             out = g.run_command(cmd)
@@ -750,7 +754,7 @@ def _build_script(host_1250, ip_1250, hub_hostname, hub_ip, ds1_list, ds1_map,
 def _write(script_text, circuit_id):
     safe = re.sub(r'[^\w.-]', '_', circuit_id)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\DS1_Test_Script_{}_{}.txt".format(safe, ts)
+    out_path = platform_paths.path("DS1_Test_Script_{}_{}.txt".format(safe, ts))
     try:
         with open(out_path, "w") as f:
             f.write(script_text)

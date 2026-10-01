@@ -2,8 +2,11 @@
 """
 secure_config.py -- Credential manager for the Curveball tool suite.
 
-Passwords are stored in Windows Credential Manager via the keyring library.
-Non-sensitive config (usernames, emails, URLs) stays in autotester_config.txt.
+Passwords are stored in the OS's own credential store via the keyring library
+(Windows Credential Manager on Windows; Secret Service/KWallet on Linux, if
+one is actually running -- falls back to a locked-down local file otherwise,
+see _keyring_available() below). Non-sensitive config (usernames, emails,
+URLs) stays in autotester_config.txt.
 
 Sensitive keys managed here:
     INFRA_PASS    -- 1250 / 1800 / MUX password
@@ -23,15 +26,27 @@ Built by P. Capps.
 """
 
 import os
+import json
 import getpass
+
+import platform_paths
 
 try:
     import keyring
 except ImportError:
     keyring = None
 
-CONFIG_PATH   = r"C:\Claude\autotester_config.txt"
+CONFIG_PATH   = platform_paths.path("autotester_config.txt")
 KEYRING_APP   = "curveball"
+
+# Fallback store, used ONLY when keyring has no working backend to talk to
+# (confirmed live 2026-09-11 on noe-util-01a.lab1.bwnet.us -- a headless
+# Linux VM with no desktop session, so no Secret Service/KWallet daemon for
+# keyring to use). On Windows this path is never touched; keyring always has
+# Credential Manager there. Best-effort permission lockdown (chmod 600) on
+# POSIX -- still plaintext, so this is a lab/demo posture, not a long-term
+# one; see load_config()'s warning when this path is actually used.
+_FALLBACK_SECRETS_PATH = platform_paths.path(".secure_fallback.json")
 
 # Keys stored in Credential Manager (never written to disk as plaintext)
 SECURE_KEYS = ("INFRA_PASS", "GSX_PASS", "JIRA_TOKEN")
@@ -49,27 +64,98 @@ SECURE_PROMPTS = {
 
 
 # ── Keyring wrappers ──────────────────────────────────────────────────────────
+#
+# On Windows, keyring always has Credential Manager -- this whole fallback
+# path is dead code there. On Linux, keyring only works if a Secret Service
+# (GNOME Keyring) or KWallet daemon is actually running, which a headless
+# lab/automation VM typically doesn't have -- confirmed live 2026-09-11 on
+# noe-util-01a. Rather than silently forget every secure key on every single
+# run there (the old behavior: get/set would just fail, cfg[key] only lived
+# for that one process, so load_config() re-prompted every time), fall back
+# to a lightly-locked-down local file. Still plaintext -- fine for a lab/demo
+# box, explicitly NOT the long-term posture for a real deployment.
+
+_KEYRING_OK = None  # cached after first real probe -- avoid probing every call
+
+
+def _keyring_backend_usable():
+    """
+    Does keyring have an ACTUALLY working backend here, not just an installed
+    one? Some backends report present but fail at call time (e.g. no Secret
+    Service daemon actually running) -- so this does a real set/get/delete
+    round-trip on a throwaway key rather than trusting keyring.get_keyring().
+    """
+    if keyring is None:
+        return False
+    probe_key = "_curveball_probe"
+    try:
+        keyring.set_password(KEYRING_APP, probe_key, "x")
+        ok = keyring.get_password(KEYRING_APP, probe_key) == "x"
+        try:
+            keyring.delete_password(KEYRING_APP, probe_key)
+        except Exception:
+            pass
+        return ok
+    except Exception:
+        return False
+
 
 def _keyring_available():
-    return keyring is not None
+    global _KEYRING_OK
+    if _KEYRING_OK is None:
+        _KEYRING_OK = _keyring_backend_usable()
+        if not _KEYRING_OK:
+            print("  [secure_config] No usable keyring backend on this host -- "
+                  "falling back to {} (plaintext file, permissions locked "
+                  "down where the OS supports it). Fine for a lab/demo box; "
+                  "NOT a long-term credential-storage posture.".format(
+                      _FALLBACK_SECRETS_PATH))
+    return _KEYRING_OK
+
+
+def _read_fallback():
+    try:
+        with open(_FALLBACK_SECRETS_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_fallback(data):
+    try:
+        with open(_FALLBACK_SECRETS_PATH, "w") as f:
+            json.dump(data, f)
+        # chmod 600 -- best-effort; no-op/fails harmlessly on Windows where
+        # this path isn't reached anyway (keyring is always usable there).
+        try:
+            os.chmod(_FALLBACK_SECRETS_PATH, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        print("  [secure_config] fallback store write failed: {}".format(e))
 
 
 def get_password(key):
-    """Retrieve a password from Credential Manager. Returns None if not set."""
+    """Retrieve a password from the system credential store. Returns None if
+    not set. Falls back to the local file store if keyring has no usable
+    backend on this host (see _keyring_available)."""
     if not _keyring_available():
-        return None
+        return _read_fallback().get(key)
     try:
         return keyring.get_password(KEYRING_APP, key)
     except Exception as e:
         print("  [keyring] get '{}' failed: {}".format(key, e))
-        return None
+        return _read_fallback().get(key)
 
 
 def set_password(key, value):
-    """Store a password in Credential Manager."""
+    """Store a password in the system credential store, or the fallback file
+    if no usable keyring backend exists on this host."""
     if not _keyring_available():
-        print("  [keyring] not available -- password not stored securely.")
-        return False
+        data = _read_fallback()
+        data[key] = value
+        _write_fallback(data)
+        return True
     try:
         keyring.set_password(KEYRING_APP, key, value)
         return True
@@ -79,8 +165,12 @@ def set_password(key, value):
 
 
 def delete_password(key):
-    """Remove a password from Credential Manager."""
+    """Remove a password from the system credential store or fallback file."""
     if not _keyring_available():
+        data = _read_fallback()
+        if key in data:
+            del data[key]
+            _write_fallback(data)
         return
     try:
         keyring.delete_password(KEYRING_APP, key)
@@ -202,7 +292,10 @@ def load_config(path=CONFIG_PATH):
 
     # First-run setup: prompt for any missing secure keys
     if missing_secure:
-        print("\n  -- First-time credential setup (stored securely in Windows Credential Manager) --")
+        store_desc = ("the system credential store" if _keyring_available()
+                      else "a local fallback file -- no usable keyring backend "
+                           "on this host, see startup warning above")
+        print("\n  -- First-time credential setup (stored in {}) --".format(store_desc))
         for key in missing_secure:
             prompt = SECURE_PROMPTS.get(key, key)
             while True:
@@ -211,7 +304,7 @@ def load_config(path=CONFIG_PATH):
                     break
                 print("  Required -- cannot be blank.")
             if set_password(key, val):
-                print("  '{}' stored in Credential Manager.".format(key))
+                print("  '{}' stored in {}.".format(key, store_desc))
             cfg[key] = val
 
     return cfg

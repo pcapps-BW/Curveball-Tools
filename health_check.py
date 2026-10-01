@@ -17,6 +17,8 @@ import os
 import re
 import datetime
 
+import platform_paths
+
 try:
     import paramiko  # noqa: F401
     _DEP_ERROR = None
@@ -132,47 +134,54 @@ def run(params):
     except Exception as e:
         print("[!] connect failed: {}: {}".format(type(e).__name__, e))
         return None
-    host = c.hostname
-    print("  host: {}".format(host))
+    try:
+        # try/finally added 2026-10-01: the body below is long, and any
+        # exception in it used to return without closing the session.
+        # Harmless for a one-shot CLI run (process exits, socket drops) but
+        # NOT in the long-lived Flask app, where the transport and its
+        # reader thread would survive until the device timed the session out.
+        host = c.hostname
+        print("  host: {}".format(host))
 
-    lines = []
-    lines.append("NPT-1250 HEALTH CHECK")
-    lines.append("Host: {}  IP: {}".format(host, ip))
-    lines.append("=" * 64)
+        lines = []
+        lines.append("NPT-1250 HEALTH CHECK")
+        lines.append("Host: {}  IP: {}".format(host, ip))
+        lines.append("=" * 64)
 
-    # Sections too verbose for the console -- written to the .txt/JIRA only.
-    # (NE event logs can be hundreds of lines; user reads those in the file.)
-    CONSOLE_SUPPRESS = {"NE Events", "NE Events Unreported"}
-    console_lines = list(lines)   # console gets a copy sans the suppressed blocks
+        # Sections too verbose for the console -- written to the .txt/JIRA only.
+        # (NE event logs can be hundreds of lines; user reads those in the file.)
+        CONSOLE_SUPPRESS = {"NE Events", "NE Events Unreported"}
+        console_lines = list(lines)   # console gets a copy sans the suppressed blocks
 
-    raw_by_title = {}   # section title -> raw output, for the JIRA summary
-    for title, cmd in _build_command_list():
-        print("  collecting: {}".format(title))
-        raw = c.run(cmd + " | no-more")
-        raw_by_title[title] = raw
-        block = ["", "=" * 64, "  {}".format(title), "  CMD: {}".format(cmd), "=" * 64]
-        body = [ln.rstrip() for ln in raw.splitlines() if ln.rstrip()]
-        if body:
-            block.extend("  {}".format(ln) for ln in body)
-        else:
-            block.append("  (no output)")
-        lines.extend(block)
-        if title in CONSOLE_SUPPRESS:
-            # console: show the header + a pointer, not the full dump
-            console_lines.extend(["", "=" * 64, "  {}".format(title),
-                                  "  CMD: {}".format(cmd), "=" * 64,
-                                  "  (omitted from console -- see .txt / JIRA)"])
-        else:
-            console_lines.extend(block)
+        raw_by_title = {}   # section title -> raw output, for the JIRA summary
+        for title, cmd in _build_command_list():
+            print("  collecting: {}".format(title))
+            raw = c.run(cmd + " | no-more")
+            raw_by_title[title] = raw
+            block = ["", "=" * 64, "  {}".format(title), "  CMD: {}".format(cmd), "=" * 64]
+            body = [ln.rstrip() for ln in raw.splitlines() if ln.rstrip()]
+            if body:
+                block.extend("  {}".format(ln) for ln in body)
+            else:
+                block.append("  (no output)")
+            lines.extend(block)
+            if title in CONSOLE_SUPPRESS:
+                # console: show the header + a pointer, not the full dump
+                console_lines.extend(["", "=" * 64, "  {}".format(title),
+                                      "  CMD: {}".format(cmd), "=" * 64,
+                                      "  (omitted from console -- see .txt / JIRA)"])
+            else:
+                console_lines.extend(block)
 
-    c.close()
+    finally:
+        c.close()
 
     # Echo the report to the console (verbose event logs suppressed above).
     print("")
     print("\n".join(console_lines))
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\health_check_{}_{}.txt".format(ts, host)
+    out_path = platform_paths.path("health_check_{}_{}.txt".format(ts, host))
     try:
         with open(out_path, "w") as f:
             f.write("\n".join(lines))

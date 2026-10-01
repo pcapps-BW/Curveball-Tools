@@ -11,7 +11,8 @@ Trigger format (line 1 of JIRA description):
     1250: <IP>                -> Lite check: Fiber + OSPF only
     (no match)                -> Post "Scanned -- no automation triggers found."
 
-Config read from C:\\Claude\\autotester_config.txt:
+Config read from platform_paths.path("autotester_config.txt")
+(C:\\Claude\\autotester_config.txt on Windows, ~/.claude/... on Linux):
     JIRA_EMAIL=...            (non-sensitive, file)
     JIRA_ASSIGNEE_EMAIL=...   (non-sensitive, file)
     SLACK_WEBHOOK=...         (non-sensitive, file)
@@ -35,6 +36,8 @@ import datetime
 import getpass
 import base64
 
+import platform_paths
+
 try:
     import requests
 except ImportError:
@@ -57,8 +60,8 @@ TOOL_INFO = {
     'order':    5,
 }
 
-CONFIG_PATH   = r"C:\Claude\autotester_config.txt"
-OUTPUT_DIR    = r"C:\Claude"
+CONFIG_PATH   = platform_paths.path("autotester_config.txt")
+OUTPUT_DIR    = platform_paths.BASE_DIR
 JIRA_BASE_URL = "https://bandwidth-jira.atlassian.net"
 
 # Regex to parse description line 1

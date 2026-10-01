@@ -1,0 +1,84 @@
+============================================================
+CHANGES TO app.py  (v1.52 -- Morning Check)
+APPLIED 2026-08-06 -- see CHANGELOG.md v1.52 for the full list of fixes
+made on top of this staged draft (dead open_when_done param wired up,
+batch summary file so the report panel + Download aren't always blank,
+morning_check.html moved from the project root into templates/ where
+Flask actually looks for it, keyring added to requirements.txt).
+Kept here for history -- not read by anything at runtime.
+============================================================
+
+1. ADD to the import block at the top (after "import ds1_gsx_test"):
+
+    import morning_check
+
+
+2. ADD to TOOL_URLS dict:
+
+    "morning_check": "/tools/morning-check",
+
+
+3. ADD to _TOOL_MODULES list:
+
+    morning_check,
+
+
+4. ADD these two routes anywhere after the IXC Check routes:
+
+# ---- Morning Check ----------------------------------------------------------
+
+@app.route("/tools/morning-check")
+def page_morning_check():
+    return render_template("morning_check.html")
+
+
+@app.route("/api/morning-check/run", methods=["POST"])
+def api_morning_check_run():
+    f = request.form
+
+    assignee_email = (f.get("assignee_email") or "").strip()
+    if not assignee_email or "@" not in assignee_email:
+        return jsonify(error="Enter your JIRA assignee email."), 400
+
+    jira_email = (f.get("jira_email") or "").strip()
+    jira_token = (f.get("jira_token") or "").strip()
+    if not (jira_email and jira_token):
+        return jsonify(error="JIRA email and API token are required."), 400
+
+    infra_user, infra_pass = _creds(f)
+    gsx_user, gsx_pass = _creds(f, "gsx_user", "gsx_pass")
+    if not (infra_user and infra_pass):
+        return jsonify(error="Infrastructure username and password are required."), 400
+    if not (gsx_user and gsx_pass):
+        return jsonify(error="GSX username and password are required."), 400
+
+    slack_webhook = (f.get("slack_webhook") or "").strip()
+    dry_run       = f.get("dry_run") == "on"
+    open_when_done = f.get("open_when_done") == "on"
+
+    params = {
+        "jira_email":    jira_email,
+        "jira_token":    jira_token,
+        "assignee":      assignee_email,
+        "username":      infra_user,
+        "password":      infra_pass,
+        "gsx_user":      gsx_user,
+        "gsx_pass":      gsx_pass,
+        "slack_webhook": slack_webhook,
+        "dry_run":       dry_run,
+        "open_when_done": open_when_done,
+    }
+    # Morning check walks multiple tickets sequentially; each ticket can run
+    # 3 tools (Autotester ~6 min, Fiber ~1 min, OSPF ~1 min). Scale the
+    # hung warning generously -- 20 min floor, 10 min per ticket beyond that.
+    job_id = _launch_job(
+        "Morning Check ({})".format(assignee_email),
+        1200,
+        lambda: morning_check.run(params)
+    )
+    return jsonify(job_id=job_id)
+
+
+5. BUMP APP_VERSION:
+
+    APP_VERSION = "v1.52"

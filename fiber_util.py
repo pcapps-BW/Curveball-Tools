@@ -21,6 +21,8 @@ import re
 import os
 import datetime
 
+import platform_paths
+
 try:
     import paramiko  # noqa: F401
     _DEP_ERROR = None
@@ -168,7 +170,7 @@ def run(params):
     print("\n".join(lines))
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = r"C:\Claude\fiber_util_{}_{}.txt".format(ts, host)
+    out_path = platform_paths.path("fiber_util_{}_{}.txt".format(ts, host))
     try:
         with open(out_path, "w") as f:
             f.write("\n".join(lines))

@@ -49,16 +49,18 @@ import ds1_gsx_test
 import morning_check
 import site_sweep
 import ospf_stability
+import ixc_stability
 import secure_config
 
 from device_base import CredentialError
 from jira_client import valid_ticket
+from ds1_util import expand_ds1_list
 
 app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v1.81"
+APP_VERSION = "v2.14"
 
 
 @app.context_processor
@@ -179,6 +181,14 @@ def _scan_run_summary(report_text):
 
 # ---- generic job machinery (identical for every tool) --------------------
 
+# Output types that aren't text -- reading these with open(..., "r") produces
+# unreadable garbage in the report panel (found by pcapps 2026-09-14, on
+# ospf_stability.py's .xlsx report: the panel showed the raw zip/XML bytes of
+# the workbook instead of a report). Extend this set if another tool ever
+# returns a different binary format as its out_path.
+_BINARY_REPORT_EXTS = {".xlsx", ".xls", ".docx", ".pdf", ".zip"}
+
+
 def _run_job(job_id, run_callable):
     tid = threading.get_ident()
     with _THREAD_JOB_LOCK:
@@ -186,7 +196,14 @@ def _run_job(job_id, run_callable):
     try:
         out_path = run_callable()
         report_text = ""
-        if out_path and os.path.exists(out_path):
+        ext = os.path.splitext(out_path)[1].lower() if out_path else ""
+        if out_path and os.path.exists(out_path) and ext in _BINARY_REPORT_EXTS:
+            # Don't decode the binary file as text. The readable report
+            # already streamed to the live log via progress()/print() during
+            # the run (see _JobStdoutTee below) -- reuse that instead.
+            with JOBS_LOCK:
+                report_text = "\n".join(JOBS[job_id].get("log", []))
+        elif out_path and os.path.exists(out_path):
             with open(out_path, "r", errors="ignore") as f:
                 report_text = f.read()
         elif not out_path:
@@ -195,7 +212,8 @@ def _run_job(job_id, run_callable):
         verdict = _scan_run_summary(report_text)
         with JOBS_LOCK:
             JOBS[job_id].update(status="done", finished=time.time(),
-                                 report=report_text, path=out_path, verdict=verdict)
+                                 report=report_text, path=out_path, verdict=verdict,
+                                 download_ext=ext)
     except CredentialError as e:
         with JOBS_LOCK:
             JOBS[job_id].update(status="error", finished=time.time(),
@@ -246,6 +264,7 @@ def api_job_status(job_id):
     if job["status"] == "done":
         resp["report"] = job["report"]
         resp["download_url"] = "/download/{}".format(job_id)
+        resp["download_ext"] = job.get("download_ext") or ".txt"
         resp["verdict"] = job.get("verdict")
     elif job["status"] == "error":
         resp["error"] = job["error"]
@@ -277,11 +296,12 @@ TOOL_URLS = {
     "morning_check":         "/tools/morning-check",
     "site_sweep":            "/tools/site-sweep",
     "ospf_stability":        "/tools/ospf-stability",
+    "ixc_stability":         "/tools/ixc-stability",
 }
 _TOOL_MODULES = [
     autotester_standalone, npt1250_discovery, ds1_pms, fiber_util,
     ospf_events, health_check, gsx_perfmon, interface_check, mux_loop_script,
-    ds1_gsx_test, morning_check, site_sweep, ospf_stability,
+    ds1_gsx_test, morning_check, site_sweep, ospf_stability, ixc_stability,
 ]
 
 
@@ -316,7 +336,7 @@ def api_autotester_run():
     if not _valid_ip(ip_1250):
         return jsonify(error="Enter a valid 1250 IP (4 octets, e.g. 10.111.131.77)."), 400
     ds1_raw = (f.get("ds1_list") or "").strip()
-    ds1_list = [d.strip().lower() for d in ds1_raw.replace("&", ",").split(",") if d.strip()]
+    ds1_list, _ds1_notes = expand_ds1_list(ds1_raw)
     if not ds1_list:
         return jsonify(error="Enter at least one DS1 (e.g. ts3/8, ts3/9)."), 400
     infra_user, infra_pass = _creds(f)
@@ -431,7 +451,8 @@ def api_ds1_pms_run():
     if not _valid_ip(ip_1250):
         return jsonify(error="Enter a valid 1250 IP (4 octets, e.g. 10.111.131.77)."), 400
     ds1_raw = (f.get("ds1_list") or "").strip()
-    raw_entries = [e for e in ds1_raw.replace("&", ",").split(",") if e.strip()]
+    # Card expansion first ("ts1" -> all 28), then the tool's own validation.
+    raw_entries, _ds1_notes = expand_ds1_list(ds1_raw)
     if not raw_entries:
         return jsonify(error="Enter at least one DS1 (e.g. ts1/21, ts3/6)."), 400
     channels, verr = ds1_pms._parse_and_validate(raw_entries)
@@ -497,7 +518,7 @@ def api_ixc_check_run():
     f = request.form
     site = (f.get("site") or "").strip().upper()
     if site not in interface_check.SITE_TO_1800:
-        return jsonify(error="Select a valid site (ATL, LAX, JFK, DFW)."), 400
+        return jsonify(error="Select a valid site (ATL, LAX, JFK, DFW, LAB)."), 400
     iface = (f.get("interface") or "").strip()
     if not iface or "." not in iface:
         return jsonify(error="Interface must include a dot (VLAN sub-interface), e.g. xe-ts13/3.624."), 400
@@ -643,6 +664,33 @@ def api_ospf_stability_run():
     return jsonify(job_id=job_id)
 
 
+# ---- IXC Stability (BETA) ------------------------------------------------
+
+@app.route("/tools/ixc-stability")
+def page_ixc_stability():
+    info = ixc_stability.TOOL_INFO
+    return render_template("ixc_stability.html",
+                            tool_title=info["name"], tool_desc=info["desc"])
+
+
+@app.route("/api/ixc-stability/run", methods=["POST"])
+def api_ixc_stability_run():
+    f = request.form
+    user, pw = _creds(f)
+    if not (user and pw):
+        return jsonify(error="Infrastructure username and password are required."), 400
+    params = {
+        "username":       user,
+        "password":       pw,
+        "open_when_done": f.get("open_when_done") == "on",
+    }
+    # Fleet-wide DS1 sweep: ~5-15 s per device at SWEEP_WORKERS concurrency.
+    # Warn after 20 min for a large fleet.
+    job_id = _launch_job("IXC Stability Sweep", 1200,
+                          lambda: ixc_stability.run(params))
+    return jsonify(job_id=job_id)
+
+
 # ---- MUX CEM Loop Script (two modes) -------------------------------------
 
 @app.route("/tools/mux-loop")
@@ -740,7 +788,7 @@ def api_ds1_gsx_test_run():
     if not _valid_ip(ip_1250):
         return jsonify(error="Enter a valid 1250 IP."), 400
     ds1_raw = (f.get("ds1_list") or "").strip()
-    ds1_list = [d.strip().lower() for d in ds1_raw.replace("&", ",").split(",") if d.strip()]
+    ds1_list, _ds1_notes = expand_ds1_list(ds1_raw)
     if not ds1_list:
         return jsonify(error="Enter at least one DS1 (e.g. ts1/1)."), 400
 

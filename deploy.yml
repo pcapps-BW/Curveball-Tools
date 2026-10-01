@@ -13,13 +13,39 @@
 
     - name: Clone or sync application source code
       git:
-        repo: 'https://github.com/pcapps-BW/Curveball-Tools.git'
+        repo: 'git@github.com:pcapps-BW/Curveball-Tools.git'
         dest: /usr/local/scripts/NOEIP/Curveball
         version: main
         force: yes
-        accept_hostkey: yes
 
-    - name: Configure Nginx to serve Curveball directory
+    - name: Install Python dependencies
+      pip:
+        requirements: /usr/local/scripts/NOEIP/Curveball/requirements.txt
+
+    - name: Allow Nginx to connect to network proxies (SELinux)
+      seboolean:
+        name: httpd_can_network_connect
+        state: yes
+        persistent: yes
+
+    - name: Create Systemd service for Flask App
+      copy:
+        dest: /etc/systemd/system/curveball.service
+        content: |
+          [Unit]
+          Description=Curveball Tools Web Application
+          After=network.target
+
+          [Service]
+          User=pcapps
+          WorkingDirectory=/usr/local/scripts/NOEIP/Curveball
+          ExecStart=/usr/bin/python3 /usr/local/scripts/NOEIP/Curveball/app.py
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Configure Nginx reverse proxy
       copy:
         dest: /etc/nginx/conf.d/curveball.conf
         content: |
@@ -27,20 +53,28 @@
               listen 80 default_server;
               listen [::]:80 default_server;
               server_name _;
-              root /usr/local/scripts/NOEIP/Curveball;
-              index index.html index.htm;
 
               location / {
-                  try_files $uri $uri/ =404;
+                  proxy_pass http://localhost:5000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
               }
           }
 
-    - name: Ensure default welcome page configuration is disabled
+    - name: Disable default welcome page
       file:
         path: /etc/nginx/default.d/welcome.conf
         state: absent
 
-    - name: Ensure web server service is running and reloaded
+    - name: Ensure Flask app service is running
+      systemd:
+        name: curveball.service
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Ensure Nginx is running and reloaded
       service:
         name: nginx
         state: reloaded
