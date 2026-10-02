@@ -604,9 +604,16 @@ def run(params):
                 continue
             host_1800 = hub_hostnames.get(ds1, "")
             gsx_dev = netbox.derive_gsx_device_name(node, host_1800)
-            cards = netbox.gsx_mgmt_ips(gsx_dev)
+            _nb_warns = []
+            cards = netbox.gsx_mgmt_ips(gsx_dev, _nb_warns)
             if not cards:
-                progress("  {} -> no GSX mgmt IPs from Netbox for {}".format(ds1, gsx_dev))
+                # Say WHY. A name NetBox rejects, a device it does not have,
+                # and a device with no MGMT- interfaces are three different
+                # problems and used to look identical (fixed 2026-10-02).
+                why = _nb_warns[0] if _nb_warns else "reason not reported"
+                progress("  {} -> no GSX mgmt IPs for {}: {}".format(
+                    ds1, gsx_dev, why))
+                r["gsx_lookup_error"] = why
                 continue
             # Tries each mgmt IP until one both pings AND accepts SSH -- a GSX
             # can answer ICMP and still refuse the login (ATLGSX02, 2026-10-01).
@@ -939,6 +946,13 @@ def run(params):
         extra["host_1250"]    = host_1250
         extra["ds1_map"]      = ds1_map
         extra["run_summary"]  = "\n".join(run_summary_block)
+        # Added 2026-10-01 for sor_collect: the OC12 sub-channel is one of
+        # the 11 inventory fields and lives nowhere else in the handback --
+        # mux_results has the MUX side, ds1_map has the 1250 side, and this
+        # is the 1800 hop's answer. Without it that field silently stayed
+        # empty, which a stubbed test would not have caught.
+        extra["oc12_results"] = oc12_results
+        extra["hub_results"]  = hub_results
 
     return out_path
 

@@ -43,6 +43,36 @@
       (skip 1800 MUSE lookup -- use stored OC12 assignment directly)
 
 ## Known Issues / Watch List
+- [ ] **`ge-ts2/1` is reported as a fiber uplink at dual-1250 markets, where
+      it is actually the local A-B cross-connect.** Found 2026-10-02 while
+      scoping the SoR; deferred by pcapps (3-4 markets affected, fix touches
+      three shipped tools, not worth the spend yet).
+
+      Three places hardcode the pair:
+        fiber_util.py:38              FIBER_PORTS = ["ge-ts2/1", "ge-ts5/1"]
+        site_sweep.py:117             ("ge-ts2/1", "ts2"), ("ge-ts5/1", "ts5")
+        autotester_standalone.py:366  ("ge-ts2/1", "ts2"), ("ge-ts5/1", "ts5")
+
+      All three render it under "GE FIBER UPLINK HEALTH", so at a dual site
+      "the uplink looks healthy" can be describing a cable between two
+      devices in the same rack, while the real transport is only on
+      ge-ts5/1.
+
+      NOT uniformly wrong, which is why it survived: circuit_audit.py:181
+      records `ge-ts2/1  SFP (1GE)  Nitel: NIT555057` -- a real carrier
+      circuit on that port at a single-1250 site. So the port is a genuine
+      uplink at some sites and an xcon at others.
+
+      Only available test: the hostname suffix (-A/-B present => xcon).
+      There are NO interface descriptions on these ports, so the stronger
+      description-based test is not available.
+
+      When fixed: LABEL the port rather than silently reclassifying it, and
+      a port whose role cannot be determined should say so rather than
+      defaulting to "uplink". Confirm against a real dual site first.
+      Blast radius is GE uplink reporting only -- DS1 tracing, the SoR
+      fields and everything hub/MUX/GSX-side are unaffected.
+
 - [ ] Rotate the Morning Check Slack webhook URL -- it got pasted into a
       chat session on 2026-08-06, so treat it as loosely exposed even
       though a webhook can only post to that one channel. Low priority --

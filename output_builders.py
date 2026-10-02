@@ -1408,7 +1408,13 @@ def build_route_block(ds1, host_1250, loopback_ip, muse_id,
                             "says '{}'".format(
                                 mux_data.get("gsx_node_device") or "?"),
              }.get(mux_data.get("gsx_name_verdict"), "")),
-        "    IP         : {}".format(mux_data.get("gsx_ip") or "?"),
+        "    IP         : {}{}".format(
+            mux_data.get("gsx_ip") or "?",
+            "" if mux_data.get("gsx_ip")
+            else ("   <-- " + mux_data["gsx_lookup_error"]
+                  if mux_data.get("gsx_lookup_error")
+                  else "   <-- GSX not reached; the node name above is from "
+                       "the MUX description and is UNVERIFIED")),
         "    Assignment : {}".format(gsx_assign),
         "    T1 Command : SHOW T1 T1-1-{}".format(gsx_assign),
     ]

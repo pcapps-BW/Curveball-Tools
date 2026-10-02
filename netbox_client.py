@@ -124,6 +124,46 @@ class NetboxClient:
             pages += 1
         return results, None
 
+    def ipam_for_device(self, device_name, limit=500):
+        """
+        (ip_records, error) for every IP NetBox has assigned to a device.
+
+        ⚠ Resolves the device to an ID FIRST, like every other lookup in this
+        module since v2.32 -- because `/api/ipam/ip-addresses/?device=<name>`
+        has the same trap as the interfaces endpoint: NetBox VALIDATES the
+        name and answers **HTTP 400** on any mismatch rather than returning
+        an empty list.
+
+        This was missed in the v2.32 sweep. That release fixed every
+        `interfaces/?device=` query and the verification grep used that
+        literal string -- so four `ip-addresses/?device=` queries kept the
+        bug, and two of them swallowed the 400 in a bare `except` and
+        returned `{}`. The caller then could not tell "this device has no
+        management IPs" from "NetBox rejected the name".
+
+        Found 2026-10-02 while pcapps was fixing a `TEMP_GSX1` placeholder in
+        a MUX description: `gsx_mgmt_ips()` was the function that would run
+        next, and it would have reported `IP : ?` for a name mismatch,
+        looking exactly like the description fix had not worked.
+
+        Returns the error as a STRING rather than raising or swallowing, so
+        callers can surface it.
+        """
+        if not self.ok():
+            return [], "NetBox not configured"
+        if not device_name:
+            return [], "no device name"
+        dev_id, dev_name, err = self.device_id_for(device_name)
+        if not dev_id:
+            return [], (err or "device '{}' not in NetBox".format(device_name))
+        rows, err = self._paged(
+            "{}/api/ipam/ip-addresses/?device_id={}&limit={}".format(
+                self.base_url, dev_id, limit))
+        if err:
+            return [], "IPAM query failed for {}: {}".format(
+                dev_name or device_name, err)
+        return rows, None
+
     def device_id_for(self, name):
         """
         (device_id, canonical_name, error) for a device name.
@@ -537,26 +577,18 @@ class NetboxClient:
         # circuit description -- WITHOUT needing to log into the device.
         # Confirmed on FTMYFLXA939: ge-ts2/1 = 10.111.133.212/31 (JFK range),
         # ge-ts5/1 = 10.111.132.212/31 (ATL range).
+        # ipam_for_device paginates internally and returns (rows, error), so
+        # there is no loop or try/except needed here any more.
         by_name = {}
-        ipurl = "{}/api/ipam/ip-addresses/?device={}&limit=500".format(
-            self.base_url, urllib.parse.quote(hostname, safe=""))
-        try:
-            pages = 0
-            while ipurl and pages < 20:
-                r = self.session.get(ipurl, timeout=20)
-                r.raise_for_status()
-                data = r.json()
-                for rec in data.get("results", []):
-                    ao = rec.get("assigned_object") or {}
-                    nm = (ao.get("name") or "").strip()
-                    addr = (rec.get("address") or "").split("/")[0].strip()
-                    if nm and addr and nm not in by_name:
-                        by_name[nm] = addr
-                ipurl = data.get("next")
-                pages += 1
-        except Exception:
-            # Descriptions are still usable without IPs -- degrade, don't fail.
-            by_name = {}
+        _iprows, _iperr = self.ipam_for_device(hostname, limit=500)
+        if not _iperr:
+            for rec in _iprows:
+                ao = rec.get("assigned_object") or {}
+                nm = (ao.get("name") or "").strip()
+                addr = (rec.get("address") or "").split("/")[0].strip()
+                if nm and addr and nm not in by_name:
+                    by_name[nm] = addr
+        # Descriptions are still usable without IPs -- degrade, don't fail.
 
         for i in out:
             i["ip"] = by_name.get(i["name"], "")
@@ -602,18 +634,11 @@ class NetboxClient:
 
         Mirrors gsx_mgmt_ips() -- same IPAM query, different interface name pattern.
         """
-        if not self.ok():
-            return {}
-        url = "{}/api/ipam/ip-addresses/?device={}&limit=500".format(
-            self.base_url, hostname_1800)
-        try:
-            r = self.session.get(url, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
+        rows, err = self.ipam_for_device(hostname_1800, limit=500)
+        if err:
             return {}
         slots = {}
-        for item in data.get("results", []):
+        for item in rows:
             assigned = item.get("assigned_object") or {}
             iface_name = (assigned.get("name") or "").strip()
             # Match "MGMT MCP SLOT_MSA" or "MGMT MCP SLOT_MSB" (case-insensitive)
@@ -730,43 +755,42 @@ class NetboxClient:
         # report can say WHICH port worked rather than just an IP. A Ge port
         # answering when the loopback does not is a finding about the device,
         # not a detail to swallow.
-        try:
-            r = self.session.get(
-                "{}/api/ipam/ip-addresses/?device={}&limit=200".format(
-                    self.base_url, q),
-                timeout=15)
-            r.raise_for_status()
-            for item in r.json().get("results", []):
-                addr = (item.get("address") or "").split("/")[0].strip()
-                if not addr or addr in ips:
-                    continue
-                ao = item.get("assigned_object") or {}
-                iface = (ao.get("name") or "").strip()
-                ips.append(addr)
-                if iface:
-                    iface_by_ip[addr] = iface
-        except Exception as e:
-            warns.append("IPAM lookup for {} failed: {}: {}".format(
-                device_name, type(e).__name__, e))
+        _rows, _err = self.ipam_for_device(device_name, limit=200)
+        if _err:
+            warns.append("IPAM lookup for {} failed: {}".format(
+                device_name, _err))
+        for item in _rows:
+            addr = (item.get("address") or "").split("/")[0].strip()
+            if not addr or addr in ips:
+                continue
+            ao = item.get("assigned_object") or {}
+            iface = (ao.get("name") or "").strip()
+            ips.append(addr)
+            if iface:
+                iface_by_ip[addr] = iface
 
         if not ips and not warns:
             warns.append("NetBox has no IP addresses for device {}".format(
                 device_name))
         return ips, warns, iface_by_ip
 
-    def gsx_mgmt_ips(self, gsx_device_name):
-        """Returns {"1-1":[ips], "1-2":[ips]} (CIDR stripped) or {}."""
-        if not self.ok():
-            return {}
-        url = "{}/api/ipam/ip-addresses/?device={}".format(self.base_url, gsx_device_name)
-        try:
-            r = self.session.get(url, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
+    def gsx_mgmt_ips(self, gsx_device_name, warns=None):
+        """
+        {"1-1":[ips], "1-2":[ips]} (CIDR stripped), or {} with the reason
+        appended to `warns` when one is supplied.
+
+        Routed through ipam_for_device so a name NetBox rejects reports as a
+        name problem instead of looking like a GSX with no management IPs --
+        see that method for why those were indistinguishable before.
+        """
+        rows, err = self.ipam_for_device(gsx_device_name, limit=500)
+        if err:
+            if warns is not None:
+                warns.append("GSX mgmt IP lookup for {}: {}".format(
+                    gsx_device_name, err))
             return {}
         cards = {}
-        for item in data.get("results", []):
+        for item in rows:
             assigned = item.get("assigned_object") or {}
             iface_name = assigned.get("name", "")
             m = re.match(r'MGMT-(\d+)-(\d+)-(\d+)', iface_name)
@@ -777,6 +801,9 @@ class NetboxClient:
             ip = addr.split("/")[0] if addr else ""
             if ip:
                 cards.setdefault(card_key, []).append(ip)
+        if not cards and warns is not None:
+            warns.append("NetBox has no MGMT-<shelf>-<slot>-<port> addresses "
+                         "for {}".format(gsx_device_name))
         return cards
 
 

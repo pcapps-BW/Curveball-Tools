@@ -73,6 +73,7 @@ always the accurate list. Roughly, in the order they appear:
 | IXC Check | Site + interface check against NetBox, with a VERDICT block |
 | MUX CEM Loop Script | Resolves ACR/CEM and prints the loop MOP as copy/paste text |
 | DS1 Test Builder | AIS / loops toward the GSX, printed as a runbook with its own back-out |
+| SoR Collect | Records one 1250's circuits into the inventory **cache** and reports anything that moved since last time. Not an authority — the device always wins |
 
 `circuit_audit.py` conforms to the tool contract but is **CLI-only** — it has
 no `order` key and no `app.py` wiring, so it never renders a card.
@@ -125,7 +126,8 @@ trap was being avoided. Read them before changing a parser.
 | Shared lookups | `hub_registry.py` (hub identity), `netbox_client.py`, `ds1_util.py` (DS1 parsing), `chassis_config.py` (1800 config readers), `nni_check.py` |
 | Reporting | `output_builders.py` — all rendering and the per-hop health checks |
 | Integrations | `jira_client.py`, `secure_config.py` |
-| Infrastructure | `platform_paths.py` (all output paths), `assurance.py` (failing-loudly machinery) |
+| Infrastructure | `platform_paths.py` (all output paths), `assurance.py` (failing-loudly machinery), `env_check.py` (dependency banners) |
+| Inventory cache | `sor_store.py` (versioned JSON, change history), `sor_collect.py` (one-site collector) |
 
 **Tool contract:** `TOOL_INFO` dict, `collect_inputs(session=None)`, and
 `run(params) -> out_path`. `app.py` never calls `collect_inputs()` — it would

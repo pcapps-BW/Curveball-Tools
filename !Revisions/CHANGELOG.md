@@ -15,6 +15,502 @@ that's bitten this project before.
 
 ---
 
+## v2.43 — 2026-10-02
+
+### v2.32 missed four IPAM queries, and the GSX lookup was one of them
+
+Found while pcapps was fixing a `TEMP_GSX1` placeholder in a MUX
+description. The report read:
+
+```
+  HOP 4 -- GSX
+    Node       : TEMP_GSX1
+    IP         : ?
+    Assignment : 6-1-13
+```
+
+The assignment was right (it comes off the MUX); only the node name was
+fictional. Correct behaviour — but `gsx_mgmt_ips()` is the function that runs
+**next** after such a fix, and it still had the v2.32 bug:
+
+```python
+url = "{}/api/ipam/ip-addresses/?device={}".format(self.base_url, gsx_device_name)
+try:
+    ...
+except Exception:
+    return {}          # a rejected NAME, indistinguishable from "no IPs"
+```
+
+So after correcting the description to `LAXGSX01-6-1`, a name NetBox holds
+under any other spelling would still have produced `IP : ?` — and pcapps
+would reasonably have concluded the description fix had not worked.
+
+#### My v2.32 verification was narrower than my v2.32 claim
+
+That release said *"a grep now confirms no interface query filters by device
+NAME anywhere in the module."* True, and useless: the grep was
+`interfaces/?device=`, while these are **`ip-addresses/?device=`**. Four
+survived — lines 541, 607, 735, 761 — and two swallowed the HTTP 400 in a
+bare `except`.
+
+The lesson is the same one this codebase keeps relearning: **a check that
+only covers the shape of the bug you already found is not a check.** v2.32
+fixed a class of bug and verified one instance pattern of it.
+
+#### Fix
+
+New `ipam_for_device(device_name, limit)` returns `(rows, error)` and
+resolves the device to an **ID** first, like every other lookup since v2.32.
+All four call sites converted — `gsx_mgmt_ips`, `hub_1800_mgmt_ips`,
+`device_mgmt_ips`, `device_interface_descriptions`. Errors are returned as
+strings rather than raised or swallowed.
+
+`gsx_mgmt_ips()` takes an optional `warns` list, and all three callers
+(`autotester_standalone`, `ds1_gsx_test`, `mux_loop_script`) now pass one and
+print what came back. Three previously identical outcomes are now
+distinguishable:
+
+```
+no device named 'TEMP_GSX1.lax1' in NetBox
+device lookup failed (name__ie): HTTP 400 -- device: Select a valid choice...
+NetBox has no MGMT-<shelf>-<slot>-<port> addresses for LAXGSX01.lax1
+```
+
+#### The route block now says why, and admits an unverified name
+
+```
+  HOP 4 -- GSX
+    Node       : TEMP_GSX1
+    IP         : ?   <-- GSX mgmt IP lookup for TEMP_GSX1.lax1: no device
+                         named 'TEMP_GSX1.lax1' in NetBox
+```
+
+And when the GSX simply was not reached with no reason recorded:
+
+```
+    IP         : ?   <-- GSX not reached; the node name above is from the MUX
+                         description and is UNVERIFIED
+```
+
+That closes a gap in v2.28. The GSX identity cross-check only runs **after**
+a successful login, so when the GSX was never reached `gsx_name_verdict` was
+never set and the Node line rendered bare — a completely unverified name
+looked tidier than a confirmed one. A reached-and-confirmed node still reads
+`(confirmed by the device itself)`; nothing about that path changed.
+
+#### Tests
+
+Nine cases against a stubbed NetBox: `gsx_mgmt_ips` happy path (asserting it
+now queries `?device_id=`), the verbatim HTTP 400 body, device absent, device
+present with no `MGMT-` interfaces, the other three converted call sites, and
+the three route-block renderings (lookup error / unreached-and-unverified /
+normal). Also removed an `if True:` block and two dead pagination locals left
+by the conversion.
+
+---
+
+## v2.42 — 2026-10-01
+
+### SoR: one-site circuit inventory cache
+
+First build toward the circuit database. **Scope is deliberately one site**,
+and a working one-site collector is NOT "nearly done" on a fleet collector —
+concurrency across ~200 devices, partial sweeps and retry are all deferred,
+and those are the expensive problems. Design note:
+`C:\Claude\SOR_DESIGN_NOTE.md`.
+
+**It is a cache, not an authority** (pcapps: *"cache, the whole point of this
+is we cant trust netbox 100%"*). The device always wins, disagreements are
+reported rather than resolved, and there is no edit path to build.
+
+#### Why NetBox framing undersells it
+
+NetBox claims only **4 of the 11** fields — hostname, MUX name, the OC12
+*facility* name, and a GSX node name derivation. The other seven (loopback,
+DS1, MUSE, hub IP, ACR, CEM, GSX assignment) **exist nowhere but on the
+devices**. For those this is the only durable record there is, and the drift
+it catches is device-vs-its-own-past: an ACR that moved, a CEM
+reprovisioned, a GSX assignment changed without a ticket. Nothing today
+would tell you any of that happened.
+
+#### No parser, by choice
+
+`autotester_standalone.run()` already resolves all 11 fields and hands them
+back structurally via `_extra_out`, so `sor_collect` maps dicts to schema.
+
+The alternative was parsing the 407 archived `Autotester_*.txt` reports. Those
+span June to October across roughly a hundred releases and the format drifted
+at least three times (`ACR Group : 16` in June, an inline
+`SONET 0/5/4  ACR 53  CEM 401` in August, back again in October). A parser
+written against the current format silently skips the older files — **silent
+partial coverage of an inventory**, which is the failure this suite exists to
+avoid. The structured handback has no format to drift.
+
+#### A changed value is an event, not an overwrite
+
+The one decision that would be expensive to retrofit. Every field keeps
+`value / source / first_seen / last_seen / history`, so "did this move?" is
+answerable. A cache holding only "latest" tells you what is true now and
+nothing about what changed.
+
+```
+[CHANGED] mdldtxmu542|ts1/27 acr_group : 26 -> 52  (was last seen 2026-10-01 14:53:49)
+```
+
+A value returning to a previous one is a **second** change, not an undo — the
+full sequence stays recoverable. Found because this module's own fixture did
+it accidentally.
+
+#### Refusals
+
+Four places it declines to record rather than recording something wrong:
+
+- **Unreachable device → rows marked `unverified`, never deleted.** A missing
+  row and an unreachable device mean opposite things.
+- **Partial collection touches only what it saw.** A run that could not reach
+  the MUX leaves the MUX-derived fields alone instead of blanking them.
+- **`?` and empty are never stored.** `?` is this suite's "lookup had no
+  answer" marker; storing it turns a known-unknown into a recorded fact.
+- **A GSX name conflict withholds the GSX fields** (v2.28) while recording
+  the rest of the circuit. A contested value stored as fact makes the cache
+  worse than no cache.
+- **No 1250 hostname → no rows at all.** Storing under an IP would fork the
+  row the moment the name is known.
+
+#### Two bugs found while testing, both of which a stub was hiding
+
+**1. `oc12_results` was never in the handback.** The collector read it, the
+real `run()` never set it — so the OC12 field would have stayed silently
+empty on every real collection while every test passed, because the stub
+supplied it. Now handed back (with `hub_results`), and a self-test reads
+`autotester_standalone.py`'s **source** for the keys it assigns, so a stub
+cannot hide this again.
+
+**2. `load(path=STATE_FILE)` bound the path at import.** A default argument
+is evaluated once, so redirecting the store was silently ignored — the web
+page rendered an empty inventory while the collector was writing a populated
+one. Now resolved at call time, with a test that redirects it.
+
+#### The page leads with changes
+
+Default view is changes, then unverified; the full table is behind a toggle.
+A 200×28 table nobody opens is not an answer to "did anything move?".
+
+Wired per `ADDING_A_TOOL.md` §3 — `_TOOL_MODULES` and `TOOL_URLS` now both
+at 15, verified to agree (a module in one and not the other is a `KeyError`
+on the home page, not a missing card).
+
+#### Tests
+
+37 in `sor_store`, 31 in `sor_collect`, all stubbed — no devices touched.
+Covers: first collection, unchanged re-collection, a moved ACR, a flap back,
+partial collection, unreachable device, `CredentialError` propagating,
+missing hostname, GSX name conflict, hostname casing not forking rows,
+corrupt and missing files, and a disk round-trip preserving history.
+
+Also driven end to end against a temp cache with the page rendered from it,
+confirming the changes table, the unverified table and the full inventory all
+show real collected values.
+
+---
+
+## v2.41 — 2026-10-01
+
+### Skip the 96 intervals when the bin is SATURATED, not just when it is clean
+
+pcapps, on NYCGSX03 T3-1-10-1:
+
+```
+Elapsed Time:             75964
+Errored Seconds:          75964
+Severely Errored Seconds: 75964
+```
+
+> *"ES & SES are 75964 which means its been clocking ES & SES every second
+> during the entire interval. There is no need for 15 minute intervals with
+> that. If the monitor interval was 75964 and ES & SES counts were 50000,
+> then yes it makes sense to pull all the intervals since some should be
+> clean."*
+
+Exactly right, and it is the mirror of the skip that already existed:
+
+| Bin | Intervals | Pull? |
+|---|---|---|
+| clean | all zero | no |
+| **saturated** | **all full** | **no** |
+| partly dirty | differ | **yes** |
+
+Both ends of the range are uninformative for the same reason — every
+interval is identical. Only the middle carries information.
+
+#### The rule is about recoverable information, not severity
+
+`ES == elapsed` means no clean second exists, so the fault did not *start*
+inside this bin; the intervals have no onset to show. `ES < elapsed` means
+some seconds were good, and the intervals locate the onset and any gaps —
+usually the most useful thing in the report.
+
+So **a 99%-failed bin still gets all 96 intervals.** The surviving 1% is the
+timeline. This is deliberately not a "bad enough to skip" threshold, and a
+self-test pins the 99% case specifically.
+
+#### Guards, because a wrong skip loses evidence
+
+- **No `Elapsed Time`** → cannot test saturation, so pull. Never assume.
+- **Bin younger than one interval (900s)** → too short to judge; pull.
+- **`Code Violations` can never trigger it.** It counts *events*, not
+  seconds, and routinely exceeds the elapsed time. Comparing it to a
+  duration is a category error, and on a noisy-but-up facility it would
+  skip the intervals that matter most.
+- **±2s tolerance** for sampling skew between the elapsed counter and the
+  PM counters, which are read in the same command and so match exactly on a
+  genuinely saturated facility.
+
+#### One decision, one renderer
+
+`should_skip_intervals()` returns `(skip, kind, reason)` and both the T1 and
+T3 call sites use it — they previously each had their own copy of the
+branch, which is how the two would have drifted.
+
+`skip_block()` renders the report section, because **the consequence is
+opposite for the two kinds**: the old text said the intervals "are zero by
+definition", which on a saturated bin is exactly backwards. Now:
+
+```
+  T3 PERFMON -- 15-MINUTE INTERVALS SKIPPED
+  Day bin is saturated:
+    Errored Seconds=75964, Severely Errored Seconds=75964 == bin age
+    21h 06m (75964s) -- every second of the bin was bad, so all intervals
+    are identically full
+  all 96 fifteen-minute intervals are FULL (every second of the bin
+  was already bad) and were not pulled.
+```
+
+Thirteen self-tests, built on the verbatim NYCGSX03 output and on pcapps'
+own counterexample (50000 of 75964 must still pull).
+
+---
+
+## v2.40 — 2026-10-01
+
+### The 24h bin is not 24 hours, and v2.39 asserted that it was
+
+v2.39 improved the wording and introduced a worse error inside it:
+
+```
+UNAVAILABLE 21h 01m of the 24h bin -- 3 of 8 PM readings non-zero: ...
+```
+
+> *"why is 21 hours unavailable???"*
+
+Fair question, and the honest answer was that the denominator was invented.
+**The GSX reports `Elapsed Time` — how long THIS bin has been accumulating —
+and v2.39 ignored it and assumed 86400.** The evidence was already in the
+in-tree fixture:
+
+```
+Node: ATLGSX02      Date: 2026/10/01 12:09:02  GMT
+Elapsed Time: 4574
+```
+
+4574 s is **1h 16m**. At 12:09 GMT that bin began around 10:53 — the
+"Current Day" register does **not** start at midnight. It restarts on
+counter clears and facility events.
+
+So a circuit down for the whole life of a 21-hour-old bin is **100%
+unavailable**, and v2.39 rendered it as 87% of a day — understating a total
+outage as a mostly-bad one, and inviting exactly the reaction it got: *where
+did the other 3 hours of service come from?* They did not exist.
+
+#### Now
+
+`parse_elapsed_time()` reads the bin's own age and it becomes the
+denominator:
+
+```
+UNAVAILABLE 21h 01m -- the ENTIRE 21h 01m bin -- 3 of 8 PM readings
+non-zero: Errored Seconds=75693 (21h 01m), ...
+```
+
+If the bin really is a full day and some of it was up, the shortfall still
+shows, because that is a genuinely different fault:
+
+```
+UNAVAILABLE 21h 01m of the 24h 00m bin (88%)
+```
+
+And if the device does not report `Elapsed Time`, it says so rather than
+substituting a number:
+
+```
+UNAVAILABLE 21h 01m of the current day bin (bin age not reported)
+```
+
+The clean message gives the bin age too — `all 8 PM readings zero over the
+1h 00m bin` — because "clean" over 90 seconds and "clean" over 20 hours are
+not the same statement.
+
+#### Why this one is worth the entry
+
+Two releases in a row got this line wrong in the same direction: **stating a
+denominator the data did not support.** v2.39 fixed "3 of 8" reading as
+intervals and introduced "of the 24h bin". The fixture containing the
+disproof — `Elapsed Time: 4574` — was sitting in this file the whole time,
+referenced three times in comments as a line the counter regex must *not*
+match. It was treated as noise to filter rather than as the denominator.
+
+Six self-tests now pin it, including one asserting the string `of the 24h
+bin` never appears in any message, and one that the real sample parses to
+4574.
+
+---
+
+## v2.39 — 2026-10-01
+
+### "3 non-zero of 8" read as intervals, not counters
+
+From a live run on a facility that had been down all day:
+
+```
+collecting: T3 PERFMON intervals 1-96 ... (3 non-zero of 8 (Errored
+Seconds=75403, Severely Errored Seconds=75403, Unavailable Seconds=75403))
+```
+
+pcapps read that as **"3 of 8 intervals had errors"** and reasonably doubted
+it — a circuit down all day should have errors in every interval. The number
+was right and the sentence was wrong, and the cost was doubting the tool
+during a live fault, which is precisely what these lines exist to prevent.
+
+Two separate faults in eight words:
+
+**1. The count is over PM READINGS, not intervals.** A `PERFMON CURRENT DAY`
+pull is **one** bin; the 96 intervals are fetched afterwards. Nothing in that
+message was per-interval.
+
+**2. "of 8" is not a fixed denominator.** The eight counter names repeat
+across Near End / Far End x Line / Path, so the denominator is however many
+numeric readings parsed — the real ATLGSX02 fixture yields **14**, not 8.
+
+And a third, worse than the wording: **a low non-zero count is not
+reassuring, but "3 of 8" implies it is.** A hard-down facility delivers no
+framed signal, so `Code Violations` and `Controlled Slip Seconds` stay at
+zero. Fewer counter *types* trip on a dead circuit than on a marginal one.
+Three of eight on a dead circuit is expected, not mild.
+
+#### Now
+
+```
+UNAVAILABLE 20h 56m of the 24h bin -- 3 of 8 PM readings non-zero:
+Errored Seconds=75403 (20h 56m), Severely Errored Seconds=75403 (20h 56m),
+Unavailable Seconds=75403 (20h 56m)
+```
+
+- **Leads with the meaning**, not the arithmetic. `Unavailable Seconds` is the
+  counter that distinguishes "out" from "degraded", so it sets the headline.
+- **Seconds counters get a duration.** 75403 is unreadable; 20h 56m is the
+  fact — 87% of the bin, and the three matching values are the signature of a
+  facility that is out rather than dirty.
+- **Says "PM readings"**, and a self-test asserts the word "interval" never
+  appears in this line.
+- **Repeated counters report the worst value per name**, once, instead of
+  listing the same counter from four sections.
+
+Dirty-but-up now reads distinctly, because that distinction is the point:
+
+```
+errored 3m 46s of the 24h bin, but never unavailable -- 3 of 4 PM readings
+non-zero: Code Violations=1840, Errored Seconds=226 (3m 46s), ...
+```
+
+The clean message is explicit about the bin too:
+`all 8 PM readings zero across the 24h bin`.
+
+Logic unchanged — the skip decision is identical, and the run still correctly
+proceeded to all 96 intervals. This is reporting only.
+
+Fourteen self-tests, including that a down facility leads with UNAVAILABLE
+and a duration, that errored-but-available does *not*, that repeated counters
+are deduplicated to the worst value, and the four duration formats.
+
+---
+
+## v2.38 — 2026-10-01
+
+### The paramiko banner now covers every way the tools get run
+
+v2.37 put the check in `app.py`. That covers **one of four** entry points.
+A second engineer installed v2.37, ran the reverse autotester, and still hit
+paramiko 5 with no warning — because he was not coming in through the web
+app's startup path.
+
+The four ways in: the Flask app, the CLI launcher, a tool run standalone
+(`python autotester_standalone.py`), and another front end importing
+`run(params)` directly. Only the first printed anything.
+
+#### Moved to `env_check.py`, fired from `device_base.py`
+
+`device_base.py` is the one module every path to a device passes through —
+every client is built on it, and it is where `paramiko` is actually imported.
+Its import now calls `env_check.check_paramiko()`. `app.py` and `launcher.py`
+call it again so the banner lands at the top of their own startup output;
+it prints **once per process** regardless of how many modules ask.
+
+Also now tells you the thing that was missing from the v2.37 wording:
+
+```
+  FIX:  python -m pip install -r requirements.txt
+
+Then RESTART the app. A server already running keeps the old paramiko
+loaded, so the fix looks like it did nothing.
+```
+
+Goes to **stderr**, not stdout — the web layer tees stdout into the per-job
+log, and this is a startup condition, not something that happened during a
+run.
+
+#### A false alarm would be worse than no banner
+
+`paramiko_legacy_status()` returns "cannot tell" rather than "broken" when it
+cannot read paramiko's algorithm registry — an absent table, a stub, a mock,
+a future rename.
+
+**My first version got this backwards**, and its own self-test caught it. The
+obvious `getattr(paramiko.Transport, table, {})` turns an unreadable paramiko
+into one where every algorithm looks missing: the loudest possible false
+alarm. A banner that fires when nothing is wrong teaches people to scroll past
+the one that matters, so the failure mode is not "noisy", it is "the next real
+banner gets ignored".
+
+Eight self-tests pin it, including that the banner prints once and not twice,
+that it names both the fix command and the restart, and that an unreadable
+paramiko stays silent. Verified afterwards that the correction did not
+over-reach: the real 5.0.0 is still detected.
+
+#### `Start Curveball Tools.bat` is no longer `--quiet`
+
+That flag was hiding the step that enforces the pin. If pip cannot downgrade
+— no network, a proxy, or paramiko installed machine-wide without admin
+rights — the failure scrolled past and the app started anyway with the broken
+version. Now it reports the failure, pauses, suggests `--user`, and then
+prints what actually got installed:
+
+```
+paramiko 4.0.0 | C:\Python314\python.exe
+```
+
+So "I installed the fix" can be checked instead of assumed. The interpreter
+path is there because pip installing into one Python while the app runs under
+another is the other way this ends up looking mysterious.
+
+#### Worth being explicit about
+
+**A pin in `requirements.txt` changes nothing on its own.** It constrains what
+pip *chooses* next time it resolves; it does not reach into an environment and
+remove an already-installed paramiko 5.0.0. Unzipping v2.37 ships the corrected
+file — it does not run pip. Someone has to.
+
+---
+
 ## v2.37 — 2026-10-01
 
 ### paramiko 5.0.0 took out every MUX at every site

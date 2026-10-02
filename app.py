@@ -38,6 +38,8 @@ from flask import Flask, render_template, request, jsonify, send_file, abort
 
 import autotester_standalone
 import reverse_autotester
+import sor_collect
+import sor_store
 import npt1250_discovery
 import ds1_pms
 import fiber_util
@@ -61,7 +63,7 @@ app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v2.37"
+APP_VERSION = "v2.43"
 
 
 @app.context_processor
@@ -123,31 +125,14 @@ sys.stdout = _JobStdoutTee(sys.stdout)
 # Found live 2026-10-01 after "Start Curveball Tools.bat" pip-installed an
 # unpinned paramiko>=3.5 and picked up 5.0.0.
 
-def _check_paramiko():
-    try:
-        import paramiko
-    except Exception as e:
-        print("[!] paramiko not importable: {}".format(e))
-        return
-    missing = [n for n, tbl in (
-        ("diffie-hellman-group14-sha1", getattr(paramiko.Transport, "_kex_info", {})),
-        ("ssh-rsa",                     getattr(paramiko.Transport, "_key_info", {})),
-    ) if n not in tbl]
-    if missing:
-        ver = getattr(paramiko, "__version__", "?")
-        print("")
-        print("!" * 72)
-        print("  paramiko {} has dropped: {}".format(ver, ", ".join(missing)))
-        print("  The Cisco NCS 4216 MUX offers ONLY these algorithms, so every")
-        print("  MUX is unreachable -- the MUX and GSX hops of both autotesters")
-        print("  will fail at every site. The 1250 and 1800 hops are unaffected.")
-        print("")
-        print("  Fix:  pip install -r requirements.txt     (pins paramiko<5)")
-        print("!" * 72)
-        print("")
+# The check itself now lives in env_check.py and fires from device_base's
+# import, so it covers the CLI launcher and standalone tool runs too -- not
+# just this front end. Called again here only so the banner lands at the top
+# of the server's own startup output, where someone launching the web app
+# will actually see it. check_paramiko() prints once per process.
+import env_check
 
-
-_check_paramiko()
+env_check.check_all()
 
 
 def _valid_ip(s):
@@ -338,11 +323,13 @@ TOOL_URLS = {
     "site_sweep":            "/tools/site-sweep",
     "ospf_stability":        "/tools/ospf-stability",
     "ixc_stability":         "/tools/ixc-stability",
+    "sor_collect":           "/tools/sor",
 }
 _TOOL_MODULES = [
     autotester_standalone, npt1250_discovery, ds1_pms, fiber_util,
     ospf_events, health_check, gsx_perfmon, interface_check, mux_loop_script,
     ds1_gsx_test, morning_check, site_sweep, ospf_stability, ixc_stability,
+    sor_collect,
 ]
 
 
@@ -459,6 +446,48 @@ def api_reverse_autotester_run():
     # every device a second time -- so roughly double again.
     job_id = _launch_job(gsx_ip, _warn_after(8 if params["analyze"] else 4),
                          lambda: reverse_autotester.run(params))
+    return jsonify(job_id=job_id)
+
+
+# ---- SoR inventory cache ---------------------------------------------------
+
+@app.route("/tools/sor")
+def page_sor():
+    # Read the cache fresh on every view: a collection run in another tab,
+    # or from the CLI, must show up here without restarting the server.
+    state = sor_store.migrate(sor_store.load(), lambda *a: None)
+    return render_template(
+        "sor.html",
+        s=sor_store.summary(state),
+        rows=sor_store.rows(state),
+        changes=sor_store.changes(state, limit=200),
+        unverified=sor_store.unverified(state),
+        fields=sor_store.FIELDS,
+        netbox_claims=sor_store.NETBOX_CLAIMS)
+
+
+@app.route("/api/sor/run", methods=["POST"])
+def api_sor_run():
+    f = request.form
+    ip_1250 = (f.get("ip_1250") or "").strip()
+    if not _valid_ip(ip_1250):
+        return jsonify(error="Enter a valid 1250 IP (4 octets, e.g. 10.111.131.77)."), 400
+    infra_user, infra_pass = _creds(f)
+    gsx_user, gsx_pass = _creds(f, "gsx_user", "gsx_pass")
+    if not (infra_user and infra_pass and gsx_user and gsx_pass):
+        return jsonify(
+            error="Infrastructure and GSX credentials are both required."), 400
+
+    params = {
+        "ip_1250": ip_1250,
+        "username": infra_user, "password": infra_pass,
+        "gsx_user": gsx_user, "gsx_pass": gsx_pass,
+        "open_when_done": f.get("open_when_done") == "on",
+    }
+    # Collects EVERY DS1 on the 1250, so give it the same headroom a
+    # multi-DS1 forward run gets -- it is one, internally.
+    job_id = _launch_job(ip_1250, _warn_after(28),
+                         lambda: sor_collect.run(params))
     return jsonify(job_id=job_id)
 
 

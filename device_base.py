@@ -24,6 +24,18 @@ import threading
 
 import paramiko
 
+# Warn once, at import, if the installed paramiko cannot reach the MUX.
+#
+# This lives here rather than in app.py because device_base is the one module
+# every path to a device passes through -- web app, CLI launcher, a tool run
+# standalone, or another front end calling run(params). app.py alone covered
+# one of those four (v2.37); the colleague who hit the paramiko 5 failure was
+# on a different one.
+#
+# Warns, never raises: paramiko 5 breaks only the MUX/GSX hops.
+import env_check
+env_check.check_paramiko()
+
 
 def _is_valid_ip(s):
     """Return True if s is a valid IPv4 address (4 octets, each 0-255)."""

@@ -507,7 +507,10 @@ def _run_from_1250(params):
     if plink_path and gsx_node and gsx_node != "?":
         print("  [GSX] resolving {} ...".format(gsx_node))
         gsx_dev = netbox.derive_gsx_device_name(gsx_node, hub_hostname)
-        cards   = netbox.gsx_mgmt_ips(gsx_dev)
+        _nbw    = []
+        cards   = netbox.gsx_mgmt_ips(gsx_dev, _nbw)
+        if not cards and _nbw:
+            print("  [!] {}".format(_nbw[0]))
         if cards:
             _, gsx_ip_actual = find_live_ip(cards)
 

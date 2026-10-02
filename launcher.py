@@ -28,7 +28,12 @@ import os
 import glob
 import importlib
 
+import env_check
 from device_base import CredentialError
+
+# device_base's import already runs this; called again so the banner is the
+# first thing on screen in the menu, above the tool list.
+env_check.check_all()
 
 
 def discover_tools():
