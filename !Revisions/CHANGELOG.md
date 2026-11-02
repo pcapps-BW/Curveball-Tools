@@ -15,6 +15,95 @@ that's bitten this project before.
 
 ---
 
+## v2.50 — 2026-11-02
+
+### #3 continued -- MUX loop detection, grounded from Cisco docs
+
+pcapps has never had to go intrusive, so there is no looped-MUX output to
+sample -- and suggested searching, since it is a Cisco box. That turned up the
+answer and it is better than the hairpin I had guessed at.
+
+The NCS 4200/4216 CEM loopback is a **standard Cisco controller statement**
+(confirmed, Cisco NCS 4200 48-port T1/E1 CEM config guide, IOS XE Fuji 16.7.x,
+"Configuring Loopback"):
+
+```
+controller t1 0/0/1
+ loopback local line      (loops the line signal back -- faces the LEC)
+ loopback network line    (loops toward the packet/PSN side)
+ loopback diag
+```
+
+removed with `no loopback`. So detecting a MUX loop is a config grep of the
+controller block the reverse autotester **already pulls**
+(`show run | b controller T3`) -- no new command, and standard documented
+Cisco rather than the suite's bespoke hairpin.
+
+`loop_check.mux_controller_loops()` parses it, tracking the enclosing
+`controller` and reporting the mode (`local` = faces LEC, `network` = faces
+PSN, `diag`). Wired into the reverse autotester with a warning line in the
+report; the GSX T1 loopback (v2.49) now shows in the reverse report too.
+
+The bespoke hairpin detector from v2.49 is kept as a secondary check but
+stays unwired and confirm-live -- the hairpin MOP has never actually been run,
+so there is nothing to validate it against, and the standard controller
+loopback is the far more likely thing a tech configures.
+
+Five new self-tests (local, network, diag, `no loopback`, clean config), all
+grounded on the documented syntax.
+
+**Still not built:** fiber/GE interface loops (low priority, unlikely), and
+wiring the MUX controller check into the FORWARD autotester's MUX hop (it does
+not currently retain the full controller block; one-line add when wanted).
+
+---
+
+## v2.49 — 2026-11-02
+
+### #3 -- loop checks: is a DS1 looped at any hop?
+
+**Why it matters:** a looped DS1 returns CLEAN performance monitors, because
+it is looping its own signal back. So "PMs clean" on a looped circuit is the
+single most misleading thing a PM tool can report. The loop warning now sits
+ABOVE the PMs at every hop that checks them.
+
+New shared module `loop_check.py`. Three detectors, each grounded on real
+output or the exact set-command shape:
+
+- **1250 TDM** -- `maintenance loopback terminal|facility` in the config
+  (`show configuration | display-set | match "maintenance loopback"`). One
+  grep covers every DS1. `release` never persists, so any such line is an
+  active loop. (terminal = faces BW core; facility = faces LEC.)
+- **GSX T1** -- the `Loopback Status:` field in `SHOW T1 <id> STATUS`, which
+  every GSX hop ALREADY pulls (confirmed `NONE` on a real LAXGSX04 capture).
+  No extra command. pcapps called this exactly: "GSX is probably just one of
+  the commands we already have."
+- **MUX CEM hairpin** -- a `connect` line whose two legs are identical (a
+  production connection joins two different legs; a hairpin points one back
+  at itself). Parser built and self-tested against the MOP shape.
+
+**Wired into** the forward autotester (1250 + GSX, warnings at the top of each
+DS1's diagnostic block), `ds1_pms` (per-channel banner + a LOOP tag on the
+finding line), and `site_sweep` (a `LOOP:` tag that also flips the DS1 to
+flagged). All read-only; the 1250 detector adds one config grep, the GSX
+detector adds nothing.
+
+**Not yet wired / not grounded** (TODO):
+- MUX hairpin -- parser exists but needs an autotester `show connection name`
+  pull to feed it and a real looped-connection dump to confirm the output
+  format.
+- Fiber/GE interface loops (1250 ge-tsX/1, 1800 10gig) -- high-impact if
+  looped but the fingerprint is unconfirmed; needs a sample. pcapps: "highly
+  unlikely".
+
+⚠ The 1250 and MUX detectors are UNVERIFIED against a live looped circuit --
+built against the set-command shape. The parser is structured so a near-miss
+misses a loop (clean PMs still shown, same as today) rather than inventing
+one. First real looped circuit confirms the format. 18 self-tests in
+`loop_check`.
+
+---
+
 ## v2.48 — 2026-11-02
 
 ### #4 -- NPT-1250 Discovery ("show tech") tweaks (tsandberg)

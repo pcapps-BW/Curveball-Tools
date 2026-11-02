@@ -25,6 +25,7 @@ import datetime
 import getpass
 
 import platform_paths
+import loop_check
 from device_base import CredentialError, prompt_ip
 from npt1250_client import NPT1250Client
 from jira_client import post_report, valid_ticket, post_slack, load_jira_config
@@ -283,10 +284,13 @@ def _build_report(host_1250, ip_1250, loopback_ip, ds1_list, config_map,
         is_dirty = ("Dirty" in tdm_cd or "Dirty" in ces_cd)
         if is_dirty:
             dirty_ds1s.append(ds1)
-        icon = "[ !! ]" if is_dirty else "[ OK ]"
+        _loop = config_map.get(ds1, {}).get("loop")
+        icon = "[ !! ]" if (is_dirty or _loop) else "[ OK ]"
         muse = config_map.get(ds1, {}).get("muse_id", "?")
-        emit("  {}  {:<8}  TDM {} / CES {}  ({})".format(
-            icon, ds1.upper(), tdm_cd, ces_cd, muse))
+        _loop_tag = ("  LOOP:{}".format(
+            ",".join(x["type"] for x in _loop)) if _loop else "")
+        emit("  {}  {:<8}  TDM {} / CES {}  ({}){}".format(
+            icon, ds1.upper(), tdm_cd, ces_cd, muse, _loop_tag))
 
     emit("")
     if dirty_ds1s:
@@ -449,6 +453,18 @@ def run(params):
         # ── DS1 PMs ───────────────────────────────────────────────────────
         print("[1250] Collecting DS1 PMs ({} DS1s)...".format(len(ds1_list)))
         pm_results = c1250.query_ds1_pms(ds1_list)
+
+        # ── Loop detection ────────────────────────────────────────────────
+        # A looped DS1 reads clean PMs, so flag it before the clean/dirty
+        # verdict. One grep; stash per-DS1 into config_map (already threaded).
+        try:
+            _lraw = c1250.run(loop_check.LOOP_CONFIG_CMD)
+            for _d in ds1_list:
+                _lp = loop_check.loops_for_ds1(_lraw, _d)
+                if _lp:
+                    config_map.setdefault(_d, {})["loop"] = _lp
+        except Exception as e:
+            print("  [!] loop check skipped: {}: {}".format(type(e).__name__, e))
 
         # ── Fiber uplink ──────────────────────────────────────────────────
         print("[1250] Collecting fiber uplink health...")

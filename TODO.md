@@ -60,6 +60,26 @@ can be built later without re-deriving the knowledge. Keep capturing pasted
 reference (screenshots, CLI output) into `C:\Claude\*_reference.md` files —
 durable across sessions, which conversation context is not.
 
+## Loop checks (#3) -- remaining coverage
+
+Done 2026-11-02 (v2.49): 1250 TDM `maintenance loopback` and GSX T1
+`Loopback Status` -- both grounded on real output, wired into the autotester
+and ds1_pms. `loop_check.py` is the shared module.
+
+Remaining, parser built but not wired / not grounded on live output:
+- [x] **MUX loopback** -- DONE v2.50. The standard Cisco controller loopback
+      (`loopback local|network|diag`) is grounded on the NCS 4200 CEM config
+      guide and detected from the controller config the reverse autotester
+      already pulls. `mux_controller_loops()`. The bespoke hairpin detector
+      (`mux_hairpin_from_connect`) is kept as a secondary check; it is still
+      confirm-live and unwired, since the hairpin MOP has never been run.
+- [ ] **GSX**: covered (Loopback Status field). pcapps was right it is just a
+      field in a command we already pull.
+- [ ] **Fiber/GE loops** (1250 ge-tsX/1, 1800 10gig) -- not built. A looped
+      fiber uplink is high-impact (could down the site), so detecting one is
+      worth it, but the config/status fingerprint is unconfirmed -- needs a
+      sample. Lower priority (pcapps: "highly unlikely").
+
 ## Known Issues / Watch List
 - [ ] **`ge-ts2/1` is reported as a fiber uplink at dual-1250 markets, where
       it is actually the local A-B cross-connect.** Found 2026-10-02 while

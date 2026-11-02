@@ -26,6 +26,7 @@ try:
 except ImportError as e:
     _DEP_ERROR = "paramiko not installed (pip install paramiko): {}".format(e)
 
+import loop_check
 from npt1250_client import NPT1250Client
 from device_base import CredentialError, prompt_ip
 from jira_client import post_report, valid_ticket
@@ -191,6 +192,11 @@ def run(params):
                     lines.append("    {}".format(clean))
             return raw
 
+        # Loop detection, once: a DS1 looped back reads CLEAN PMs regardless
+        # of the real circuit, so the loop warning has to sit ABOVE the PMs.
+        # One config grep covers every channel on the box.
+        loop_raw = c.run(loop_check.LOOP_CONFIG_CMD)
+
         findings = []   # per-DS1 one-liners for the JIRA summary
         for ch, slot, ch_num in channels:
             print("  collecting: {}".format(ch))
@@ -198,6 +204,9 @@ def run(params):
             lines.append("=" * 64)
             lines.append("  -- {} --".format(ch))
             lines.append("=" * 64)
+            _loops = loop_check.loops_for_ds1(loop_raw, ch)
+            if _loops:
+                lines.append(loop_check.loop_banner(_loops, ch))
             raw_status = block("Physical Status",
                   'show interfaces physical status slot {} | grep "ds1/{} "'.format(slot, ch_num))
             raw_alarms = block("NE Alarms", "show ne alarms | grep {}".format(ch))
@@ -218,6 +227,9 @@ def run(params):
                           if ch in l and l.strip()]
             finding = "{}  {}".format(ch, status_row if status_row
                                       else "(no status row returned)")
+            if _loops:
+                finding += "  |  LOOP: {}".format(
+                    ", ".join(lp["type"] for lp in _loops))
             if alarm_rows:
                 finding += "  |  {} alarm(s): {}".format(
                     len(alarm_rows), alarm_rows[0][:60])

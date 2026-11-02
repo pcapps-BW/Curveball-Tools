@@ -62,6 +62,7 @@ from mux4216_client import MUX4216Client
 from npt1800_client import NPT1800Client
 from npt1250_client import NPT1250Client
 import gsx_client
+import loop_check
 import autotester_standalone
 from gsx_client import GSXClient, find_plink
 from device_base import CredentialError
@@ -311,6 +312,15 @@ def trace(gsx_ip, t1_id, infra_user, infra_pass, gsx_user, gsx_pass,
         # (2026-10-01). `| section` is no help either -- on this platform it
         # behaves like `| include`. See mux4216_client.T3_CONFIG_CMD.
         raw_run = cmux.run(mux4216_client.T3_CONFIG_CMD, 90)
+        # MUX controller loopback (standard Cisco `loopback local|network`),
+        # from the controller config we just pulled -- no extra command. A
+        # looped controller makes everything downstream read clean.
+        _mux_loops = loop_check.mux_controller_loops(raw_run)
+        if _mux_loops:
+            ctx["mux_loops"] = _mux_loops
+            log("    [!] MUX controller LOOPBACK: " + "; ".join(
+                "{} {}".format(l["controller"] or "?", l["mode"])
+                for l in _mux_loops))
         t3_id, desc, cem_id, note = mux4216_client.t3_for_gsx_t1(
             raw_run, ctx["gsx_node"], parts["slot"], parts["port"],
             parts["t1"])
@@ -771,6 +781,16 @@ def render(hops, ctx):
         for ln in ctx["gsx_t3_status"].splitlines():
             out.append("    {}".format(ln))
     # ISUP circuit + trunk group, information only (mgmt/Barlow).
+    # Loop warnings -- a loop anywhere makes the PMs above read clean.
+    if ctx.get("mux_loops"):
+        out += ["", "  [ !! ] MUX CONTROLLER LOOPBACK: " + "; ".join(
+            "{} {}".format(l["controller"] or "?", l["mode"])
+            for l in ctx["mux_loops"]) +
+            " -- PMs through a loop are not the real circuit."]
+    _gl = loop_check.gsx_loop_from_t1_status(
+        "\n".join(o for _l, _c, o in (ctx.get("gsx_t1_stats") or [])))
+    if _gl:
+        out += ["  [ !! ] GSX T1 LOOPBACK active ({}) -- same caveat.".format(_gl)]
     if ctx.get("gsx_isup_raw") or ctx.get("gsx_trunk_raw"):
         out += [SEP, "  GSX ISUP CIRCUIT  (information only)", SEP]
         if ctx.get("gsx_isup_id"):

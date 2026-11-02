@@ -217,6 +217,8 @@ string it's given by a caller. The callers, complete as of v2.35:
 and so was the first caller to drive this client as its entry point rather
 than its last hop.
 
+**Added 2026-11-02:** `loop_check.LOOP_CONFIG_CMD` = `show configuration | display-set | match "maintenance loopback" | no-more`, run by the autotester's 1250 hop and `ds1_pms` to detect a configured TDM loopback. A **read**. The GSX and MUX loop detectors parse output the suite already pulls (`SHOW T1 ... STATUS`, `show connection name`), no new command.
+
 **Added 2026-11-02:** `gsx_client.pull_isup_circuit()` sends
 `SHOW ISUP CIRCUIT SHELF 1 SLOT <s> PORT <p> DS1 <d> status` and
 `show trunk group <name> admin` — both **reads**, called from the forward

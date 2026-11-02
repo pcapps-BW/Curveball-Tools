@@ -15,6 +15,7 @@ Built by P. Capps.
 """
 
 import re
+import loop_check
 import datetime
 import textwrap
 
@@ -1522,8 +1523,9 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
                              all_t3_stats, peerless, errors, gsx_pm_results=None,
                              fiber_results=None, evc_results=None,
                              ospf_events_raw=None, ldp_session_raw=None,
-                             gsx_t3_results=None):
+                             gsx_t3_results=None, loop_1250=None):
     gsx_pm_results  = gsx_pm_results or {}
+    loop_1250 = loop_1250 or {}   # ds1 -> list of 1250 maintenance loops
     _ces_disabled = []   # DS1s needing the CES-enable MOP (see end of fn)
     gsx_t3_results  = gsx_t3_results or {}
     fiber_results = fiber_results or {}
@@ -1576,6 +1578,18 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
             lines.append("  COLLECTION FAILED: {}".format(errors[ds1]))
             lines.append("")
             continue
+
+        # Loop warnings go FIRST -- a looped DS1 reads clean PMs at every hop
+        # below, so "everything's clean" must be read in light of the loop.
+        _mux_for_loop = mux_results.get(ds1, {})
+        if loop_1250.get(ds1):
+            lines.append(loop_check.loop_banner(loop_1250[ds1], ds1))
+            lines.append("")
+        if _mux_for_loop.get("gsx_loop"):
+            lines.append("  [ !! ] GSX T1 LOOPBACK active ({}) -- the GSX T1 is "
+                         "looped, so its PMs below are not the real circuit."
+                         .format(_mux_for_loop["gsx_loop"]))
+            lines.append("")
 
         pm   = pm_results.get(ds1, "")
         oc12 = oc12_results.get(ds1, "")

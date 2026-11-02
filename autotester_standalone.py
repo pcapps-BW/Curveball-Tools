@@ -36,6 +36,7 @@ from output_builders import (
 )
 from jira_client import post_report, valid_ticket, post_slack, JIRA_BASE
 from ds1_util import expand_ds1_list
+import loop_check
 
 # loc -> MUX (from SecureCRT LOC_TO_MUX)
 LOC_TO_MUX = {
@@ -339,6 +340,20 @@ def run(params):
     progress("  host: {}".format(host_1250))
 
     ds1_map, step1_errors = c1250.query_batch(ds1_list)
+    # Loop detection on the 1250 TDM side, once: a DS1 looped back reads CLEAN
+    # PMs regardless of the real circuit, so the warning has to reach the
+    # summary. One config grep covers every DS1.
+    loop_1250 = {}
+    try:
+        _lraw = c1250.run(loop_check.LOOP_CONFIG_CMD)
+        for ds1 in ds1_map:
+            _lp = loop_check.loops_for_ds1(_lraw, ds1)
+            if _lp:
+                loop_1250[ds1] = _lp
+                progress("  [!] {} -> MAINTENANCE LOOP on the 1250 ({})".format(
+                    ds1, ", ".join(x["type"] for x in _lp)))
+    except Exception as e:
+        progress("  [!] loop check skipped: {}: {}".format(type(e).__name__, e))
     for ds1, info in ds1_map.items():
         progress("  {} -> MUSE {} | hub {} | loopback {}".format(
             ds1, info["muse_id"], info["hub_ip"], info["loopback_ip"]))
@@ -687,6 +702,14 @@ def run(params):
                 r["gsx_isup_id"]   = isup.get("isup_id")
                 r["gsx_isup_raw"]  = isup.get("isup_raw", "")
                 r["gsx_trunk_raw"] = isup.get("trunk_raw", "")
+                # GSX T1 loopback -- read from the STATUS output already pulled
+                # above (no extra command). A looped T1 reads clean too.
+                _status = next((o for lbl, cmd, o in stats
+                                if "STATUS" in lbl.upper()), "")
+                _gl = loop_check.gsx_loop_from_t1_status(_status)
+                if _gl:
+                    r["gsx_loop"] = _gl
+                    progress("     [!] GSX T1 LOOPBACK active: {}".format(_gl))
                 if isup.get("isup_id"):
                     progress("     ISUP circuit: {}".format(isup["isup_id"]))
             except Exception as e:
@@ -770,7 +793,7 @@ def run(params):
             hub_results, mux_results_all, oc12_stats_all,
             t3_stats_all, peerless_all, step1_errors_all, gsx_pm_results,
             fiber_results, evc_results, ospf_events_raw, ldp_session_raw,
-            gsx_t3_results=gsx_t3_results)
+            gsx_t3_results=gsx_t3_results, loop_1250=loop_1250)
         emit(ds1_diag_text)
         emit("")
         diag_text_parts.append(ds1_diag_text)
