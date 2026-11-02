@@ -193,7 +193,12 @@ def gsx_loop_from_t1_status(t1_status_raw):
 # controller config (`show run | b controller T3`), so this is a config grep,
 # no new command -- and it is standard documented Cisco, not the suite's
 # bespoke hairpin. This is the primary MUX loop check.
-_MUX_CTRL_HDR_RE = re.compile(r'^\s*controller\s+(T[13]\s+\S+)', re.I)
+# Both MUX sides: the T3/T1 controller faces the GSX; the SONET controller
+# faces the 1800 (the OCx back-side). A loopback can sit on either, so both
+# controller types are recognised (pcapps, 2026-11-02: "both sides of the MUX
+# can be checked").
+_MUX_CTRL_HDR_RE = re.compile(
+    r'^\s*controller\s+((?:T[13]|SONET|OC\d*)\s+\S+)', re.I)
 _MUX_LOOP_RE = re.compile(r'^\s*loopback\s+(local|network|diag)\b', re.I)
 
 
@@ -266,6 +271,21 @@ def mux_hairpin_from_connect(connect_raw):
     return None
 
 
+def status_line(hop, looped, detail=""):
+    """
+    A loop STATUS line that is always emitted -- '[ OK ]' when clean so the
+    reader knows the check ran, '[ !! ]' with the detail when looped.
+
+    pcapps, 2026-11-02: wants loop status shown even when no loop is found
+    (excluding fiber/GE interfaces), so absence of a warning is not confused
+    with absence of the check.
+    """
+    if looped:
+        return "  [ !! ] {} LOOP: {} -- PMs read through a loop show clean.".format(
+            hop, detail)
+    return "  [ OK ] {} -- no loop".format(hop)
+
+
 def self_test(verbose=True):
     fails = []
 
@@ -336,6 +356,14 @@ def self_test(verbose=True):
     chk("MUX network loopback detected",
         mux_controller_loops("controller T1 0/0/1\n loopback network line")[0]["mode"],
         "network")
+    # Both MUX sides: a loop on the SONET (1800-facing) controller is caught
+    # too, not just the T3 (GSX-facing) one.
+    _both = ("controller SONET 0/13/1\n loopback network line\n!\n"
+             "controller T3 8/1/12\n loopback local line\n!\n")
+    _bl = mux_controller_loops(_both)
+    chk("both MUX sides detected", len(_bl), 2)
+    chk("SONET (1800-facing) controller is one of them",
+        any(l["controller"].startswith("SONET") for l in _bl), True)
     chk("no loopback is not an active loop",
         mux_controller_loops("controller T1 0/0/1\n no loopback"), [])
     chk("clean controller config -> no loop",

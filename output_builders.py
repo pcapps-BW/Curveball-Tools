@@ -1518,6 +1518,59 @@ def build_peerless_block(ds1, host_1250, loopback_ip, muse_id,
 
 
 # ---- DIAGNOSTIC SUMMARY (vertical route, OK/!! indicators, X connectors) ----
+def mux_xconnect_status(mux):
+    """
+    Validate the MUX CEM cross-connect is built as expected.
+
+    The MUX joins the ACR/1250 side (CEM-ACR<acr>:<cem>) to the GSX side
+    (CE<gsx_ce>:<gsx_id>). All four values are already resolved by the MUX
+    hop, and the connection's live state and leg states are captured too
+    (connection_state, xconnect_ok), so this does not add a device command --
+    it states, explicitly, whether the binding that is UP is the one we
+    expect.
+
+    Returns a list of report lines (may be empty when the MUX hop produced no
+    xconnect data -- e.g. a Peerless circuit or a failed MUX resolve).
+    """
+    acr    = (mux or {}).get("acr_group")
+    cem    = (mux or {}).get("cem_group")
+    gsx_ce = (mux or {}).get("gsx_ce_iface")
+    gsx_id = (mux or {}).get("gsx_cem_id")
+    # Nothing to validate if the MUX hop did not resolve the binding.
+    if not (acr and cem and acr != "?" and cem != "?"):
+        return []
+
+    expected = "CEM-ACR{}:{} <-> CE{}:{}".format(
+        acr, cem, gsx_ce or "?", gsx_id or "?")
+    state  = (mux.get("connection_state") or "?")
+    xc_ok  = mux.get("xconnect_ok")
+    xc_raw = (mux.get("xconnect_raw") or "").strip()
+
+    lines = ["  XCONNECT STATUS:"]
+    # State of the named connection binding.
+    if state.upper() in ("UP", "CONNECTED"):
+        lines.append("  [ OK ] connection UP -- {}".format(expected))
+    elif state in ("?", ""):
+        lines.append("  [ -- ] connection state not read -- {}".format(expected))
+    else:
+        lines.append("  [ !! ] connection state {} (expected UP) -- {}".format(
+            state, expected))
+    # Both xconnect legs present and not down.
+    if xc_ok is True:
+        lines.append("  [ OK ] both xconnect legs up")
+    elif xc_ok is False and xc_raw:
+        lines.append("  [ !! ] an xconnect leg is DOWN: {}".format(
+            xc_raw.splitlines()[0][:80]))
+    elif xc_ok is False:
+        lines.append("  [ !! ] xconnect not found for CE{}:{} -- the binding "
+                     "may not be built".format(acr, cem))
+    # A conflict the MUX hop already flagged means the binding we validated
+    # might be a different circuit's -- surface it here, where the binding is.
+    if mux.get("gsx_xc_conflict"):
+        lines.append("  [ !! ] {}".format(mux["gsx_xc_conflict"]))
+    return lines
+
+
 def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
                              hub_results, mux_results, all_oc12_stats,
                              all_t3_stats, peerless, errors, gsx_pm_results=None,
@@ -1579,16 +1632,32 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
             lines.append("")
             continue
 
-        # Loop warnings go FIRST -- a looped DS1 reads clean PMs at every hop
+        # Loop status goes FIRST -- a looped DS1 reads clean PMs at every hop
         # below, so "everything's clean" must be read in light of the loop.
+        # Status is shown even when clean (pcapps 2026-11-02) so absence of a
+        # warning is not mistaken for absence of the check. Fiber/GE excluded.
         _mux_for_loop = mux_results.get(ds1, {})
-        if loop_1250.get(ds1):
-            lines.append(loop_check.loop_banner(loop_1250[ds1], ds1))
-            lines.append("")
-        if _mux_for_loop.get("gsx_loop"):
-            lines.append("  [ !! ] GSX T1 LOOPBACK active ({}) -- the GSX T1 is "
-                         "looped, so its PMs below are not the real circuit."
-                         .format(_mux_for_loop["gsx_loop"]))
+        _l1250 = loop_1250.get(ds1)
+        _lmux = _mux_for_loop.get("mux_loop")
+        _lgsx = _mux_for_loop.get("gsx_loop")
+        lines.append("  LOOP STATUS:")
+        lines.append(loop_check.status_line(
+            "1250 {}".format(ds1), _l1250,
+            ", ".join(x["type"] for x in _l1250) if _l1250 else ""))
+        lines.append(loop_check.status_line(
+            "MUX {}".format((_mux_for_loop.get("gsx_ce_iface") or "").strip()
+                            or "controller"),
+            _lmux, "; ".join("{} {}".format(l["controller"] or "?", l["mode"])
+                             for l in _lmux) if _lmux else ""))
+        lines.append(loop_check.status_line(
+            "GSX T1", bool(_lgsx), _lgsx or ""))
+        lines.append("")
+
+        # MUX cross-connect validation -- is the binding that is UP the one we
+        # expect? (ACR/CEM side joined to the GSX CE side.)
+        _xc = mux_xconnect_status(_mux_for_loop)
+        if _xc:
+            lines.extend(_xc)
             lines.append("")
 
         pm   = pm_results.get(ds1, "")

@@ -15,6 +15,110 @@ that's bitten this project before.
 
 ---
 
+## v2.53 — 2026-11-02
+
+### MUX cross-connect validation -- is the binding built as expected?
+
+Requested alongside the loop checks: validate that the cross-connects are
+built as expected. The MUX is the one hop with a self-contained expectation,
+so it is done now; the full cross-hop version (live route vs the SoR record)
+is on pcapps' list as a SoR feature.
+
+The MUX joins the ACR/1250 side (`CEM-ACR<acr>:<cem>`) to the GSX side
+(`CE<gsx_ce>:<gsx_id>`). All four values, plus the connection's live state
+and the leg states, are ALREADY resolved by the MUX hop -- so this adds no
+device command. It states explicitly whether the binding that is UP is the
+one expected:
+
+```
+  XCONNECT STATUS:
+  [ OK ] connection UP -- CEM-ACR26:723 <-> CE8/1/12:113
+  [ OK ] both xconnect legs up
+```
+
+and the ways it can be wrong, each its own line:
+
+- `[ !! ] connection state DOWN (expected UP) -- <binding>`
+- `[ !! ] an xconnect leg is DOWN: <leg>`
+- `[ !! ] xconnect not found for CE<acr>:<cem> -- the binding may not be built`
+- `[ !! ] <gsx_xc_conflict>` -- surfaced here, where the binding is, when the
+  MUX hop already found more than one endpoint matching (the binding
+  validated might be a different circuit's)
+
+`[ -- ]` when the connection state could not be read, and the block is omitted
+entirely when the MUX hop produced no binding (Peerless, or a failed resolve)
+-- no false "as expected" on a circuit that has no MUX leg. Rendered in the
+forward autotester's diagnostic summary, under the LOOP STATUS block. All six
+branches verified.
+
+---
+
+## v2.52 — 2026-11-02
+
+### MUX loop check now covers BOTH sides, not just the GSX-facing one
+
+pcapps caught it: the MUX loop check was only looking at the T3/CE controller
+(faces the GSX). The SONET controller (faces the 1800, the OCx back-side)
+was never checked, so a `loopback` on the 1800-facing side read as "no loop".
+
+Two fixes:
+
+- `loop_check.mux_controller_loops()` now recognises `controller SONET` and
+  `controller OC...` headers, not only `T1`/`T3`.
+- The config pull changed from `show run | b controller T3` to
+  `show running-config | section controller`. `| b controller T3` begins AT
+  the first T3 and so misses the SONET controllers listed above it;
+  `| section controller` returns every controller stanza. Changed in both the
+  forward autotester's MUX hop and the reverse trace.
+- The forward per-DS1 match now checks **both** of that DS1's MUX interfaces:
+  the T3/CE (`gsx_ce_iface`, faces GSX) and the SONET (`active_sonet`, faces
+  1800).
+
+So "MUX -- no loop" now means no loop on either side. Self-tested with a
+SONET-side loop confirmed caught.
+
+---
+
+## v2.51 — 2026-11-02
+
+### Loop status is now always shown, not only on a loop
+
+The v2.49/50 loop checks printed only when a loop WAS found, so a clean
+circuit showed nothing -- and absence of a warning was indistinguishable from
+the check not running. pcapps wants explicit status (excluding fiber/GE), so
+the report now states it either way:
+
+```
+  LOOP STATUS:
+  [ OK ] 1250 ts1/26 -- no loop
+  [ OK ] MUX 8/1/12 -- no loop
+  [ OK ] GSX T1 -- no loop
+```
+
+and when looped:
+
+```
+  LOOP STATUS:
+  [ !! ] 1250 ts1/26 LOOP: terminal -- PMs read through a loop show clean.
+  [ !! ] MUX 8/1/12 LOOP: T3 8/1/12 local -- PMs read through a loop show clean.
+  [ !! ] GSX T1 LOOP: LINE -- PMs read through a loop show clean.
+```
+
+`loop_check.status_line()` is the shared renderer. Wired into:
+
+- **forward autotester** diagnostic summary -- all three hops. This also
+  **wires the MUX controller loop into the forward tool**, which v2.50 only
+  did for the reverse: one `show run | b controller T3` read in the MUX hop,
+  matched to each DS1 by its T3 (CE) interface.
+- **ds1_pms** -- the 1250 hop status per channel.
+- **reverse autotester** -- MUX + GSX status (it has no 1250 TDM config in
+  hand; the 1250 hop there is the far-end discovery, not the DS1 config).
+
+Fiber/GE interface loops remain excluded, as requested. No new self-tests
+beyond `status_line`'s own; the detectors are unchanged from v2.50.
+
+---
+
 ## v2.50 — 2026-11-02
 
 ### #3 continued -- MUX loop detection, grounded from Cisco docs

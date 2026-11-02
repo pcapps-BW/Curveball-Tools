@@ -204,9 +204,12 @@ def run(params):
             lines.append("=" * 64)
             lines.append("  -- {} --".format(ch))
             lines.append("=" * 64)
+            # Explicit 1250 loop status, shown even when clean so absence of a
+            # warning is not mistaken for absence of the check.
             _loops = loop_check.loops_for_ds1(loop_raw, ch)
-            if _loops:
-                lines.append(loop_check.loop_banner(_loops, ch))
+            lines.append(loop_check.status_line(
+                "1250 {}".format(ch), _loops,
+                ", ".join(x["type"] for x in _loops) if _loops else ""))
             raw_status = block("Physical Status",
                   'show interfaces physical status slot {} | grep "ds1/{} "'.format(slot, ch_num))
             raw_alarms = block("NE Alarms", "show ne alarms | grep {}".format(ch))

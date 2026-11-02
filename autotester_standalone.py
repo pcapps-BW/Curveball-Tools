@@ -26,6 +26,7 @@ from netbox_client import NetboxClient, load_netbox_config
 from npt1250_client import NPT1250Client
 from device_base import CredentialError, prompt_ip
 from npt1800_client import NPT1800Client
+import mux4216_client
 from mux4216_client import MUX4216Client
 from gsx_client import (GSXClient, find_plink, find_live_ip,
                         connect_first_live, node_names_match)
@@ -574,6 +575,19 @@ def run(params):
 
         mux_results, t3_stats, mn, mip, errs = cmux.query_batch(
             mux_info["name"], mux_info["ip"], ds1_oc12_map, hostmap, netbox)
+        # MUX controller loopback (standard Cisco `loopback local|network`),
+        # from the controller running-config. One read; matched per DS1 by its
+        # T3 (CE) interface below.
+        # `| section controller` gets EVERY controller stanza (T3/T1 facing
+        # the GSX, and SONET facing the 1800), so both MUX sides are checked
+        # -- `| b controller T3` would miss the SONET controllers above it.
+        _mux_loops_all = []
+        try:
+            _ctrlraw = cmux.run("show running-config | section controller", 90)
+            _mux_loops_all = loop_check.mux_controller_loops(_ctrlraw)
+        except Exception as e:
+            progress("  [!] MUX loop check skipped: {}: {}".format(
+                type(e).__name__, e))
         cmux.close()
 
         for ds1, r in mux_results.items():
@@ -581,6 +595,16 @@ def run(params):
                 r["netbox_conflict"] = (
                     "{}; {}".format(fallback_note, r["netbox_conflict"])
                     if r.get("netbox_conflict") else fallback_note)
+            # Attach any controller loopback on EITHER of this DS1's MUX
+            # interfaces: the T3/CE (faces GSX) and the SONET (faces 1800).
+            _ifaces = {(r.get("gsx_ce_iface") or "").strip(),
+                       (r.get("active_sonet") or "").strip()} - {""}
+            if _ifaces and _mux_loops_all:
+                _mine = [l for l in _mux_loops_all
+                         if (l["controller"] or "").split()[-1:]
+                         and (l["controller"] or "").split()[-1] in _ifaces]
+                if _mine:
+                    r["mux_loop"] = _mine
             mux_results_all[ds1] = r
             progress("  {} -> SONET {} ACR {} CEM {} | GSX {}-{}-{}-{}".format(
                 ds1, r["active_sonet"], r["acr_group"], r["cem_group"],
