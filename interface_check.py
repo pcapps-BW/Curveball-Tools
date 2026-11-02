@@ -420,9 +420,16 @@ def run(params):
             ]:
                 print("  collecting: {}".format(title))
                 out = c.run(cmd, 30)
+                # The device writes "4 packets transmitted, 4 received, 0%
+                # packet loss" -- NOT "4 packets received". The old pattern
+                # required the word "packets" before "received", so it matched
+                # nothing and every ping reported "no ping statistics in
+                # output" even when all four replied (pcapps, DFW
+                # xe-ts16/2.732, 2026-11-02). "packets" before "received" is
+                # now optional.
                 pm = re.search(
-                    r'(\d+)\s+packets transmitted,\s*(\d+)\s+packets received,'
-                    r'\s*(\d+)%\s*packet loss', out)
+                    r'(\d+)\s+packets transmitted,\s*(\d+)\s+(?:packets\s+)?'
+                    r'received,\s*(\d+)%\s*packet loss', out)
                 if pm:
                     ping_results[title] = "{}/{} received ({}% loss)".format(
                         pm.group(2), pm.group(1), pm.group(3))

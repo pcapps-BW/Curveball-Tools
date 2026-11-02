@@ -15,6 +15,147 @@ that's bitten this project before.
 
 ---
 
+## v2.45 — 2026-11-02
+
+### Quick-wins batch: four NOC-reported fixes
+
+From pcapps' running to-do list. Four low-risk fixes, each verified against the
+paste he supplied.
+
+#### #2 -- Ping summary said "no ping statistics" when every ping replied
+
+`interface_check` parsed `(\d+)\s+packets received`, but the device writes
+`4 packets transmitted, 4 received` -- no "packets" before "received". So a
+working ping with four replies reported `no ping statistics in output`
+(pcapps, DFW xe-ts16/2.732). The word "packets" before "received" is now
+optional; both forms parse. Confirmed against the real paste including the
+100%-loss DF case.
+
+#### #7 -- OC12 "channel 1" also flagged channels 10-19
+
+The SONET controller output is pulled once per OC facility and shared by every
+DS1 on it, and the alarm list collected **every** AIS line without scoping to
+the circuit's own sub-channel. So a channel-1 circuit (`oc12-ts21/1:10:1`)
+reported the `:10:16` .. `:10:19` alarms as its own.
+
+New `_oc12_alarms_for(stat, subchannel)` scopes alarm lines by their
+`interface-name=`, END-ANCHORED so `:10:1` matches neither `:10:16` nor
+`:10:10` -- the same substring-boundary class as the LAXGSX04 bug. Unknown
+sub-channel still returns all lines rather than hiding them. Tested against the
+verbatim paste plus the `:10:10` adjacency.
+
+#### #9 -- PM output filtered to errors only; NOC wants rx/tx
+
+`ds1_pms` split the CES PM into three grep'd blocks (`grep Valid`, `grep ES`,
+`grep UAS`), which showed only error counters and hid the Rx/Tx PSN counters
+the NOC reads -- and rendered as three empty blocks on a clean circuit, since
+grep matched nothing. Replaced with one unfiltered
+`show interfaces pm 24hour <ds1> ces`. The physical PM was already full; this
+was the only grep-filtered PM in the suite.
+
+#### #1 -- IXC NNI traffic in Mbps, not pps
+
+`455563 pps in / 938023 pps out` is not a traffic level a human reads. The
+headline now leads with the device's own bps counter rendered as
+Gbps/Mbps/Kbps:
+
+```
+Traffic passing on this physical NNI -- 5.60 Mbps in / 11.50 Mbps out average over 1.9 min.
+```
+
+pps stays in the detail lines and still drives the keepalive / asymmetric /
+no-traffic verdicts, where it is the correct unit -- those thresholds are
+unchanged. Rate prefers the **Average** bps (pairs with the Average pps the
+verdict uses), falls back to **Current** rate (the only bps label confirmed on
+every device so far, labelled "current" when used), and falls back again to
+pps if the device emits no bps counter at all.
+
+⚠ **One thing to eyeball on the first live run:** the `IN/OUT Average Rate(bps)`
+label is assumed, not yet confirmed on a device -- only `Current Rate(bps)` is.
+If the detail line reads "... Mbps current" rather than "... Mbps avg", the
+device lacks the average-rate field and is using current; still correct, just
+worth knowing.
+
+---
+
+## v2.44 — 2026-10-02
+
+### GSX field accepts a hostname, not just an IP
+
+The three GSX-side forms (Reverse Autotester, GSX Perfmon, GSX Monitor) made
+the user go to NetBox, find the right management IP, and paste it. Now the
+field takes either:
+
+```
+GSX IP or hostname
+[ 192.168.40.5   or   LAXGSX01 ]
+```
+
+A hostname is resolved to its management IP through NetBox and the chosen IP
+is shown in the run log. An IP still passes straight through.
+
+#### Cheap because v2.33 already did the hard part
+
+`device_id_for('LAXGSX01')` already resolves a bare hostname to the right
+device via the `_first_label` match (case-insensitive exact, then contains
+narrowed by hostname). So no `.lax1` suffix, no `derive_gsx_device_name`,
+and no dependency on the 1800 hostname the reverse tool does not know until
+hop 7. `gsx_mgmt_ips` returns the device's management IPs;
+`find_live_ip` picks a pingable one.
+
+#### A free correctness check falls out of it
+
+Because v2.27 makes the GSX report its own name at login, typing `LAXGSX01`
+and being sent by NetBox to a box that calls itself something else is now
+caught by `node_names_match` (v2.28) -- you learn NetBox is wrong instead of
+silently tracing the wrong chassis. That check only exists *because* a name
+was typed.
+
+#### Shared resolver, one place
+
+`app._resolve_gsx(raw)` returns `(ip, note, error)`:
+
+- an IP passes through untouched -- the **escape hatch** for when NetBox is
+  wrong, which four NetBox lookup bugs on 2026-10-01 argue is not paranoia;
+- a hostname resolves through NetBox, preferring a ping-confirmed candidate
+  and falling back to the first with the fallback stated;
+- a half-typed IP (`192.168.40`) is rejected as such rather than searched for
+  as a device name;
+- NetBox unconfigured, or the name unresolvable, returns a plain-language
+  error and the route rejects with HTTP 400 before any job starts.
+
+It runs in the request and does NetBox + ICMP only -- no SSH, which stays in
+the job thread. ping != SSH (ATLGSX02), so the chosen IP is "reachable", not
+"logged in"; the tool reports the real connect outcome as always.
+
+#### The chosen IP is visible
+
+`_launch_job` gained an optional `initial_log`, so the resolution note is the
+first line of the live log:
+
+```
+[resolved GSX 'LAXGSX01' -> 192.168.40.5 via NetBox (ping-confirmed)]
+```
+
+A hostname that became an IP silently would be worse than the old
+paste-the-IP flow -- the user could not tell which box was hit.
+
+#### New dependency, stated plainly
+
+The three GSX forms now depend on NetBox for the hostname path, where before
+they depended on nothing. That is exactly why the IP path is kept working:
+when NetBox is wrong, paste the IP and carry on.
+
+#### Tests
+
+Eight cases: IP passthrough (NetBox untouched), blank, half-IP, hostname with
+a pingable candidate, hostname with none pingable, device absent, NetBox
+unconfigured, and all three routes rejecting a bad GSX with no job launched.
+Plus an end-to-end confirming a resolved hostname launches the job with the
+note seeded in the log.
+
+---
+
 ## v2.43 — 2026-10-02
 
 ### v2.32 missed four IPAM queries, and the GSX lookup was one of them

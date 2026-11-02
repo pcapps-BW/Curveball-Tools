@@ -107,8 +107,9 @@
   <form id="monitorForm" data-run-url="/api/gsx-monitor/run">
     <div class="row">
       <div>
-        <label for="mon_gsx_ip">GSX IP</label>
-        <input type="text" id="mon_gsx_ip" name="gsx_ip" placeholder="192.168.45.3">
+        <label for="mon_gsx_ip">GSX IP or hostname</label>
+        <input type="text" id="mon_gsx_ip" name="gsx_ip" placeholder="192.168.45.3  or  LAXGSX01">
+        <div class="hint">A hostname is resolved to its management IP via NetBox; the chosen IP is shown in the run log.</div>
       </div>
       <div>
         <label for="mon_t1_id">T1 assignment</label>

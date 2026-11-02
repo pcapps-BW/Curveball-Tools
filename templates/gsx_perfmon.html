@@ -6,8 +6,9 @@
 
 <div class="panel">
   <form id="runForm" data-run-url="/api/gsx-perfmon/run">
-    <label for="gsx_ip">GSX IP</label>
-    <input type="text" id="gsx_ip" name="gsx_ip" placeholder="192.168.45.3" required>
+    <label for="gsx_ip">GSX IP or hostname</label>
+    <input type="text" id="gsx_ip" name="gsx_ip" placeholder="192.168.45.3  or  LAXGSX01" required>
+    <div class="hint">A hostname is resolved to its management IP via NetBox; the chosen IP is shown in the run log. Enter an IP directly to bypass NetBox.</div>
 
     <label for="t1_id">T1 assignment</label>
     <input type="text" id="t1_id" name="t1_id" placeholder="T1-1-7-2-2 or 7-2-2" required>

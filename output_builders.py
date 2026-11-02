@@ -123,6 +123,39 @@ def _oc_label(oc_iface):
     return "OC{}".format(m.group(1)) if m else "OC"
 
 
+def _oc12_alarms_for(oc12_stat, subchannel):
+    """
+    AIS-V / R-DS1AIS-P alarm lines on a shared OC controller, scoped to ONE
+    circuit's sub-channel.
+
+    The SONET controller output is pulled once per OC facility and shared by
+    every DS1 riding it, so collecting every AIS line and attributing it to
+    each DS1 made a channel-1 circuit report the alarms for channels 16-19 as
+    its own (pcapps, 2026-11-02: looking at oc12-ts21/1:10:1, flagged the
+    :10:16 .. :10:19 alarms).
+
+    Each alarm line carries `interface-name=<subchannel>`, so match on that,
+    END-ANCHORED: ':10:1' must not match ':10:16' or ':10:10'. Same
+    substring-boundary class as the LAXGSX04 wrong-circuit bug.
+
+    If the circuit's sub-channel is unknown, every AIS line is returned rather
+    than none -- hiding alarms because we could not scope them would be the
+    worse failure.
+    """
+    ais = [l.strip() for l in (oc12_stat or "").splitlines()
+           if "R-DS1AIS-P" in l or "AIS-V" in l]
+    if not subchannel:
+        return ais
+    # interface-name=oc12-ts21/1:10:1 followed by a non-digit (';', space, EOL)
+    pat = re.compile(r'interface-name=' + re.escape(subchannel) + r'(?!\d)')
+    scoped = [l for l in ais if pat.search(l)]
+    # If none matched but the sub-channel carries no explicit :sts:ds1 (a bare
+    # OC facility), fall back to all -- better a noisy report than a silent one.
+    if not scoped and ":" not in subchannel.split("/")[-1]:
+        return ais
+    return scoped
+
+
 def _parse_cd(val):
     """'Clean' / 'Dirty (TAG)' / 'Disabled' -> (dirty_bool, tag_or_state)."""
     val = (val or "").strip()
@@ -1561,8 +1594,8 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         alarm_los = bool(re.search(r'DS1LOS-L', pm) and
                          re.search(r'port-name=ds1-{}'.format(re.escape(ds1)), pm, re.IGNORECASE))
         oc12_errs = _check_counters(oc12_stat, OC12_COUNTERS)
-        oc12_alarms = [l.strip() for l in oc12_stat.splitlines()
-                       if "R-DS1AIS-P" in l or "AIS-V" in l]
+        # Scope alarms to THIS circuit's sub-channel, not every DS1 on the OC.
+        oc12_alarms = _oc12_alarms_for(oc12_stat, oc12)
 
         if ds1 in peerless:
             lines.append("  Peerless circuit (ts{}).".format(peerless[ds1]))

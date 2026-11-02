@@ -63,7 +63,7 @@ app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v2.43"
+APP_VERSION = "v2.45"
 
 
 @app.context_processor
@@ -170,6 +170,70 @@ def _creds(f, user_key="infra_user", pass_key="infra_pass"):
     return u, p
 
 
+def _resolve_gsx(raw):
+    """
+    Accept a GSX IP *or* a hostname, return (ip, note, error).
+
+    An IP passes straight through -- it is the escape hatch for when NetBox
+    is wrong, which on this project's recent form is not paranoia (four
+    consecutive NetBox lookup bugs on 2026-10-01). A hostname is resolved
+    through NetBox: device_id_for already turns a bare 'LAXGSX01' into the
+    right device (v2.33's hostname match), and gsx_mgmt_ips returns its
+    management IPs. A pingable candidate is preferred; the first is the
+    fallback.
+
+    `note` is a one-line human record of what the hostname became, surfaced
+    in the job log so the user sees which IP was chosen. `error` is a
+    user-facing string or None.
+
+    This runs IN THE REQUEST, so it does NetBox (fast) and ICMP ping
+    (1-2s for a two-card GSX) only -- no SSH, which belongs in the job
+    thread. ping != SSH (ATLGSX02, 2026-10-01), so the chosen IP is
+    "reachable", not "logged into"; the tool reports the real connect
+    outcome.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None, "Enter a GSX IP or hostname."
+    if _valid_ip(raw):
+        return raw, None, None
+
+    # Looks like a hostname. It must not look like a half-typed IP, or we
+    # would quietly treat '192.168.40' as a device name and search NetBox
+    # for it.
+    if re.match(r'^[\d.]+$', raw):
+        return None, None, ("'{}' is not a complete IP address (need 4 "
+                            "octets) and is not a hostname.".format(raw))
+
+    from netbox_client import NetboxClient, load_netbox_config
+    from gsx_client import find_live_ip
+    nb_url, nb_token = load_netbox_config()
+    nb = NetboxClient(nb_url, nb_token)
+    if not nb.ok():
+        return None, None, ("'{}' is a hostname, but NetBox is not configured "
+                            "to resolve it to an IP. Enter the IP instead."
+                            .format(raw))
+
+    warns = []
+    cards = nb.gsx_mgmt_ips(raw, warns)
+    flat = [ip for key in sorted(cards) for ip in cards[key]]
+    if not flat:
+        return None, None, ("Could not resolve '{}' to a GSX IP via NetBox: {}"
+                            .format(raw, warns[0] if warns
+                                    else "no management IPs on that device"))
+
+    _card, live = find_live_ip(cards)
+    chosen = live or flat[0]
+    if live:
+        note = "resolved GSX '{}' -> {} via NetBox (ping-confirmed)".format(
+            raw, chosen)
+    else:
+        note = ("resolved GSX '{}' -> {} via NetBox -- NONE of its {} "
+                "address(es) answered ping; trying this one anyway".format(
+                    raw, chosen, len(flat)))
+    return chosen, note, None
+
+
 def _warn_after(count=1):
     """Seconds before the UI flags a running job as possibly hung. Scales
     gently for tools that loop per-DS1 (Autotester, DS1 PMs)."""
@@ -253,12 +317,16 @@ def _run_job(job_id, run_callable):
             _THREAD_JOB.pop(tid, None)
 
 
-def _launch_job(label, warn_seconds, run_callable):
+def _launch_job(label, warn_seconds, run_callable, initial_log=None):
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
         JOBS[job_id] = {
             "status": "running", "started": time.time(), "finished": None,
-            "report": None, "path": None, "error": None, "log": [],
+            "report": None, "path": None, "error": None,
+            # initial_log lets a route seed a line before the job thread
+            # starts -- used to show "resolved LAXGSX01 -> 192.168.40.5"
+            # so the user sees which IP a hostname became.
+            "log": list(initial_log or []),
             "warn_after": warn_seconds, "label": label,
         }
     t = threading.Thread(target=_run_job, args=(job_id, run_callable), daemon=True)
@@ -402,9 +470,9 @@ def api_reverse_autotester_run():
     drive the home-page tool list).
     """
     f = request.form
-    gsx_ip = (f.get("gsx_ip") or "").strip()
-    if not _valid_ip(gsx_ip):
-        return jsonify(error="Enter a valid GSX IP (4 octets, e.g. 192.168.40.5)."), 400
+    gsx_ip, gsx_note, gsx_err = _resolve_gsx(f.get("gsx_ip"))
+    if gsx_err:
+        return jsonify(error=gsx_err), 400
     t1_id = (f.get("t1_id") or "").strip()
     if not reverse_autotester.parse_t1_id(t1_id):
         return jsonify(
@@ -445,7 +513,8 @@ def api_reverse_autotester_run():
     # analysis on it then runs a whole forward autotester as well, walking
     # every device a second time -- so roughly double again.
     job_id = _launch_job(gsx_ip, _warn_after(8 if params["analyze"] else 4),
-                         lambda: reverse_autotester.run(params))
+                         lambda: reverse_autotester.run(params),
+                         initial_log=["[{}]".format(gsx_note)] if gsx_note else None)
     return jsonify(job_id=job_id)
 
 
@@ -611,9 +680,9 @@ def page_gsx_perfmon():
 @app.route("/api/gsx-perfmon/run", methods=["POST"])
 def api_gsx_perfmon_run():
     f = request.form
-    gsx_ip = (f.get("gsx_ip") or "").strip()
-    if not _valid_ip(gsx_ip):
-        return jsonify(error="Enter a valid GSX IP (4 octets)."), 400
+    gsx_ip, gsx_note, gsx_err = _resolve_gsx(f.get("gsx_ip"))
+    if gsx_err:
+        return jsonify(error=gsx_err), 400
     t1_id = gsx_perfmon._parse_t1_id((f.get("t1_id") or "").strip())
     if not t1_id:
         return jsonify(error="T1 assignment must look like T1-1-7-2-2 or 7-2-2."), 400
@@ -629,7 +698,8 @@ def api_gsx_perfmon_run():
         "gsx_user": gsx_user, "gsx_pass": gsx_pass,
         "jira_ticket": jira_ticket, "open_when_done": f.get("open_when_done") == "on",
     }
-    job_id = _launch_job(t1_id, _warn_after(), lambda: gsx_perfmon.run(params))
+    job_id = _launch_job(t1_id, _warn_after(), lambda: gsx_perfmon.run(params),
+                         initial_log=["[{}]".format(gsx_note)] if gsx_note else None)
     return jsonify(job_id=job_id)
 
 
@@ -965,9 +1035,9 @@ def api_ds1_gsx_test_run():
 @app.route("/api/gsx-monitor/run", methods=["POST"])
 def api_gsx_monitor_run():
     f = request.form
-    gsx_ip = (f.get("gsx_ip") or "").strip()
-    if not _valid_ip(gsx_ip):
-        return jsonify(error="Enter a valid GSX IP."), 400
+    gsx_ip, gsx_note, gsx_err = _resolve_gsx(f.get("gsx_ip"))
+    if gsx_err:
+        return jsonify(error=gsx_err), 400
     t1_id = gsx_perfmon._parse_t1_id((f.get("t1_id") or "").strip())
     if not t1_id:
         return jsonify(error="T1 assignment must look like T1-1-7-2-2 or 7-2-2."), 400
@@ -993,7 +1063,8 @@ def api_gsx_monitor_run():
         "clear_first": f.get("clear_first") == "on",
     }
     job_id = _launch_job("Monitor {}".format(t1_id), duration + 120,
-                          lambda: ds1_gsx_test.run_gsx_monitor(params))
+                          lambda: ds1_gsx_test.run_gsx_monitor(params),
+                          initial_log=["[{}]".format(gsx_note)] if gsx_note else None)
     with JOBS_LOCK:
         JOBS[job_id]["stop_event"] = stop_event
     return jsonify(job_id=job_id)

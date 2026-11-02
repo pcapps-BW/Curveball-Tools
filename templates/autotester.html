@@ -74,8 +74,9 @@
     the way. Use it when a GSX alarm is all you have.
   </div>
   <form id="revRunForm" data-run-url="/api/reverse-autotester/run">
-    <label for="gsx_ip">GSX IP</label>
-    <input type="text" id="gsx_ip" name="gsx_ip" placeholder="192.168.40.5" required>
+    <label for="gsx_ip">GSX IP or hostname</label>
+    <input type="text" id="gsx_ip" name="gsx_ip" placeholder="192.168.40.5  or  LAXGSX01" required>
+    <div class="hint">A hostname (e.g. <code>LAXGSX01</code>) is resolved to its management IP via NetBox &mdash; the chosen IP is shown in the run log. Enter an IP directly to bypass NetBox.</div>
 
     <label for="t1_id">GSX T1 -- shelf-slot-port-t1</label>
     <input type="text" id="t1_id" name="t1_id" placeholder="T1-1-11-1-11" required>

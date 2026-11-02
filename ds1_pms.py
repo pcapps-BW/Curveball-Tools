@@ -202,12 +202,14 @@ def run(params):
                   'show interfaces physical status slot {} | grep "ds1/{} "'.format(slot, ch_num))
             raw_alarms = block("NE Alarms", "show ne alarms | grep {}".format(ch))
             block("Physical PM 24hr", "show interfaces physical pm 24hour {}".format(ch))
-            block("CES PM 24hr (Valid intervals)",
-                  "show interfaces pm 24hour {} ces | grep Valid".format(ch))
-            block("CES PM 24hr (ES)",
-                  "show interfaces pm 24hour {} ces | grep ES | except Stat".format(ch))
-            block("CES PM 24hr (UAS)",
-                  "show interfaces pm 24hour {} ces | grep UAS".format(ch))
+            # Full CES PM, unfiltered. This used to be three separate
+            # grep'd blocks (Valid / ES / UAS) that showed only the error
+            # counters -- which hid the Rx/Tx PSN counters the NOC reads
+            # (RxPsnLostPkts, TxPsnDiscardPkts, etc.) and, worse, rendered as
+            # three empty blocks on a clean circuit because grep matched
+            # nothing (pcapps, 2026-11-02: "NOC wants to also read rx/tx
+            # outputs ... full output, no filter"). One dump, everything.
+            block("CES PM 24hr", "show interfaces pm 24hour {} ces".format(ch))
 
             # One-liner per DS1: echo the device's own status row + alarm count.
             status_row = next(

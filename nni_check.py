@@ -200,7 +200,47 @@ def parse_interface_pm_15min(raw):
         "out_maximum_pps":    fields.get("OUT Maximum PPS"),
         "in_current_bps":     fields.get("IN Current Rate(bps)"),
         "out_current_bps":    fields.get("OUT Current Rate(bps)"),
+        # Average Rate(bps) is what pairs with the Average PPS the headline
+        # reports. Captured from the same `fields` dict; None if the device
+        # does not emit that exact label, in which case the formatter falls
+        # back to Current Rate (see _dir_rate).
+        "in_average_bps":     fields.get("IN Average Rate(bps)"),
+        "out_average_bps":    fields.get("OUT Average Rate(bps)"),
     }
+
+
+def _fmt_rate(bps):
+    """bps integer -> human-readable Gbps/Mbps/Kbps/bps, or None."""
+    if bps is None:
+        return None
+    try:
+        b = float(bps)
+    except (TypeError, ValueError):
+        return None
+    if b >= 1e9:
+        return "{:.2f} Gbps".format(b / 1e9)
+    if b >= 1e6:
+        return "{:.2f} Mbps".format(b / 1e6)
+    if b >= 1e3:
+        return "{:.1f} Kbps".format(b / 1e3)
+    return "{:.0f} bps".format(b)
+
+
+def _dir_rate(pm, d):
+    """
+    (formatted_rate, which) for direction 'in'/'out'. Prefers the AVERAGE
+    bps -- it pairs with the Average PPS the verdict uses -- and falls back
+    to the CURRENT rate, which is the only bps field confirmed on every
+    device so far. (None, None) when neither is present, so the caller can
+    degrade to pps rather than print a wrong unit.
+    """
+    avg = pm.get(d + "_average_bps")
+    if avg is not None:
+        return _fmt_rate(avg), "avg"
+    cur = pm.get(d + "_current_bps")
+    if cur is not None:
+        return _fmt_rate(cur), "cur"
+    return None, None
 
 
 # Traffic verdicts
@@ -231,13 +271,18 @@ def assess_nni_traffic(pm):
     in_pps  = pm["in_average_pps"]
     out_pps = pm["out_average_pps"]
     mins    = pm.get("monitored_seconds", 0) / 60.0
+    in_rate, in_which   = _dir_rate(pm, "in")
+    out_rate, out_which = _dir_rate(pm, "out")
+    _rate_note = {"avg": "avg", "cur": "current"}
     detail = [
         "interval: {:.1f} min monitored{}".format(
             mins, " -- DEVICE-FLAGGED SUSPECT" if pm.get("suspect") else ""),
-        "avg IN:  {} pps  ({} bps)".format(
-            in_pps, pm.get("in_current_bps", "?")),
-        "avg OUT: {} pps  ({} bps)".format(
-            out_pps, pm.get("out_current_bps", "?")),
+        "avg IN:  {} pps  ({}{})".format(
+            in_pps, in_rate or "no bps counter",
+            " " + _rate_note[in_which] if in_which else ""),
+        "avg OUT: {} pps  ({}{})".format(
+            out_pps, out_rate or "no bps counter",
+            " " + _rate_note[out_which] if out_which else ""),
     ]
 
     if in_pps == 0 and out_pps == 0:
@@ -259,9 +304,18 @@ def assess_nni_traffic(pm):
                 "traffic. Possible one-way loss.".format(
                     low_dir, KEEPALIVE_PPS_THRESHOLD),
                 detail)
+    # Lead with Mbps -- "455563 pps" is not something a human reads as a
+    # traffic level (pcapps, 2026-11-02). pps stays in the detail lines and
+    # still drives the keepalive/asymmetric verdicts above, where it is the
+    # right unit. If the device gave no bps counter at all, fall back to pps
+    # rather than print nothing.
+    if in_rate and out_rate:
+        rate_txt = "{} in / {} out".format(in_rate, out_rate)
+    else:
+        rate_txt = "{} pps in / {} pps out".format(in_pps, out_pps)
     return (T_PASSING,
-            "Traffic passing on this physical NNI -- {} pps in / {} pps out "
-            "average over {:.1f} min.".format(in_pps, out_pps, mins),
+            "Traffic passing on this physical NNI -- {} average over "
+            "{:.1f} min.".format(rate_txt, mins),
             detail)
 
 
