@@ -63,6 +63,7 @@ from npt1800_client import NPT1800Client
 from npt1250_client import NPT1250Client
 import gsx_client
 import loop_check
+import output_builders
 import autotester_standalone
 from gsx_client import GSXClient, find_plink
 from device_base import CredentialError
@@ -381,6 +382,18 @@ def trace(gsx_ip, t1_id, infra_user, infra_pass, gsx_user, gsx_pass,
             return hops, ctx
         acr, cem, sts, ds1 = want_cem
         ctx.update({"acr": acr, "cem": cem, "sts": sts, "ds1_num": ds1})
+        # Capture the LIVE xconnect leg state for this binding, from the same
+        # 'show xconnect all' output already in hand (no extra command). The
+        # matched CE:CEM line carries UP/DOWN leg columns; a leg DOWN means the
+        # cross-connect is built but not forwarding. Mirrors the forward
+        # autotester's XCONNECT STATUS (xconnect_ok / xconnect_raw).
+        _xc_re = re.compile(r'CE{}:{}(?!\d)'.format(re.escape(acr),
+                                                    re.escape(cem)))
+        _xc_line = next((ln for ln in (raw_xc or "").splitlines()
+                         if _xc_re.search(ln)), "")
+        ctx["xc_raw_line"] = _xc_line.strip()
+        ctx["xc_ok"] = (bool(_xc_line.strip())
+                        and "DOWN" not in _xc_line.upper())
         # Third source for the CEM, free: hop 3 read `t1 23 cem-group 123`
         # out of the running-config, and this hop just read the CEM off the
         # LIVE xconnect. They should agree. If they don't, the config and the
@@ -530,6 +543,18 @@ def trace(gsx_ip, t1_id, infra_user, infra_pass, gsx_user, gsx_pass,
         c1250.connect()
         ctx["host_1250"] = (getattr(c1250, "hostname", "") or "").strip()
         ds1_list, loopback, config_map = site_sweep._discover_ds1s(c1250)
+        # Pull the 1250's maintenance-loopback config while we have the session
+        # open -- the matched DS1 is not known until after this block closes
+        # c1250, so grab the whole (tiny) loop-config dump now and filter it
+        # per-DS1 below. Same command the forward autotester uses. A looped DS1
+        # reads clean PMs, so this is the one loop the reverse walk could not
+        # see before (pcapps, 2026-11-02).
+        try:
+            ctx["loop_cfg_1250"] = c1250.run(loop_check.LOOP_CONFIG_CMD, 30)
+        except Exception as _le:
+            ctx["loop_cfg_1250"] = ""
+            log("    [!] 1250 loop config read failed: {}: {}".format(
+                type(_le).__name__, _le))
     except CredentialError:
         raise
     except Exception as e:
@@ -559,6 +584,9 @@ def trace(gsx_ip, t1_id, infra_user, infra_pass, gsx_user, gsx_pass,
                                    ", ".join(sorted(matches)))))
         return hops, ctx
     ctx["ds1_1250"] = matches[0]
+    # Now that the DS1 is known, filter the loop config pulled above to it.
+    ctx["loop_1250"] = loop_check.loops_for_ds1(
+        ctx.get("loop_cfg_1250", ""), matches[0])
     hops.append(h.done("{}  ds1-{}  ({})".format(
         ctx.get("host_1250") or "?", matches[0], ctx["muse"])))
     return hops, ctx
@@ -787,15 +815,50 @@ def render(hops, ctx):
             out.append("    {}".format(ln))
     # ISUP circuit + trunk group, information only (mgmt/Barlow).
     # Loop status -- shown even when clean, excluding fiber/GE. A loop
-    # anywhere makes the PMs above read clean.
+    # anywhere makes the PMs above read clean. Mirrors the forward autotester:
+    # 1250 TDM, BOTH MUX controllers (GSX-facing T3/CE and 1800-facing SONET),
+    # and the GSX T1.
     _ml = ctx.get("mux_loops")
+    _l1250 = ctx.get("loop_1250")
     _gl = loop_check.gsx_loop_from_t1_status(
         "\n".join(o for _l, _c, o in (ctx.get("gsx_t1_stats") or [])))
-    out += ["", "  LOOP STATUS:",
-            loop_check.status_line(
-                "MUX", _ml, "; ".join("{} {}".format(l["controller"] or "?",
-                l["mode"]) for l in _ml) if _ml else ""),
-            loop_check.status_line("GSX T1", bool(_gl), _gl or "")]
+    out += ["", "  LOOP STATUS:"]
+    # 1250 TDM loop (only shown when the walk reached the 1250 and read it).
+    if ctx.get("loop_cfg_1250") is not None and ctx.get("ds1_1250"):
+        out.append(loop_check.status_line(
+            "1250 {}".format(ctx["ds1_1250"]), _l1250,
+            ", ".join(x["type"] for x in _l1250) if _l1250 else ""))
+    # BOTH MUX sides -- one line each so neither is read as unchecked.
+    for _side, _iface in (
+            ("faces GSX",  (ctx.get("ce_iface") or "").strip()),
+            ("faces 1800", (ctx.get("sonet_active")
+                            or ctx.get("sonet_working") or "").strip())):
+        if not _iface:
+            out.append("  [ -- ] MUX {} -- controller not identified".format(
+                _side))
+            continue
+        _hits = [l for l in (_ml or [])
+                 if (l.get("controller") or "").split()[-1:] == [_iface]]
+        out.append(loop_check.status_line(
+            "MUX {} ({})".format(_iface, _side), _hits,
+            "; ".join("{} {}".format(l["controller"] or "?", l["mode"])
+                      for l in _hits)))
+    out.append(loop_check.status_line("GSX T1", bool(_gl), _gl or ""))
+    # XCONNECT STATUS -- validate the CEM cross-connect, from the live
+    # xconnect state captured at the ACR/CEM hop. Built from the reverse
+    # walk's own values; rendered by the same helper as the forward autotester
+    # so the two reports read identically.
+    _xc_lines = output_builders.mux_xconnect_status({
+        "acr_group":    ctx.get("acr"),
+        "cem_group":    ctx.get("cem"),
+        "gsx_ce_iface": ctx.get("ce_iface"),
+        "gsx_cem_id":   ctx.get("cem"),
+        "cem_health":   {"xconnect_ok":      ctx.get("xc_ok"),
+                         "xconnect_raw":     ctx.get("xc_raw_line", ""),
+                         "connection_state": "?"},
+    })
+    if _xc_lines:
+        out += [""] + _xc_lines
     if ctx.get("gsx_isup_raw") or ctx.get("gsx_trunk_raw"):
         out += [SEP, "  GSX ISUP CIRCUIT  (information only)", SEP]
         if ctx.get("gsx_isup_id"):

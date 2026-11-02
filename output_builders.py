@@ -1523,47 +1523,60 @@ def mux_xconnect_status(mux):
     Validate the MUX CEM cross-connect is built as expected.
 
     The MUX joins the ACR/1250 side (CEM-ACR<acr>:<cem>) to the GSX side
-    (CE<gsx_ce>:<gsx_id>). All four values are already resolved by the MUX
-    hop, and the connection's live state and leg states are captured too
-    (connection_state, xconnect_ok), so this does not add a device command --
-    it states, explicitly, whether the binding that is UP is the one we
-    expect.
+    (CE<gsx_ce>:<gsx_id>). All four values are resolved by the MUX hop; the
+    xconnect leg state (xconnect_ok / xconnect_raw) and the named-connection
+    state (connection_state) are captured by query_cem_health and live in the
+    nested `cem_health` dict -- NOT at the top level of mux_results[ds1].
+    gsx_xc_conflict is top-level. This adds no device command; it states,
+    explicitly, whether the binding that is UP is the one we expect.
+
+    The xconnect leg state is the signal we reliably have (it comes straight
+    from 'show xconnect all' during resolution), so the status LEADS with it.
+    connection_state depends on a connection NAME having resolved, which it may
+    not, so it is a secondary line shown only when actually read.
 
     Returns a list of report lines (may be empty when the MUX hop produced no
     xconnect data -- e.g. a Peerless circuit or a failed MUX resolve).
     """
-    acr    = (mux or {}).get("acr_group")
-    cem    = (mux or {}).get("cem_group")
-    gsx_ce = (mux or {}).get("gsx_ce_iface")
-    gsx_id = (mux or {}).get("gsx_cem_id")
+    mux    = mux or {}
+    acr    = mux.get("acr_group")
+    cem    = mux.get("cem_group")
+    gsx_ce = mux.get("gsx_ce_iface")
+    gsx_id = mux.get("gsx_cem_id")
     # Nothing to validate if the MUX hop did not resolve the binding.
     if not (acr and cem and acr != "?" and cem != "?"):
         return []
 
+    # Xconnect/connection health is nested under cem_health (method A output).
+    ch     = mux.get("cem_health") or {}
+    xc_ok  = ch.get("xconnect_ok")
+    xc_raw = (ch.get("xconnect_raw") or "").strip()
+    state  = (ch.get("connection_state") or "?")
+
     expected = "CEM-ACR{}:{} <-> CE{}:{}".format(
         acr, cem, gsx_ce or "?", gsx_id or "?")
-    state  = (mux.get("connection_state") or "?")
-    xc_ok  = mux.get("xconnect_ok")
-    xc_raw = (mux.get("xconnect_raw") or "").strip()
 
     lines = ["  XCONNECT STATUS:"]
-    # State of the named connection binding.
-    if state.upper() in ("UP", "CONNECTED"):
-        lines.append("  [ OK ] connection UP -- {}".format(expected))
-    elif state in ("?", ""):
-        lines.append("  [ -- ] connection state not read -- {}".format(expected))
-    else:
-        lines.append("  [ !! ] connection state {} (expected UP) -- {}".format(
-            state, expected))
-    # Both xconnect legs present and not down.
+    # LEAD with the xconnect leg state -- the reliably-captured signal.
     if xc_ok is True:
-        lines.append("  [ OK ] both xconnect legs up")
+        lines.append("  [ OK ] xconnect up, both legs -- {}".format(expected))
     elif xc_ok is False and xc_raw:
-        lines.append("  [ !! ] an xconnect leg is DOWN: {}".format(
-            xc_raw.splitlines()[0][:80]))
+        lines.append("  [ !! ] an xconnect leg is DOWN -- {} -- {}".format(
+            xc_raw.splitlines()[0][:80], expected))
     elif xc_ok is False:
-        lines.append("  [ !! ] xconnect not found for CE{}:{} -- the binding "
-                     "may not be built".format(acr, cem))
+        lines.append("  [ !! ] no xconnect for CE{}:{} -- the binding may not "
+                     "be built -- {}".format(acr, cem, expected))
+    else:
+        # xc_ok is None: query_cem_health did not run (e.g. CEM health lookup
+        # raised) -- the binding resolved but its leg state was not captured.
+        lines.append("  [ -- ] xconnect state not read -- {}".format(expected))
+    # Named-connection binding state, only when it was actually read.
+    if state and state not in ("?", ""):
+        if state.upper() in ("UP", "CONNECTED"):
+            lines.append("  [ OK ] connection binding {}".format(state))
+        else:
+            lines.append("  [ !! ] connection binding {} (expected UP)".format(
+                state))
     # A conflict the MUX hop already flagged means the binding we validated
     # might be a different circuit's -- surface it here, where the binding is.
     if mux.get("gsx_xc_conflict"):
@@ -1644,11 +1657,26 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         lines.append(loop_check.status_line(
             "1250 {}".format(ds1), _l1250,
             ", ".join(x["type"] for x in _l1250) if _l1250 else ""))
-        lines.append(loop_check.status_line(
-            "MUX {}".format((_mux_for_loop.get("gsx_ce_iface") or "").strip()
-                            or "controller"),
-            _lmux, "; ".join("{} {}".format(l["controller"] or "?", l["mode"])
-                             for l in _lmux) if _lmux else ""))
+        # MUX has TWO interfaces in the path and a loop can sit on either:
+        # the T3/CE controller facing the GSX, and the SONET controller
+        # facing the 1800. Emit a line for EACH so both are visibly checked
+        # -- a single collapsed line read as "only one side was looked at"
+        # (pcapps, 2026-11-02).
+        for _side, _iface in (
+                ("faces GSX",  (_mux_for_loop.get("gsx_ce_iface") or "").strip()),
+                ("faces 1800", (_mux_for_loop.get("active_sonet") or "").strip())):
+            if not _iface:
+                # Side's controller was not resolved -- say so rather than
+                # silently drop it, so the count is always both sides.
+                lines.append("  [ -- ] MUX {} -- controller not identified"
+                             .format(_side))
+                continue
+            _hits = [l for l in (_lmux or [])
+                     if (l.get("controller") or "").split()[-1:] == [_iface]]
+            lines.append(loop_check.status_line(
+                "MUX {} ({})".format(_iface, _side),
+                _hits, "; ".join("{} {}".format(l["controller"] or "?", l["mode"])
+                                 for l in _hits)))
         lines.append(loop_check.status_line(
             "GSX T1", bool(_lgsx), _lgsx or ""))
         lines.append("")

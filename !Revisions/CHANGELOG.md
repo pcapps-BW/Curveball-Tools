@@ -15,6 +15,81 @@ that's bitten this project before.
 
 ---
 
+## v2.55 — 2026-11-02
+
+### Reverse autotester: loop + xconnect status brought to parity
+
+The reverse autotester had a LOOP STATUS block but it (a) collapsed the MUX to
+a single line, same display bug fixed in the forward path at v2.54, and (b) had
+no 1250 TDM loop line and (c) no XCONNECT STATUS block at all. All three added,
+rendered by the same helpers as the forward autotester so the two reports read
+identically:
+
+- **1250 TDM loop** -- the reverse walk reaches the 1250 at hop 9 but never
+  read its loopback config. It now pulls `loop_check.LOOP_CONFIG_CMD` while the
+  1250 session is open and filters it to the matched DS1. This is the one
+  addition that costs a device read; the other two are free.
+- **Both MUX sides** -- one status line each for the GSX-facing T3/CE
+  (`ce_iface`) and the 1800-facing SONET (`sonet_active`) controller, from the
+  controller config the reverse walk already pulls `| section controller`.
+- **XCONNECT STATUS** -- the live xconnect leg state is captured at the ACR/CEM
+  hop from the `show xconnect all` output already in hand (no extra command),
+  and rendered via `output_builders.mux_xconnect_status`. The reverse walk
+  builds its binding from the live xconnect, so this is a strong place for it.
+
+```
+  LOOP STATUS:
+  [ OK ] 1250 ts1/25 -- no loop
+  [ OK ] MUX 8/0/19 (faces GSX) -- no loop
+  [ OK ] MUX 0/5/7 (faces 1800) -- no loop
+  [ OK ] GSX T1 -- no loop
+
+  XCONNECT STATUS:
+  [ OK ] xconnect up, both legs -- CEM-ACR16:112 <-> CE8/0/19:112
+```
+
+---
+
+## v2.54 — 2026-11-02
+
+### Loop + xconnect status fixes (reported live)
+
+**MUX loop showed only one side.** The LOOP STATUS block collapsed both MUX
+controllers into a single line labelled with just the GSX-facing interface
+(`MUX 8/0/19 -- no loop`), which read as "only one side was checked." It now
+emits one line per MUX controller in the path -- the T3/CE side facing the GSX
+AND the SONET side facing the 1800 -- so both are visibly examined:
+
+```
+  [ OK ] MUX 8/0/19 (faces GSX) -- no loop
+  [ OK ] MUX 0/13/1 (faces 1800) -- no loop
+```
+
+A side whose controller did not resolve shows `[ -- ] MUX faces 1800 --
+controller not identified` rather than silently dropping, so the count is
+always both sides. (The parser already read both controllers since v2.52; this
+was a display bug only.)
+
+**XCONNECT STATUS said "connection state not read."** The forward autotester's
+MUX resolver stores the xconnect leg state and connection state under the
+NESTED `cem_health` dict (from query_cem_health), but the status function read
+them from the top level of mux_results[ds1] -- so it found nothing and always
+printed `[ -- ] connection state not read`. Fixed to read from `cem_health`,
+and reordered to LEAD with the xconnect leg state (`xconnect_ok`, captured
+reliably from 'show xconnect all' during resolution) instead of the named
+connection state (which depends on a connection NAME resolving and often is
+not read):
+
+```
+  [ OK ] xconnect up, both legs -- CEM-ACR16:112 <-> CE8/0/19:112
+```
+
+The connection-binding line is now shown only when that state was actually
+read. gsx_xc_conflict still surfaces here. All six xconnect branches and the
+both-sides loop render verified.
+
+---
+
 ## v2.53 — 2026-11-02
 
 ### MUX cross-connect validation -- is the binding built as expected?
