@@ -30,6 +30,31 @@ from device_base import CredentialError, prompt_ip
 from jira_client import post_report, valid_ticket
 
 
+_CMD_ERR_RE = re.compile(r'syntax error|unknown command|invalid',
+                         re.IGNORECASE)
+
+
+def _run_prefer_nomore(c, cmd):
+    """
+    Run `cmd | no-more`, but fall back to bare `cmd` if the device rejects
+    the `| no-more`. Returns (output, cmd_that_worked).
+
+    This exists because the transceiver command is a live disagreement:
+    tsandberg (2026-11-02) asked for `| no-more` so the output is not
+    segmented; a prior code comment claimed the command "does not support
+    | no-more". Rather than guess and hardcode one or the other without a
+    device to test on, this tries the pipe, detects a `syntax error` /
+    `unknown command` response, and retries without it -- so it is correct
+    whichever is true, and the CMD line in the report shows which form the
+    device actually accepted.
+    """
+    out = c.run(cmd + " | no-more")
+    if _CMD_ERR_RE.search(out or ""):
+        bare = c.run(cmd)
+        return bare, cmd
+    return out, cmd + " | no-more"
+
+
 def _section(lines, title, cmd, output):
     lines.append("")
     lines.append("=" * 64)
@@ -184,10 +209,16 @@ def run(params):
         if not fiber_slots:
             lines.append("\n  NOTE: No fiber (GE) slots detected.")
         for slot in fiber_slots:
-            # transceiver info does not support | no-more
-            cmd = "show chassis transceiver information slot {} port1".format(slot)
+            # tsandberg asked for `| no-more` here (output was segmented);
+            # a prior comment claimed the command does not support it.
+            # _run_prefer_nomore tries the pipe and falls back to bare if the
+            # device rejects it, so it works either way and the CMD line shows
+            # which form was used. Applies to both data-card ports (ts2/1,
+            # ts5/1) -- fiber_slots covers both.
+            base = "show chassis transceiver information slot {} port1".format(slot)
             print("  collecting: Transceiver -- {}".format(slot))
-            _section(lines, "Transceiver -- {}".format(slot), cmd, c.run(cmd))
+            tx_out, tx_cmd = _run_prefer_nomore(c, base)
+            _section(lines, "Transceiver -- {}".format(slot), tx_cmd, tx_out)
             sec("Fiber Interface Config -- {}".format(slot),
                 "show configuration interfaces ge-{}/1 | display-set".format(slot))
             sec("Fiber Interface Stats -- {}".format(slot),
@@ -200,7 +231,9 @@ def run(params):
         sec("OSPF Interfaces", "show ospf interface")
         sec("LDP Sessions", "show ldp session")
         sec("LDP Adjacency", "show ldp adjacency")
-        sec("BFD Sessions", "show bfd session")
+        # `detail` adds per-session uptime, which plain `show bfd session`
+        # omits (tsandberg, 2026-11-02).
+        sec("BFD Sessions", "show bfd session detail")
 
         # Alarms and events
         sec("Chassis Alarms", "show chassis alarms")
@@ -223,7 +256,9 @@ def run(params):
         sec("All Peer Addresses",
             'show configuration | display-set | match "peer-address"')
         sec("NE-ID (VLAN)", 'show configuration | display-set | grep ne-id')
-        sec("DS1 Descriptions", 'show configuration | display-set | grep description')
+        # DS1 Descriptions removed 2026-11-02 (tsandberg): the suite does not
+        # provision the `description` field -- circuit identity lives in
+        # `nms-user-label` instead -- so this section was always empty.
         sec("Customer DS1s (Peerless)",
             'show configuration | display-set | grep Peerless')
         sec("PM Collection Enabled Interfaces",

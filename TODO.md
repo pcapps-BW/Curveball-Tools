@@ -42,6 +42,24 @@
 - [ ] Build PM script that queries DB instead of building route each time
       (skip 1800 MUSE lookup -- use stored OC12 assignment directly)
 
+## Neptune BGP (knowledge captured 2026-11-02)
+
+Reference is in `C:\Claude\Neptune_BGP_reference.md` (prefix-set change
+procedure + the standard-vs-non-standard decision rules). Two future items
+feed off it, build when the time comes:
+
+- [ ] **Read-only Neptune BGP tool** — the three read commands
+      (`show run prefix-set`, `show bgp neighbor <peer> advertised-routes`,
+      `... routes`), parsed. Blocked on: a real Neptune paste to confirm
+      prompt/paging/output format before writing any parser.
+- [ ] **Feed the standard-change rules into #6 (SEARN)** — auto-flag a change
+      that touches a private IP or an infrastructure circuit as NON-standard.
+
+**Strategy note:** pcapps is accumulating reference material so either tool
+can be built later without re-deriving the knowledge. Keep capturing pasted
+reference (screenshots, CLI output) into `C:\Claude\*_reference.md` files —
+durable across sessions, which conversation context is not.
+
 ## Known Issues / Watch List
 - [ ] **`ge-ts2/1` is reported as a fiber uplink at dual-1250 markets, where
       it is actually the local A-B cross-connect.** Found 2026-10-02 while

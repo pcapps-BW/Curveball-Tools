@@ -266,6 +266,33 @@ def node_from_output(text):
     return m.group(1) if m else ""
 
 
+def parse_isup_service(raw):
+    """
+    The ISUP service / trunk-group name from SHOW ISUP CIRCUIT output.
+
+    The table row is e.g.:
+        Port DS1 ISUP Service              CIC  Ch Status   ...
+        ---- --- ------------------------ ----- -- -------- ...
+        1    16  PSN_440_AT_TF_AC739432   5025  1  UNEQUIP  ...
+
+    Every data row repeats the same service name; return the first one. The
+    name is a single token (letters, digits, underscores) in the third
+    column. Returns None when no data row is present (empty circuit, command
+    error, unrecognised output) rather than guessing.
+    """
+    if not raw:
+        return None
+    for line in raw.splitlines():
+        # A data row starts with port and DS1 integers, then the name.
+        m = re.match(r'\s*\d+\s+\d+\s+([A-Za-z0-9_]+)\s', line)
+        if m:
+            name = m.group(1)
+            # Guard against matching a header/separator token.
+            if name.lower() not in ("isup", "service", "status"):
+                return name
+    return None
+
+
 def node_names_match(a, b):
     """
     Do two GSX node names refer to the same device?
@@ -291,6 +318,11 @@ class GSXClient:
     # Match the surrounding dashes too, so no "---  ---" remnant is left behind.
     PAGER_RE   = re.compile(r'-*\s*Press <space>.*?<q>uit\s*-*', re.IGNORECASE)
     PROMPT_RE  = re.compile(r'[\w.\-]+>\s*$')
+    # Some SHOW commands (SHOW ISUP CIRCUIT) warn they take a few seconds and
+    # ask "continue? - Confirm (y/n):". Answered 'y' automatically, the same
+    # way the pager is answered 'c'. These are READ commands -- the confirm is
+    # about runtime, not about changing anything.
+    CONFIRM_RE = re.compile(r'Confirm\s*\(y/n\)\s*:?\s*$', re.IGNORECASE)
     HOSTKEY_RE = re.compile(r'Store key in cache', re.IGNORECASE)
 
     def __init__(self, ip, username, password, plink_path=None):
@@ -375,6 +407,16 @@ class GSXClient:
                 deadline = time.time() + timeout
                 continue
             tail = snap.rstrip().splitlines()[-1] if snap.strip() else ""
+            # A "Confirm (y/n):" prompt only appears on the tail line, waiting
+            # for input -- answer 'y' and reset the clock, since the command
+            # warned it may take several seconds after confirmation.
+            if self.CONFIRM_RE.search(tail):
+                self._send("y\n")
+                with self._lock:
+                    self._buf = ""
+                time.sleep(0.3)
+                deadline = time.time() + timeout
+                continue
             if self.PROMPT_RE.search(tail):
                 return snap
             if self.proc.poll() is not None:
@@ -463,6 +505,52 @@ class GSXClient:
                     continue
             cleaned.append(s)
         return "\n".join(cleaned)
+
+    def pull_isup_circuit(self, slot, port, ds1):
+        """
+        ISUP circuit + trunk-group detail for a GSX T1, read-only.
+
+        Two commands, for information only (requested for mgmt/Barlow,
+        2026-11-02):
+
+          SHOW ISUP CIRCUIT SHELF 1 SLOT <s> PORT <p> DS1 <d> status
+          show trunk group <trunk-name> admin
+
+        The trunk name is NOT known in advance -- it is the "ISUP Service"
+        column of the first command's output (e.g. PSN_440_AT_TF_AC739432),
+        which is also the ISUP circuit ID the summary line wants. So the
+        first command is run, the name parsed, then the second run.
+
+        Returns a dict:
+          {"isup_id":   <trunk name or None>,
+           "isup_raw":  <full SHOW ISUP CIRCUIT output>,
+           "trunk_raw": <full show trunk group output, or a note>}
+
+        Never raises -- a failure here must not take down the GSX hop, which
+        has already produced the real diagnostic data. Errors are recorded in
+        the raw fields.
+        """
+        out = {"isup_id": None, "isup_raw": "", "trunk_raw": ""}
+        try:
+            out["isup_raw"] = self.run_command(
+                "SHOW ISUP CIRCUIT SHELF 1 SLOT {} PORT {} DS1 {} status"
+                .format(slot, port, ds1))
+        except Exception as e:
+            out["isup_raw"] = "[command error: {}]".format(e)
+            return out
+
+        out["isup_id"] = parse_isup_service(out["isup_raw"])
+        if not out["isup_id"]:
+            out["trunk_raw"] = ("[no ISUP service/trunk name found in the "
+                                "SHOW ISUP CIRCUIT output -- trunk group not "
+                                "queried]")
+            return out
+        try:
+            out["trunk_raw"] = self.run_command(
+                "show trunk group {} admin".format(out["isup_id"]))
+        except Exception as e:
+            out["trunk_raw"] = "[command error: {}]".format(e)
+        return out
 
     def get_t3_status(self, slot, port):
         """
@@ -597,6 +685,24 @@ def self_test(verbose=True):
     chk("command error is not a node",
         node_from_output("[command error: timeout]"), "")
     chk("Node: from empty", node_from_output(""), "")
+
+    # ---- ISUP circuit parsing (#8, mgmt/Barlow, 2026-11-02) ---------------
+    _isup = ("Node: ATLGSX02   Date: 2026/10/16 14:20:44  GMT\n"
+             "Shelf: 1  Slot: 7\n"
+             "Port DS1 ISUP Service              CIC  Ch Status   Local\n"
+             "---- --- ------------------------ ----- -- -------- -----\n"
+             "1    16  PSN_440_AT_TF_AC739432   5025  1  UNEQUIP  BLK\n"
+             "1    16  PSN_440_AT_TF_AC739432   5026  2  UNEQUIP  BLK")
+    chk("ISUP service name parsed from the data row",
+        parse_isup_service(_isup), "PSN_440_AT_TF_AC739432")
+    chk("ISUP header/separator rows are not mistaken for a name",
+        parse_isup_service("Port DS1 ISUP Service\n---- --- -----"), None)
+    chk("no ISUP data row -> None", parse_isup_service("Node: X\n(empty)"), None)
+    chk("ISUP from empty -> None", parse_isup_service(""), None)
+    chk("the y/n confirm prompt is recognised",
+        bool(GSXClient.CONFIRM_RE.search(
+            "This may take several seconds, continue? - Confirm (y/n): ")),
+        True)
 
     # ---- node_names_match: the forward autotester's identity cross-check ---
     chk("same name", node_names_match("ATLGSX02", "ATLGSX02"), True)

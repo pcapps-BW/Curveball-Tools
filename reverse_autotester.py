@@ -219,6 +219,12 @@ def trace(gsx_ip, t1_id, infra_user, infra_pass, gsx_user, gsx_pass,
         ctx["gsx_t1_stats"] = g.pull_t1_stats(parts["slot"], parts["port"],
                                               parts["t1"])
         ctx["gsx_t3_status"] = g.get_t3_status(parts["slot"], parts["port"])
+        # ISUP circuit + trunk group, information only (mgmt/Barlow,
+        # 2026-11-02). Read-only, on the GSX we are already logged into.
+        _isup = g.pull_isup_circuit(parts["slot"], parts["port"], parts["t1"])
+        ctx["gsx_isup_id"]   = _isup.get("isup_id")
+        ctx["gsx_isup_raw"]  = _isup.get("isup_raw", "")
+        ctx["gsx_trunk_raw"] = _isup.get("trunk_raw", "")
         # Second source, no extra command: every GSX command's output starts
         # 'Node: ATLGSX02  Date: ...'. The prompt is the primary (it is the
         # device naming itself at login), this is the backstop.
@@ -704,7 +710,10 @@ def render(hops, ctx):
             "    GSX        : {} ({})  T1-{}-{}-{}-{}".format(
                 ctx.get("gsx_node", "?"), ctx.get("gsx_ip", "?"),
                 ctx.get("shelf", "?"), ctx.get("slot", "?"),
-                ctx.get("port", "?"), ctx.get("t1", "?")),
+                ctx.get("port", "?"), ctx.get("t1", "?")),]
+    if ctx.get("gsx_isup_id"):
+        out.append("    ISUP       : {}".format(ctx["gsx_isup_id"]))
+    out += [
             "    MUX        : {} ({})".format(
                 ctx.get("mux_name", "?"), ctx.get("mux_ip", "?")),
             "    T3 / CE    : T3 {} -> CE{}".format(
@@ -760,6 +769,22 @@ def render(hops, ctx):
     if ctx.get("gsx_t3_status"):
         out += [SEP2, "  GSX PARENT T3 STATUS", SEP2]
         for ln in ctx["gsx_t3_status"].splitlines():
+            out.append("    {}".format(ln))
+    # ISUP circuit + trunk group, information only (mgmt/Barlow).
+    if ctx.get("gsx_isup_raw") or ctx.get("gsx_trunk_raw"):
+        out += [SEP, "  GSX ISUP CIRCUIT  (information only)", SEP]
+        if ctx.get("gsx_isup_id"):
+            out.append("  ISUP Circuit ID: {}".format(ctx["gsx_isup_id"]))
+        out.append("  CMD: SHOW ISUP CIRCUIT SHELF 1 SLOT {} PORT {} DS1 {} "
+                   "status".format(ctx.get("slot", "?"), ctx.get("port", "?"),
+                                   ctx.get("t1", "?")))
+        for ln in (ctx.get("gsx_isup_raw") or "  (no output)").splitlines():
+            out.append("    {}".format(ln))
+        out.append("")
+        if ctx.get("gsx_isup_id"):
+            out.append("  CMD: show trunk group {} admin".format(
+                ctx["gsx_isup_id"]))
+        for ln in (ctx.get("gsx_trunk_raw") or "  (no output)").splitlines():
             out.append("    {}".format(ln))
     return "\n".join(out)
 

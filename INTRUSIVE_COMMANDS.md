@@ -217,6 +217,14 @@ string it's given by a caller. The callers, complete as of v2.35:
 and so was the first caller to drive this client as its entry point rather
 than its last hop.
 
+**Added 2026-11-02:** `gsx_client.pull_isup_circuit()` sends
+`SHOW ISUP CIRCUIT SHELF 1 SLOT <s> PORT <p> DS1 <d> status` and
+`show trunk group <name> admin` — both **reads**, called from the forward
+autotester, `reverse_autotester` and `gsx_perfmon` GSX hops for information
+only (mgmt/Barlow). The first prompts
+`continue? - Confirm (y/n):`, answered `y` automatically; the confirm is
+about the command's runtime, not about changing state.
+
 **One of those callers DOES hand it a destructive command.**
 `ds1_gsx_test.run_gsx_monitor()` sends
 `CONFIGURE T1 ... PERFMON RESET COUNTERS ALL` when its opt-in `clear_first`

@@ -679,6 +679,16 @@ def run(params):
                 # Pull parent T3 STATUS to distinguish T3-level outage from a
                 # DS1-specific failure in the run summary (one T3 ticket vs 28).
                 gsx_t3_results[ds1] = g.get_t3_status(slot, port)
+                # ISUP circuit + trunk group, information only (mgmt/Barlow,
+                # 2026-11-02). Read-only; stored on the DS1 row for the route
+                # block (ISUP ID line) and the raw-output section. Never fails
+                # the hop -- the real diagnostics are already in hand.
+                isup = g.pull_isup_circuit(slot, port, t1)
+                r["gsx_isup_id"]   = isup.get("isup_id")
+                r["gsx_isup_raw"]  = isup.get("isup_raw", "")
+                r["gsx_trunk_raw"] = isup.get("trunk_raw", "")
+                if isup.get("isup_id"):
+                    progress("     ISUP circuit: {}".format(isup["isup_id"]))
             except Exception as e:
                 progress("     [!] GSX pull failed: {}: {}".format(type(e).__name__, e))
             finally:
@@ -852,6 +862,24 @@ def run(params):
                 emit("  >> {}".format(label))
                 emit("  CMD: {}".format(cmd))
                 emit(out)
+                emit("")
+            # ISUP circuit + trunk group, information only (mgmt/Barlow).
+            # Read-only; appended to the raw section whenever it was pulled.
+            _mr = mux_results_all.get(ds1, {})
+            if _mr.get("gsx_isup_raw") or _mr.get("gsx_trunk_raw"):
+                emit("  >> GSX ISUP CIRCUIT  (information only)")
+                if _mr.get("gsx_isup_id"):
+                    emit("  ISUP Circuit ID: {}".format(_mr["gsx_isup_id"]))
+                emit("  CMD: SHOW ISUP CIRCUIT SHELF 1 SLOT {} PORT {} DS1 {} "
+                     "status".format(_mr.get("gsx_slot", "?"),
+                                     _mr.get("gsx_port", "?"),
+                                     _mr.get("gsx_t1", "?")))
+                emit(_mr.get("gsx_isup_raw") or "  (no output)")
+                emit("")
+                if _mr.get("gsx_isup_id"):
+                    emit("  CMD: show trunk group {} admin".format(
+                        _mr["gsx_isup_id"]))
+                emit(_mr.get("gsx_trunk_raw") or "  (no output)")
                 emit("")
 
     out_path = _write(report, host_1250)

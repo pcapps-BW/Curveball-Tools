@@ -625,6 +625,27 @@ def run(params):
                 for ln in out.splitlines():
                     lines.append("  {}".format(ln))
 
+        # ISUP circuit + trunk group, information only (mgmt/Barlow,
+        # 2026-11-02). Read-only; appended to the raw output. Derived from
+        # the canonical T1 id (T1-1-<slot>-<port>-<t1>).
+        _m = re.match(r'^T1-1-(\d+)-(\d+)-(\d+)$', t1_id)
+        if _m:
+            _slot, _port, _t1 = _m.group(1), _m.group(2), _m.group(3)
+            isup = c.pull_isup_circuit(_slot, _port, _t1)
+            lines += ["", SEP, "  GSX ISUP CIRCUIT  (information only)", SEP]
+            if isup.get("isup_id"):
+                lines.append("  ISUP Circuit ID: {}".format(isup["isup_id"]))
+            lines.append("  CMD: SHOW ISUP CIRCUIT SHELF 1 SLOT {} PORT {} "
+                         "DS1 {} status".format(_slot, _port, _t1))
+            for ln in (isup.get("isup_raw") or "  (no output)").splitlines():
+                lines.append("  {}".format(ln))
+            lines.append("")
+            if isup.get("isup_id"):
+                lines.append("  CMD: show trunk group {} admin".format(
+                    isup["isup_id"]))
+            for ln in (isup.get("trunk_raw") or "  (no output)").splitlines():
+                lines.append("  {}".format(ln))
+
     finally:
         c.close()
     if not t1_clean:

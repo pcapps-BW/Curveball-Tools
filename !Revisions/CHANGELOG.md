@@ -15,6 +15,112 @@ that's bitten this project before.
 
 ---
 
+## v2.48 — 2026-11-02
+
+### #4 -- NPT-1250 Discovery ("show tech") tweaks (tsandberg)
+
+Three changes to the discovery dump.
+
+**Transceiver `| no-more`.** tsandberg asked for it (output was segmented); a
+prior code comment claimed the command does not support it. Rather than guess
+and hardcode one form with no device to test on, `_run_prefer_nomore()` tries
+`| no-more`, detects a `syntax error` / `unknown command` response, and falls
+back to the bare command. Correct whichever is true, and the CMD line in the
+report shows which form the device actually accepted -- so the first real run
+settles the disagreement empirically. Applies to both data-card ports
+(ts2/1, ts5/1), which `fiber_slots` already covers.
+
+**BFD session detail.** `show bfd session` -> `show bfd session detail`, which
+adds per-session uptime.
+
+**Removed the DS1 Descriptions section.** `show configuration | display-set |
+grep description` was always empty -- the suite does not provision the
+`description` field; circuit identity is in `nms-user-label`.
+
+Both the transceiver fallback (device supports / device rejects) and the
+other two edits verified. The transceiver pull is still one read either way;
+`INTRUSIVE_COMMANDS.md` needs no change (no new command verbs).
+
+---
+
+## v2.47 — 2026-11-02
+
+### #8 continued -- ISUP pull added to gsx_perfmon and reverse autotester
+
+v2.46 wired the ISUP circuit + trunk group pull into the forward autotester
+only. By request, the other two tools that reach the GSX now do it too, using
+the same shared `gsx_client.pull_isup_circuit()`:
+
+- **gsx_perfmon** -- appends a `GSX ISUP CIRCUIT (information only)` section
+  after the T1 intervals. Derives slot/port/t1 from the canonical T1 id. Fires
+  even when the clean/saturated 24h skip means no intervals were pulled.
+- **reverse_autotester** -- pulls it in hop 1 (already logged into the GSX),
+  adds an `ISUP :` line to the resolved PATH block and the full raw section at
+  the end of the report. Omitted cleanly when no ISUP circuit resolves.
+
+All three GSX-reaching tools now carry the ISUP info. The commands are
+unchanged (both reads, confirm-prompt auto-answered), and `INTRUSIVE_COMMANDS.md`
+is updated to list all three callers. Verified end to end against a stubbed
+client for both tools, including the no-ISUP omission path.
+
+---
+
+## v2.46 — 2026-11-02
+
+### #8 -- GSX ISUP circuit + trunk group in the autotester (mgmt/Barlow)
+
+After the forward autotester resolves the GSX node and T1 assignment, it now
+pulls two additional commands, **information only**, read-only:
+
+```
+SHOW ISUP CIRCUIT SHELF 1 SLOT <s> PORT <p> DS1 <d> status
+show trunk group <trunk-name> admin
+```
+
+The trunk name is not known ahead of time -- it is the "ISUP Service" column
+of the first command's output (e.g. `PSN_440_AT_TF_AC739432`), which is also
+the ISUP circuit ID. So the first command runs, the name is parsed, then the
+second runs against it.
+
+#### Two surfaces, as requested
+
+- **Summary / route block** gains one line under the GSX assignment:
+  `ISUP Circuit: PSN_440_AT_TF_AC739432`. Shown only when resolved.
+- **Full raw output** gains a `GSX ISUP CIRCUIT (information only)` section
+  with the complete output of both commands.
+
+#### The confirm prompt
+
+`SHOW ISUP CIRCUIT` warns it takes a few seconds and asks
+`continue? - Confirm (y/n):`. The GSX client now answers it `y`
+automatically, the same mechanism that answers the pager `c` -- a new
+`CONFIRM_RE` in `_wait_for_prompt`. The confirm is about runtime, not about
+changing anything; both commands are reads.
+
+#### Never fails the hop
+
+`pull_isup_circuit()` never raises: the real diagnostics are already in hand
+before it runs, and an ISUP/trunk failure is recorded in the raw fields
+rather than taking down the GSX hop. An empty circuit (no ISUP service row)
+skips the trunk-group query rather than running `show trunk group None`.
+
+#### Audit + tests
+
+`INTRUSIVE_COMMANDS.md` updated -- both new commands are reads, logged in the
+`gsx_client` caller note. Five self-tests on `parse_isup_service` (the data
+row, header/separator rows rejected, empty, and the confirm-prompt regex),
+built on the verbatim ATLGSX02 paste. Route block verified to show the ISUP
+line when present and omit it when absent; the pull wiring exercised end to
+end with a stubbed client including the empty-circuit skip.
+
+#### Scope
+
+Forward autotester only for now. The reverse autotester and gsx_perfmon also
+reach the GSX but were not wired -- `pull_isup_circuit` is a shared method on
+the client, so adding them later is a one-line call each if wanted.
+
+---
+
 ## v2.45 — 2026-11-02
 
 ### Quick-wins batch: four NOC-reported fixes

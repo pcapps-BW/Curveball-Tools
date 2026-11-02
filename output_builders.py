@@ -1451,6 +1451,11 @@ def build_route_block(ds1, host_1250, loopback_ip, muse_id,
         "    Assignment : {}".format(gsx_assign),
         "    T1 Command : SHOW T1 T1-1-{}".format(gsx_assign),
     ]
+    # ISUP circuit ID (trunk-group name), information only -- requested for
+    # mgmt/Barlow, 2026-11-02. Only shown when the GSX hop resolved it; the
+    # full SHOW ISUP CIRCUIT / show trunk group output is in the raw section.
+    if mux_data.get("gsx_isup_id"):
+        lines.append("    ISUP Circuit: {}".format(mux_data["gsx_isup_id"]))
     # The T1 number has two independent sources (live CEM id vs the controller's
     # provisioned description) which can disagree. When they do, say so right
     # under the command rather than printing one silently -- an operator acting on
