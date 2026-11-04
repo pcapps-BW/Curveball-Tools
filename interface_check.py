@@ -499,6 +499,23 @@ def run(params):
                 lines.append("")
                 for ln in format_ospf_outages(ospf_outages).splitlines():
                     lines.append("  {}".format(ln))
+                # Always-show LDP SESSION state for this circuit's peer -- the
+                # outage history above is the bounce record; this is the live
+                # session (state + uptime). Read on the 1800 (c), filtered to the
+                # 1250's loopback; bounce annotated from ne_raw already in hand.
+                import ldp_check
+                lines.append("")
+                lines.append("  LDP STATUS:")
+                try:
+                    _ldp_sess = c.run(ldp_check.LDP_SESSION_CMD, 30)
+                except Exception as _le:
+                    _ldp_sess = ""
+                    lines.append("  [ -- ] LDP session read failed -- {}".format(
+                        str(_le)[:60]))
+                else:
+                    for _ln in ldp_check.status_lines(
+                            _ldp_sess, event_raw=ne_raw, peer_filter=loopback):
+                        lines.append(_ln)
         else:
             # Distinguish "the config genuinely has no inet address" from "the config
             # command never ran". The old wording claimed the former in both cases.

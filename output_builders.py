@@ -16,6 +16,7 @@ Built by P. Capps.
 
 import re
 import loop_check
+import ldp_check
 import datetime
 import textwrap
 
@@ -1163,8 +1164,13 @@ def check_ospf_ldp_health(ospf_events_raw, ldp_session_raw):
         sessions = parse_ldp_sessions(ldp_session_raw)
         if not sessions:
             info.append("LDP: no session data parsed")
+        # Annotate with the most recent LDP-Session bounce from the event log we
+        # already pulled for OSPF (no extra device read). Shared parser, so the
+        # wording matches the LDP STATUS block the other tools render.
+        bounce = ldp_check.last_ldp_bounce(ospf_events_raw)
+        suffix = "  (last {} {} UTC)".format(bounce["name"], bounce["ts"]) if bounce else ""
         for s in sessions:
-            line = "LDP {} {} -- up {}".format(s["peer"], s["state"], s["uptime"])
+            line = "LDP {} {} -- up {}{}".format(s["peer"], s["state"], s["uptime"], suffix)
             if s["state"].lower() != "operational":
                 flags.append(line)
             else:
@@ -1653,37 +1659,46 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         _l1250 = loop_1250.get(ds1)
         _lmux = _mux_for_loop.get("mux_loop")
         _lgsx = _mux_for_loop.get("gsx_loop")
+        _is_peerless = ds1 in peerless
         lines.append("  LOOP STATUS:")
         lines.append(loop_check.status_line(
             "1250 {}".format(ds1), _l1250,
             ", ".join(x["type"] for x in _l1250) if _l1250 else ""))
-        # MUX has TWO interfaces in the path and a loop can sit on either:
-        # the T3/CE controller facing the GSX, and the SONET controller
-        # facing the 1800. Emit a line for EACH so both are visibly checked
-        # -- a single collapsed line read as "only one side was looked at"
-        # (pcapps, 2026-11-02).
-        for _side, _iface in (
-                ("faces GSX",  (_mux_for_loop.get("gsx_ce_iface") or "").strip()),
-                ("faces 1800", (_mux_for_loop.get("active_sonet") or "").strip())):
-            if not _iface:
-                # Side's controller was not resolved -- say so rather than
-                # silently drop it, so the count is always both sides.
-                lines.append("  [ -- ] MUX {} -- controller not identified"
-                             .format(_side))
-                continue
-            _hits = [l for l in (_lmux or [])
-                     if (l.get("controller") or "").split()[-1:] == [_iface]]
+        if _is_peerless:
+            # A Peerless circuit ends at the 1800 -- there is NO Bandwidth MUX
+            # or GSX to check. Emitting "MUX ... / GSX T1 -- no loop" would be a
+            # hollow pass on hops that do not exist and were never read, which
+            # reads worse than silence (pcapps, 2026-11-02). Say so instead.
+            lines.append("  [ -- ] no MUX/GSX on a Peerless circuit "
+                         "(route ends at the 1800)")
+        else:
+            # MUX has TWO interfaces in the path and a loop can sit on either:
+            # the T3/CE controller facing the GSX, and the SONET controller
+            # facing the 1800. Emit a line for EACH so both are visibly checked
+            # -- a single collapsed line read as "only one side was looked at"
+            # (pcapps, 2026-11-02).
+            for _side, _iface in (
+                    ("faces GSX",  (_mux_for_loop.get("gsx_ce_iface") or "").strip()),
+                    ("faces 1800", (_mux_for_loop.get("active_sonet") or "").strip())):
+                if not _iface:
+                    # Side's controller was not resolved -- say so rather than
+                    # silently drop it, so the count is always both sides.
+                    lines.append("  [ -- ] MUX {} -- controller not identified"
+                                 .format(_side))
+                    continue
+                _hits = [l for l in (_lmux or [])
+                         if (l.get("controller") or "").split()[-1:] == [_iface]]
+                lines.append(loop_check.status_line(
+                    "MUX {} ({})".format(_iface, _side),
+                    _hits, "; ".join("{} {}".format(l["controller"] or "?", l["mode"])
+                                     for l in _hits)))
             lines.append(loop_check.status_line(
-                "MUX {} ({})".format(_iface, _side),
-                _hits, "; ".join("{} {}".format(l["controller"] or "?", l["mode"])
-                                 for l in _hits)))
-        lines.append(loop_check.status_line(
-            "GSX T1", bool(_lgsx), _lgsx or ""))
+                "GSX T1", bool(_lgsx), _lgsx or ""))
         lines.append("")
 
         # MUX cross-connect validation -- is the binding that is UP the one we
-        # expect? (ACR/CEM side joined to the GSX CE side.)
-        _xc = mux_xconnect_status(_mux_for_loop)
+        # expect? (ACR/CEM side joined to the GSX CE side.) None on Peerless.
+        _xc = [] if _is_peerless else mux_xconnect_status(_mux_for_loop)
         if _xc:
             lines.extend(_xc)
             lines.append("")

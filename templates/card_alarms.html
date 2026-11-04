@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Card Alarms -- Curveball Tools{% endblock %}
+{% block content %}
+<h1>Card Alarms &mdash; Fleet Equipment Sweep</h1>
+<div class="sub">Reads <code>show ne alarms</code> on every NPT-1250 and reports the
+  EQUIPMENT/hardware alarms &mdash; card, fan, power, MCP, temperature &mdash; grouped by
+  market, with new-vs-known tracking so a freshly-failed card stands out from one already
+  known. Fills the gap left by monitoring that can't see card status.
+  Requires OSPF &amp; LDP Stability to have run at least once (for the 1250 site list).
+  State persists between runs; first contact with a device establishes baseline only.</div>
+
+<div class="panel">
+  <form id="runForm" data-run-url="/api/card-alarms/run">
+
+    <div class="row">
+      <div>
+        <label for="infra_user">Infrastructure username</label>
+        <input type="text" id="infra_user" name="infra_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="infra_pass">Infrastructure password</label>
+        <input type="password" id="infra_pass" name="infra_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <label style="margin-top:14px;">Alarm categories to show</label>
+    <div class="hint" style="margin-top:0;">Leave all checked for everything, or narrow to just what you're after (e.g. card alarms only). The sweep always reads every device; this only filters the report.</div>
+    <div class="checkbox-row" style="flex-wrap:wrap;gap:16px;">
+      <span><input type="checkbox" id="catCard" name="cat_card" checked><label for="catCard">Card</label></span>
+      <span><input type="checkbox" id="catFan" name="cat_fan" checked><label for="catFan">Fan</label></span>
+      <span><input type="checkbox" id="catPower" name="cat_power" checked><label for="catPower">Power</label></span>
+      <span><input type="checkbox" id="catMcp" name="cat_mcp" checked><label for="catMcp">MCP</label></span>
+      <span><input type="checkbox" id="catTemp" name="cat_temperature" checked><label for="catTemp">Temperature</label></span>
+      <span><input type="checkbox" id="catOther" name="cat_other" checked><label for="catOther">Other equipment</label></span>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="slackAlert" name="slack_alert" checked>
+      <label for="slackAlert">Post new equipment alarms to Slack (if a webhook is configured)</label>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="openWhenDone" name="open_when_done">
+      <label for="openWhenDone">Open report when done</label>
+    </div>
+    <div class="hint">Only works when this server is running on your own machine.</div>
+
+    <button type="submit">Run Card Alarm Sweep</button>
+    <div class="field-error" id="formError"></div>
+  </form>
+</div>
+
+{% include "_job_panels.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='job.js') }}"></script>
+<script>
+  initJobForm('runForm');
+</script>
+{% endblock %}

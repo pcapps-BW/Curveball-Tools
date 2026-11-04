@@ -56,9 +56,9 @@ _RE_TX_PWR = re.compile(r'tx[\s-]*(?:laser[\s-]*|optical[\s-]*)?power[^:]*:\s*(-
 
 # Launcher menu metadata.
 TOOL_INFO = {
-    'name':     'OSPF Events + Fiber Levels',
+    'name':     'OSPF, LDP & Fiber Levels',
     'ran_from': '1250',
-    'desc':     'OSPF up/down event timestamps from NE unreported events + fiber transceiver light levels (ts2/ts5).',
+    'desc':     'OSPF up/down event timestamps from NE unreported events, LDP session state + last bounce, and fiber transceiver light levels (ts2/ts5).',
     'requires': '1250 IP, creds',
     'order':    45,
 }
@@ -394,7 +394,7 @@ def run(params):
     print("  host: {}".format(host))
 
     lines = []
-    lines.append("OSPF EVENTS + FIBER LIGHT LEVELS")
+    lines.append("OSPF, LDP & FIBER LIGHT LEVELS")
     lines.append("Host: {}  IP: {}".format(host, ip))
     lines.append("Run:  {}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     lines.append("=" * 64)
@@ -422,6 +422,24 @@ def run(params):
     outages = pair_ospf_outages(build_ospf_outage_events(ospf))
     lines.append("")
     lines.append(format_ospf_outages(outages))
+
+    # ── LDP Status ───────────────────────────────────────────────────────────
+    # Always shown (pcapps 2026-11-03), same shape as the autotester/IXC/reverse
+    # tools. Session uptime from `show ldp session`; last bounce annotated from
+    # the LDP-Session event log. Two cheap reads on the 1250 already in session.
+    import ldp_check
+    print("  collecting: LDP session + LDP-Session events")
+    try:
+        ldp_session_raw = c.run(ldp_check.LDP_SESSION_CMD)
+    except Exception as e:
+        ldp_session_raw = ""
+        print("    [!] LDP session read failed: {}".format(str(e)[:70]))
+    try:
+        ldp_event_raw = c.run(ldp_check.LDP_EVENT_CMD)
+    except Exception:
+        ldp_event_raw = ""
+    lines += ["", "=" * 64, "  LDP STATUS", "=" * 64]
+    lines += ldp_check.status_lines(ldp_session_raw, event_raw=ldp_event_raw)
 
     lines += [
         "",
@@ -520,11 +538,11 @@ def run(params):
     # Optional JIRA post.
     if jira_ticket:
         print("\n[JIRA] Posting to {} ...".format(jira_ticket))
-        intro = "OSPF events + fiber levels -- {} ({}), run {}.".format(
+        intro = "OSPF, LDP & fiber levels -- {} ({}), run {}.".format(
             host, ip, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         ok, msg = post_report(
             jira_ticket, intro,
-            "OSPF Events + Fiber Levels -- {}".format(host),
+            "OSPF, LDP & Fiber Levels -- {}".format(host),
             "\n".join(lines),
             attach_path=out_path,
             summary_text=format_ospf_outages(outages) + "\n\n" +
@@ -544,7 +562,7 @@ def run(params):
 
 def main():
     print("=" * 64)
-    print("  OSPF EVENTS + FIBER LIGHT LEVELS (standalone)")
+    print("  OSPF, LDP & FIBER LIGHT LEVELS (standalone)")
     print("=" * 64)
     params = collect_inputs()
     if params:

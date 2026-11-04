@@ -15,6 +15,201 @@ that's bitten this project before.
 
 ---
 
+## v2.62 — 2026-11-03
+
+### Rename: "OSPF Events + Fiber Levels" -> "OSPF, LDP & Fiber Levels"
+
+Now that the per-1250 events tool shows an LDP STATUS block (v2.61), its name
+said OSPF + fiber but not LDP. Renamed to **OSPF, LDP & Fiber Levels** so the card
+matches what it does -- and so it is harder to confuse with the fleet-wide
+**OSPF & LDP Stability** monitor (`ospf_stability.py`), which is a different tool.
+Updated the TOOL_INFO name + desc, the report header, the JIRA intro/panel title,
+the standalone banner, and the README / Overview tool lists. Tool key, route and
+filename unchanged.
+
+(Also confirmed this release: OSPF & LDP Stability does output LDP -- an "LDP
+SESSION OUTAGE HISTORY" text section merged from the hub and 1250 event logs, a
+dedicated "LDP Outages" xlsx sheet, port-correlated LDP drops, and Slack alerts
+on new LDP drops. No change needed there.)
+
+---
+
+## v2.61 — 2026-11-03
+
+### LDP checked and shown consistently across the circuit tools (TODO #10)
+
+LDP was handled unevenly: the autotester showed 1250 session uptime, IXC Check
+showed adjacency + an outage count, OSPF Events never surfaced LDP at all, and the
+reverse autotester never read it. New shared `ldp_check.py` gives every tool one
+always-shown LDP status line (pcapps chose always-show, to match the loop lines):
+
+```
+  LDP STATUS:
+  [ OK ] LDP 10.111.132.255:0 Operational -- up 12d:04h:11m:09s  (last LDP-Session-Up 2026-01-06,00:52:10 UTC)
+```
+
+- **Shared helper, no drift.** `ldp_check` reuses the canonical `parse_ldp_sessions`
+  from `ospf_events` (session peer/state/uptime) and adds a focused `last_ldp_bounce`
+  parser over `show ne events | grep LDP-Session` (records split on `******`, first
+  timestamp per record, newest wins). Deliberately does NOT import `ospf_stability`
+  (would cycle through output_builders); imports only `ospf_events`, which is cycle-free.
+- **Always-show**, `[ OK ]`/`[ !! ]`, with `[ -- ]` when not collected or no session
+  data -- never a blank that reads as "checked, clean".
+- Wired into all four tools the request named:
+  - **Autotester** -- existing LDP line now annotated with the last bounce, from the
+    OSPF event log it already pulls (no new device read).
+  - **OSPF Events + Fiber Levels** -- new LDP STATUS block (was missing entirely);
+    two reads on the 1250 already in session.
+  - **Reverse Autotester** -- new LDP STATUS block, read on the 1250 at hop 9.
+  - **IXC Check** -- new live LDP SESSION line alongside its existing outage history,
+    read on the 1800 and filtered to this circuit's 1250 loopback peer.
+- Bounce timestamps shown as the device reported them, tagged UTC (device clocks are
+  UTC); uptime is the device's own field. `ldp_check --self-test` covers the session
+  parse, state classification, peer filter, and the newest-bounce logic.
+
+Closes the last open item from the October TODO list (#10). #6 (SEARN) remains,
+and is a design/planning item.
+
+---
+
+## v2.60 — 2026-11-03
+
+### Card Alarms: 1250 hostname shown next to the IP
+
+The "CURRENT EQUIPMENT ALARMS (by market)" device line showed the 1250 by IP
+only, because the loopback->hostname map often doesn't resolve and `_hn` was
+falling back to the IP. Now the sweep captures the device's OWN hostname from its
+prompt on connect (the suite's authority order -- device name beats NetBox) and
+uses it everywhere in the report, so the line reads:
+
+```
+TOLDOH21
+  TOLDOH21326  10.111.130.41  --  1 alarm(s)
+```
+
+Falls back to the map hostname, then the IP, only when the device didn't report a
+usable name. Applies to the by-market, new, and cleared sections and the live
+progress log.
+
+---
+
+## v2.59 — 2026-11-03
+
+### Card Alarms: per-alarm-type tally in the summary
+
+The summary gave a single "Equipment alarms shown" total; on a fleet with 100+
+alarms that is not enough to act on. Added a per-alarm-type breakdown right under
+that line -- each alarm name, its category, and its fleet-wide count, sorted
+most-common first:
+
+```
+Equipment alarms shown:       128
+  By alarm type:
+    Card-Ctrl-Fail           (card)        64
+    Fan-Fail                 (fan)         31
+    Power-Fail               (power)       22
+    Over-Temp                (temperature) 11
+```
+
+Respects the active category filter (the tally counts only what is shown), so
+narrowing to card alarms narrows the breakdown too. Counts current alarms across
+all reachable sites.
+
+---
+
+## v2.58 — 2026-11-03
+
+### Card Alarms: category checkboxes (filter the view)
+
+The full equipment sweep is a lot to sort through when you only want one kind of
+alarm. Added category checkboxes -- Card / Fan / Power / MCP / Temperature /
+Other equipment -- so a run can be narrowed to just what you're after (e.g. card
+alarms only).
+
+Key design choice: the filter is a VIEW, not a collection change. The sweep still
+reads every device and tracks every equipment alarm in state, so new-vs-known
+stays stable no matter what filter you run with -- you never get a false "new"
+alarm just because last run you were filtering to a different category. The
+category filter applies to the report sections and the Slack alert; the summary
+shows the filtered count alongside the total ("12 of 47 total equipment") so a
+narrow filter never hides how much is really out there.
+
+- New `equipment_category()` buckets each equipment alarm by entity (strong
+  signal) then name (fallback): card/fan/power/mcp/temperature, with `other` for
+  chassis/TMU/unfamiliar hardware -- a real bucket, so filtering it out can't hide
+  a card/fan/power/mcp/temp alarm.
+- `build_report(..., categories=)` and the Slack builder both filter; `run()` takes
+  a `categories` param (None = all). Empty selection in the UI falls back to all.
+- Template: six category checkboxes (all checked by default). Self-test extended
+  to cover the categoriser and the filter view.
+
+---
+
+## v2.57 — 2026-11-03
+
+### New tool: Card Alarms (fleet equipment-alarm sweep, NPT-1250)
+
+Our monitoring can't see card status, so a failed card (e.g. `Card-Ctrl-Fail`)
+goes unnoticed until it takes circuits with it. New `card_alarms.py` sweeps every
+NPT-1250 in the fleet, reads `show ne alarms | no-more`, and reports the
+EQUIPMENT/hardware alarms -- card, fan, power, MCP, temperature -- grouped by
+market, with new-vs-known tracking so a freshly-failed card stands out from one
+already known. 1250s only for now (pcapps); the 1800s run the same Neptune OS and
+the same command, so extending later is a target-list change, not a parser one.
+
+- **Classifier grounded on the Element field** -- a hardware alarm is pinned to a
+  `slot=` (card/fan/power), a circuit alarm to `interface-name=`/`port-name=`.
+  Plus a known hardware-entity set and name hints. Anything it can't classify is
+  COUNTED and surfaced ("non-equipment alarms seen"), never silently dropped --
+  per the project's "never render clean when the read was partial" rule. The exact
+  fan/power/MCP/temperature entity strings are CONFIRM-LIVE (noted in the module);
+  the card/`slot=` shapes are confirmed against the guide and a live broadcast.
+- **Reuses the ixc_stability scaffold** -- 1250 list from ospf_stability_state.json,
+  loopback->hostname map, 24-worker concurrent sweep, atomic JSON state, baseline
+  on first contact (first run never cries wolf).
+- **Market grouping** by CLLI stem (TOLDOH21326 -> TOLDOH21), so multiple 1250s at
+  a site report together.
+- **Slack alert on NEW equipment alarms only** (via jira_client.post_slack +
+  SLACK_WEBHOOK), matching ospf_stability -- a monitor that alerts every run gets
+  muted. No per-run JIRA: like the other fleet monitors, this is standing
+  surveillance, not a per-circuit ticket.
+- Wired into app.py (route `/tools/card-alarms`, API `/api/card-alarms/run`),
+  `card_alarms.html` template, order 11. Off-box `--self-test` covers the parser,
+  the three-way classifier, alarm-key slot distinction, and market grouping.
+
+Tool count note: this is a 15th home-page card (see CONTEXT_PRIMER for how the
+14/15/16 counts are drawn).
+
+---
+
+## v2.56 — 2026-11-02
+
+### Loop status: no hollow MUX/GSX lines on a Peerless circuit
+
+Running the loop checks on a Peerless circuit showed `GSX T1 -- no loop` and
+two `MUX ... -- controller not identified` lines. A Peerless circuit has NO
+Bandwidth MUX or GSX -- the route ends at the 1800 -- so the GSX line was a
+hollow pass: gsx_loop is empty because there is no GSX, and the status helper
+defaulted the empty value to "no loop". That reads as "checked, clean" on a hop
+that does not exist and was never read (pcapps caught it live). It was not
+derived from the OC12 side or anything else -- just a default.
+
+The loop block now detects the Peerless circuit (the same `ds1 in peerless`
+test the rest of the summary uses) and, after the 1250 line, prints a single:
+
+```
+  LOOP STATUS:
+  [ OK ] 1250 ts3/6 -- no loop
+  [ -- ] no MUX/GSX on a Peerless circuit (route ends at the 1800)
+```
+
+instead of the MUX/GSX lines, and the XCONNECT STATUS block is skipped for
+Peerless too (there is no cross-connect to validate). Normal circuits are
+unchanged. The reverse autotester always starts from a GSX, so it cannot run on
+a Peerless circuit and needs no equivalent guard.
+
+---
+
 ## v2.55 — 2026-11-02
 
 ### Reverse autotester: loop + xconnect status brought to parity

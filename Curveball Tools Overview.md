@@ -35,7 +35,7 @@ Troubleshooting a circuit today means logging into each device in the path separ
 - **NPT-1250 Discovery** — full read-only inventory dump for reference/documentation.
 - **DS1 PMs** — physical status, alarms, and PM counters for specific DS1s.
 - **Fiber Utilization** — real per-port IN/OUT bandwidth (max/avg) on the GE uplinks.
-- **OSPF Events + Fiber Levels** — OSPF up/down history, adjacency uptime, and light-level checks.
+- **OSPF, LDP & Fiber Levels** — OSPF up/down history, adjacency uptime, LDP session state, and light-level checks.
 - **IXC Check** — validates an IXC handoff circuit from the 1800 (config, OSPF/LDP, reachability).
 
 **GSX testing**

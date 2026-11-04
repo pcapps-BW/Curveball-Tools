@@ -67,7 +67,7 @@ always the accurate list. Roughly, in the order they appear:
 | NPT-1250 Discovery | Full `show tech`-style benchmark capture |
 | DS1 PMs | Standalone DS1 performance-monitor pull |
 | Fiber Utilization | Optical levels and utilisation |
-| OSPF Events + Fiber Levels | Event log plus levels in one pass |
+| OSPF, LDP & Fiber Levels | Event log, LDP session state, plus levels in one pass |
 | 1250 Health Check | Chassis, alarms, uptime |
 | GSX Perfmon | 96-interval PM pull, with a 24h-clean skip |
 | IXC Check | Site + interface check against NetBox, with a VERDICT block |

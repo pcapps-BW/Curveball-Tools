@@ -63,6 +63,7 @@ from npt1800_client import NPT1800Client
 from npt1250_client import NPT1250Client
 import gsx_client
 import loop_check
+import ldp_check
 import output_builders
 import autotester_standalone
 from gsx_client import GSXClient, find_plink
@@ -555,6 +556,18 @@ def trace(gsx_ip, t1_id, infra_user, infra_pass, gsx_user, gsx_pass,
             ctx["loop_cfg_1250"] = ""
             log("    [!] 1250 loop config read failed: {}: {}".format(
                 type(_le).__name__, _le))
+        # LDP session + state-change history on the 1250, while the session is
+        # open -- always-shown in the report, same as the forward autotester.
+        try:
+            ctx["ldp_session_raw"] = c1250.run(ldp_check.LDP_SESSION_CMD, 30)
+        except Exception as _le:
+            ctx["ldp_session_raw"] = ""
+            log("    [!] 1250 LDP session read failed: {}: {}".format(
+                type(_le).__name__, _le))
+        try:
+            ctx["ldp_event_raw"] = c1250.run(ldp_check.LDP_EVENT_CMD, 60)
+        except Exception:
+            ctx["ldp_event_raw"] = ""
     except CredentialError:
         raise
     except Exception as e:
@@ -859,6 +872,12 @@ def render(hops, ctx):
     })
     if _xc_lines:
         out += [""] + _xc_lines
+    # LDP STATUS -- 1250 session uptime + last bounce, always shown (same helper
+    # and wording as the forward autotester / OSPF Events / IXC Check).
+    if "ldp_session_raw" in ctx:
+        out += ["", "  LDP STATUS:"]
+        out += ldp_check.status_lines(ctx.get("ldp_session_raw"),
+                                      event_raw=ctx.get("ldp_event_raw"))
     if ctx.get("gsx_isup_raw") or ctx.get("gsx_trunk_raw"):
         out += [SEP, "  GSX ISUP CIRCUIT  (information only)", SEP]
         if ctx.get("gsx_isup_id"):
