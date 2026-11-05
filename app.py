@@ -54,6 +54,7 @@ import site_sweep
 import ospf_stability
 import ixc_stability
 import card_alarms
+import bcr_1800_check
 import secure_config
 
 from device_base import CredentialError
@@ -64,7 +65,7 @@ app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v2.62"
+APP_VERSION = "v2.65"
 
 
 @app.context_processor
@@ -393,13 +394,14 @@ TOOL_URLS = {
     "ospf_stability":        "/tools/ospf-stability",
     "ixc_stability":         "/tools/ixc-stability",
     "card_alarms":           "/tools/card-alarms",
+    "bcr_1800_check":        "/tools/bcr-1800-check",
     "sor_collect":           "/tools/sor",
 }
 _TOOL_MODULES = [
     autotester_standalone, npt1250_discovery, ds1_pms, fiber_util,
     ospf_events, health_check, gsx_perfmon, interface_check, mux_loop_script,
     ds1_gsx_test, morning_check, site_sweep, ospf_stability, ixc_stability,
-    card_alarms, sor_collect,
+    card_alarms, bcr_1800_check, sor_collect,
 ]
 
 
@@ -920,6 +922,32 @@ def api_card_alarms_run():
     # Warn after 20 min for a large fleet.
     job_id = _launch_job("Card Alarms Sweep", 1200,
                           lambda: card_alarms.run(params))
+    return jsonify(job_id=job_id)
+
+
+# ---- BCR to 1800 Check ---------------------------------------------------
+
+@app.route("/tools/bcr-1800-check")
+def page_bcr_1800_check():
+    info = bcr_1800_check.TOOL_INFO
+    return render_template("bcr_1800_check.html",
+                            tool_title=info["name"], tool_desc=info["desc"])
+
+
+@app.route("/api/bcr-1800-check/run", methods=["POST"])
+def api_bcr_1800_check_run():
+    f = request.form
+    user, pw = _creds(f)
+    if not (user and pw):
+        return jsonify(error="Infrastructure username and password are required."), 400
+    params = {
+        "username":       user,
+        "password":       pw,
+        "open_when_done": f.get("open_when_done") == "on",
+    }
+    # Four BCRs + their 1800s, serial; a couple of show commands each.
+    job_id = _launch_job("BCR to 1800 Check", 600,
+                          lambda: bcr_1800_check.run(params))
     return jsonify(job_id=job_id)
 
 

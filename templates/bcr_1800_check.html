@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}BCR to 1800 Check -- Curveball Tools{% endblock %}
+{% block content %}
+<h1>BCR to 1800 Check</h1>
+<div class="sub">For each hub, reports the BGP session between the site's BCR
+  (<code>bcr01.&lt;site&gt;</code>, IOS-XR) and its NPT-1800 &mdash; uptime, Established/not,
+  prefixes &mdash; plus the physical link state on the 1800 side (catches a dead cable
+  the BGP line alone wouldn't localize). BCRs are discovered from NetBox; the paired
+  1800 is resolved by site. Read-only.</div>
+
+<div class="panel">
+  <form id="runForm" data-run-url="/api/bcr-1800-check/run">
+
+    <div class="row">
+      <div>
+        <label for="infra_user">Infrastructure username</label>
+        <input type="text" id="infra_user" name="infra_user" required autocomplete="username">
+      </div>
+      <div>
+        <label for="infra_pass">Infrastructure password</label>
+        <input type="password" id="infra_pass" name="infra_pass" required autocomplete="current-password">
+      </div>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="openWhenDone" name="open_when_done">
+      <label for="openWhenDone">Open report when done</label>
+    </div>
+    <div class="hint">Only works when this server is running on your own machine.</div>
+
+    <button type="submit">Run BCR to 1800 Check</button>
+    <div class="field-error" id="formError"></div>
+  </form>
+</div>
+
+{% include "_job_panels.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='job.js') }}"></script>
+<script>
+  initJobForm('runForm');
+</script>
+{% endblock %}

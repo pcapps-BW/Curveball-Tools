@@ -15,6 +15,78 @@ that's bitten this project before.
 
 ---
 
+## v2.65 — 2026-11-05
+
+### BCR to 1800 Check: scoped to the four US hubs
+
+US-focused for now (pcapps). NetBox may list BCRs at other sites; the sweep now
+keeps only the four production hub sites -- **ATL / JFK / DFW / LAX** -- via a
+`US_SITES` constant and `hub_registry.site_from_hostname`. Out-of-scope BCRs are
+skipped with a one-line note in the log. Widen the `US_SITES` set when
+international hubs come into scope (single edit). Self-test covers in-scope vs
+out-of-scope.
+
+---
+
+## v2.64 — 2026-11-05
+
+### BCR to 1800 Check: 1800-side read fixed to `show interfaces physical`
+
+First live test turned up a Neptune quirk (pcapps): the 1800 does NOT list these
+uplink ports in `show interfaces` / `show interfaces description` -- they read as
+if they don't exist. Only `show interfaces physical` shows them, and it has no
+description column. So the v2.63 approach (grep the description for "bcr") could
+never have matched.
+
+Fixed:
+- 1800-side now reads **`show interfaces physical | no-more`** and parses the
+  Port / Admin / Oper table (grounded on real ces01.jfk1 output).
+- The BCR-facing port is derived by NAME from the BCR's own facing description
+  (`(s13p1)` -> `xe-ts13/1`) and looked up in that table; its **Oper** column is
+  the dead-cable signal (`[ OK ]` Up / `[ !! ]` Down). `[ -- ]` if the derived
+  port isn't present or no facing description was parsed.
+- Note corrected: there is no last-link-flapped timestamp on the 1800 for these
+  ports (physical view has only hold timers), so Oper Up/Down is the signal --
+  not a flap history. The earlier "confirm-live timestamp" note is resolved.
+- Self-test updated with the real `show interfaces physical` sample.
+
+---
+
+## v2.63 — 2026-11-05
+
+### New tool: BCR to 1800 Check (first IOS-XR tool)
+
+Reports, for each hub in one view, the BGP session between the site BCR
+(`bcr01.<site>`, Cisco **IOS-XR**) and its NPT-1800 -- uptime, Established/not,
+prefixes -- plus the physical link state on the 1800 side so a dead cable the BGP
+line alone wouldn't localize still gets caught.
+
+- **First IOS-XR client** (`bcr_client.py`): a thin BaseDeviceClient subclass --
+  IOS-XR takes the default (modern-algorithm) transport, so unlike the MUX it
+  needs no legacy-algo handling. Only the `#` prompt (`RP/0/RSP0/CPU0:<host>#`)
+  and `terminal length 0` (no `| no-more`) differ. Read-only.
+- **Discovery:** `netbox_client.bcr_devices("bcr01")` (thin alias on the existing
+  name-filter discovery; BCRs confirmed present in NetBox 2026-11-05). Each BCR's
+  paired 1800 is resolved by site through `hub_registry`.
+- **BGP parse grounded on a real bcr01.jfk1 sample** (2026-11-05): neighbor table
+  from `show bgp summary`; the 1800 peer is the one with a 4-byte private AS
+  (>=4200000000, e.g. 4200000635 -- the 635 is the site/bundle id). St/PfxRcd a
+  number => Established (that many prefixes); a state word (Idle/Active) => not.
+- **1800 side** uses `show interfaces description` (a confirmed command) and reports
+  the BCR-facing port's Admin/Link -- "down" there is the dead-cable signal. Per the
+  "never guess a format" rule, the exact last-link-flapped TIMESTAMP on Neptune is
+  NOT fabricated (no live sample yet); noted in the report as confirm-live. A
+  BCR-referencing row that doesn't fit the columns is surfaced raw, not called clean.
+- Wired into app.py (route `/tools/bcr-1800-check`, order 13), `bcr_1800_check.html`.
+  Off-box `--self-test` covers the BGP row parse, the internal-peer pick, the
+  facing-1800 description parse, and the 1800 up/down link parse.
+
+Built in-month (est. was $15-25 after NetBox confirmed + parse sample in hand).
+Still needs a live run to prove end-to-end -- same position every new tool starts
+in; the 1800 interface-name / flap format is the confirm-live item.
+
+---
+
 ## v2.62 — 2026-11-03
 
 ### Rename: "OSPF Events + Fiber Levels" -> "OSPF, LDP & Fiber Levels"

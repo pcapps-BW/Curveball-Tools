@@ -1,5 +1,56 @@
 # Curveball Automation -- TODO / Planned Work
 
+## Next Month (Dec 2026)
+
+### BCR BGP uptime tool (read-only)  [scope + build]
+- [ ] **Goal:** report the BGP session uptime/state for all four 1800 hubs to
+      their respective BCRs in one view -- the "just ask" version of a per-BCR
+      `show bgp summary`. Currently a manual one-off per hub.
+- [ ] **New platform:** the BCR (`bcr01.<site>`) is Cisco **IOS-XR** -- the suite
+      has NO IOS-XR client yet. Biggest part of the build is a new
+      `bcr_client.py` -- ADAPT the existing Cisco MUX client (already
+      `terminal length 0`, paramiko); main work is the prompt regex for
+      `RP/0/RSP0/CPU0:bcr01.<site>#` and confirming no paging surprises. Only
+      read-only `show` commands.
+- [ ] **Discovery: CONFIRMED in NetBox** (pcapps 2026-11-05 -- `bcr01.jfk1` is a
+      NetBox device under the JFK1 site). So same `netbox_client` discovery as the
+      1800 hubs, just a `bcr01` device-name filter instead of `ces01`. No static
+      fallback map needed -- the swing-factor risk is gone.
+- [ ] **Reads (all read-only):** `show bgp summary` (neighbor table, Up/Down =
+      uptime) and/or `show bgp neighbors <peer>` (BGP state = Established, up for
+      HH:MM:SS). Filter to the 1800 BVI peer -- per pcapps, first-3-octets of the
+      /29 is unique enough to pick the peer.
+- [ ] **Parse sample already captured** (bcr01.jfk1, 2026-11-05) -- parse against
+      THIS, don't guess (saves the live-iteration cost):
+      ```
+      RP/0/RSP0/CPU0:bcr01.jfk1#show bgp sum | i X.X.X
+      X.X.X.3   0 4200000635  235246  81348  12310320  0  0  1w2d  3
+      ```
+      Columns (IOS-XR): Neighbor | Spk | **RemoteAS** | MsgRcvd | MsgSent |
+      TblVer | InQ | OutQ | **Up/Down (uptime)** | **St/PfxRcd**. Here: peer
+      `X.X.X.3`, AS `4200000635` (the `635` is the site/bundle id woven through
+      BV635/BE635/LACP-MAC), up **1w2d**, **3** prefixes received (a NUMBER in the
+      last column = Established; a state word like Idle/Active = NOT established).
+      Note the `1w2d` matches `BE635`'s `Last link flapped 1w2d` -- bundle + BGP
+      came up together.
+- [ ] **1800-side check = physical, not BGP** (pcapps 2026-11-05): the BCR's
+      `show bgp summary` already covers BOTH ends of the SESSION, so don't re-check
+      BGP on the 1800. What the 1800 adds is catching a **dead cable on its own
+      side** -- read the 1800 interface facing the BCR and report its
+      **last-link-flapped / link state**. Identify that port from the BCR Te
+      description (`Internal: ces01.jfk1 (s13p1)` -> 1800 slot 13 port 1), with the
+      1800's own interface description as the corroborating source. Uses the
+      EXISTING `npt1800_client` -- one extra `show` command, no new client.
+- [ ] **Shape:** 4 BCRs, concurrent, one-view report (per hub: BGP peer/uptime/
+      state/prefixes from the BCR + the 1800-side link-flap). No persistent state
+      (one-off). See `Neptune_BGP_reference.md` (BCR edge section) for the stack
+      and command set.
+- [ ] **Cost note (revised, pcapps 2026-11-05):** est. **$15-25** -- down from
+      $35-55 after NetBox discovery confirmed and the IOS-XR client scoped as an
+      adapt-the-MUX-client job rather than from scratch. Live parse sample already
+      captured. Deferred from Nov -- "typically one-offs," revisit if pulled more
+      than ~weekly.
+
 ## Scripts
 
 ### Batch_Ckt_Layout_w_PMs.py / Any script pulling 1800 PMs

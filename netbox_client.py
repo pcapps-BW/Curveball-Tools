@@ -595,6 +595,16 @@ class NetboxClient:
         return out, None
 
     # ---- NPT-1800 hub device discovery ----
+    def bcr_devices(self, name_contains="bcr01"):
+        """
+        Return all BCR (backbone core router) device names from NetBox, e.g.
+        ["bcr01.atl1", "bcr01.jfk1", ...]. Thin alias for the same name__ic
+        discovery hub_1800_devices uses -- the BCRs are regular NetBox devices
+        (confirmed 2026-11-05: bcr01.jfk1 under the JFK1 site), so no separate
+        query or fallback map is needed, only a different name filter.
+        """
+        return self.hub_1800_devices(name_contains=name_contains)
+
     def hub_1800_devices(self, name_contains="ces01"):
         """
         Return all NPT-1800 hub device names from NetBox.
