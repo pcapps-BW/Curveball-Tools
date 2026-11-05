@@ -11,6 +11,9 @@ NPT-1250 (access)  ->  NPT-1800 (hub)  ->  Cisco NCS 4216 (MUX)  ->  GSX9000
    DS1 / EVC             OC12 + xe- NNI      SONET / ACR / CEM        T1-1-s-p-c
 ```
 
+Above the hub, each site's **BCR** (`bcr01.<site>`, Cisco IOS-XR) peers BGP with
+the 1800 toward the core — checked separately by the BCR to 1800 Check tool.
+
 **Current version is in `app.py` as `APP_VERSION`.** This file does not restate
 it — a version number in prose is a version number that goes stale.
 
@@ -62,6 +65,8 @@ always the accurate list. Roughly, in the order they appear:
 | Site Sweep | Fast triage — every DS1 on a 1250 at once, no route trace |
 | OSPF & LDP Stability | Fleet-wide adjacency monitor, xlsx output, persistent state |
 | IXC Stability | **BETA — do not use in production** (its own `TOOL_INFO` says so) |
+| Card Alarms | Fleet-wide NPT-1250 equipment-alarm sweep — card/fan/power/MCP/temperature, grouped by market, new-vs-known tracking, category filter, per-type tally, Slack on new |
+| BCR to 1800 Check | Per-hub BGP session (BCR ↔ 1800) uptime/state/prefixes + the 1800-side physical link, across the four US hubs. First IOS-XR tool |
 | **Autotester** | Full end-to-end T1 trace, 1250 → GSX, PMs at every hop. The core tool |
 | **Reverse Autotester** | The same trace backwards, GSX → 1250, for when a GSX alarm is all you have. Shares the Autotester page as a second card |
 | NPT-1250 Discovery | Full `show tech`-style benchmark capture |
@@ -122,8 +127,9 @@ trap was being avoided. Read them before changing a parser.
 |---|---|
 | Web app | `app.py`, `templates/`, `static/` |
 | CLI | `launcher.py`, plus each tool's own `collect_inputs()` |
-| Device clients | `device_base.py` and `npt1250_client.py`, `npt1800_client.py`, `mux4216_client.py`, `gsx_client.py` |
+| Device clients | `device_base.py` and `npt1250_client.py`, `npt1800_client.py`, `mux4216_client.py`, `gsx_client.py`, `bcr_client.py` (IOS-XR, the BCR) |
 | Shared lookups | `hub_registry.py` (hub identity), `netbox_client.py`, `ds1_util.py` (DS1 parsing), `chassis_config.py` (1800 config readers), `nni_check.py` |
+| Shared checks | `loop_check.py` (loop detection), `ldp_check.py` (LDP session status) — both always-emit status lines reused across the trace tools |
 | Reporting | `output_builders.py` — all rendering and the per-hop health checks |
 | Integrations | `jira_client.py`, `secure_config.py` |
 | Infrastructure | `platform_paths.py` (all output paths), `assurance.py` (failing-loudly machinery), `env_check.py` (dependency banners) |
