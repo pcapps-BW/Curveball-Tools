@@ -65,7 +65,7 @@ app = Flask(__name__)
 
 # Shown next to the "Built by P. Capps" watermark on every page.
 # Bump this with each release (keep in sync with CHANGELOG.md).
-APP_VERSION = "v2.65"
+APP_VERSION = "v2.67"
 
 
 @app.context_processor
@@ -405,18 +405,48 @@ _TOOL_MODULES = [
 ]
 
 
+# Home-page grouping. Keyed by module name so it lives in one place (not spread
+# across 17 TOOL_INFO dicts). A module not listed here still appears -- it falls
+# into "Other" at the bottom -- so a newly added tool is never silently dropped.
+TOOL_CATEGORIES = [
+    ("Circuit Tracing & Triage",
+        ["autotester_standalone", "site_sweep", "interface_check"]),
+    ("Fleet Monitoring",
+        ["morning_check", "ospf_stability", "ixc_stability", "card_alarms",
+         "bcr_1800_check"]),
+    ("1250 Diagnostics",
+        ["npt1250_discovery", "ds1_pms", "fiber_util", "ospf_events",
+         "health_check"]),
+    ("GSX & Test Builders",
+        ["gsx_perfmon", "mux_loop_script", "ds1_gsx_test"]),
+    ("Inventory",
+        ["sor_collect"]),
+]
+
+
 @app.route("/")
 def home():
-    tools = []
+    by_name = {}
     for mod in _TOOL_MODULES:
         info = mod.TOOL_INFO
-        tools.append({
+        by_name[mod.__name__] = {
             "name": info["name"], "ran_from": info["ran_from"],
             "desc": info["desc"], "requires": info["requires"],
             "order": info["order"], "url": TOOL_URLS[mod.__name__],
-        })
-    tools.sort(key=lambda t: t["order"])
-    return render_template("home.html", tools=tools)
+        }
+    groups, placed = [], set()
+    for label, names in TOOL_CATEGORIES:
+        items = [by_name[n] for n in names if n in by_name]
+        items.sort(key=lambda t: t["order"])
+        placed.update(names)
+        if items:
+            groups.append({"category": label, "tools": items})
+    # Anything not categorised -> "Other", so nothing disappears.
+    leftover = sorted((t for n, t in by_name.items() if n not in placed),
+                      key=lambda t: t["order"])
+    if leftover:
+        groups.append({"category": "Other", "tools": leftover})
+    return render_template("home.html", groups=groups)
 
 
 # ---- Autotester -------------------------------------------------------------

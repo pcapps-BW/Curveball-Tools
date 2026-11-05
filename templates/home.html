@@ -5,14 +5,21 @@
 <h1>Curveball Tools</h1>
 <div class="sub">Web front end (proof of concept). Pick a tool below.</div>
 
-<div class="tool-grid">
-  {% for t in tools %}
-  <a class="tool-card" href="{{ t.url }}">
-    <div class="tool-ran-from">Runs from: {{ t.ran_from }}</div>
-    <div class="tool-name">{{ t.name }}</div>
-    <div class="tool-desc">{{ t.desc }}</div>
-    <div class="tool-requires">Requires: {{ t.requires }}</div>
-  </a>
-  {% endfor %}
+{% for g in groups %}
+<div class="tool-group">
+  <div class="tool-group-label">{{ g.category }}</div>
+  <div class="tool-list">
+    {% for t in g.tools %}
+    <a class="tool-row" href="{{ t.url }}">
+      <div class="tool-row-top">
+        <span class="tool-name">{{ t.name }}</span>
+        <span class="tool-ran-from">Run from: {{ t.ran_from }}</span>
+      </div>
+      <div class="tool-desc">{{ t.desc }}</div>
+      <div class="tool-requires">Requires: {{ t.requires }}</div>
+    </a>
+    {% endfor %}
+  </div>
 </div>
+{% endfor %}
 {% endblock %}

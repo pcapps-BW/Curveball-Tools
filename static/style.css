@@ -152,21 +152,34 @@ a.download:hover { text-decoration: underline; }
 }
 
 /* Home page tool grid */
-.tool-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 14px; max-width: 1100px;
+/* Home page: tools grouped by category, one list per group, a card-like row
+   per tool with space between them. */
+.tool-group { max-width: 880px; margin-bottom: 26px; }
+.tool-group-label {
+  font-size: 12px; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted);
+  margin: 0 0 10px 2px;
 }
-.tool-card {
+.tool-list { display: flex; flex-direction: column; gap: 10px; }
+.tool-row {
   display: block; background: var(--panel); border: 1px solid var(--border);
-  border-radius: 8px; padding: 16px; text-decoration: none; color: var(--text);
-  transition: border-color 0.15s;
+  border-radius: 8px; padding: 14px 16px; text-decoration: none;
+  color: var(--text); transition: border-color 0.15s, background 0.15s;
 }
-.tool-card:hover { border-color: var(--accent); }
-.tool-name { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.tool-row:hover { border-color: var(--accent); background: #2b2d38; }
+.tool-row-top {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 14px; margin-bottom: 6px;
+}
+.tool-name { font-size: 15px; font-weight: 600; }
 .tool-ran-from {
-  display: inline-block; font-size: 11px; color: var(--accent);
-  background: rgba(79, 163, 255, 0.12); padding: 2px 7px; border-radius: 4px;
+  flex: none; font-size: 11px; color: var(--accent);
+  background: rgba(79, 163, 255, 0.12); padding: 2px 8px; border-radius: 4px;
+  white-space: nowrap;
+}
+/* Full description -- never truncated. */
+.tool-desc {
+  font-size: 13px; color: var(--text); opacity: 0.85; line-height: 1.45;
   margin-bottom: 8px;
 }
-.tool-desc { font-size: 13px; color: var(--text); opacity: 0.85; margin-bottom: 8px; line-height: 1.4; }
 .tool-requires { font-size: 12px; color: var(--muted); }

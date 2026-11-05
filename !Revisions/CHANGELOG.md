@@ -15,6 +15,36 @@ that's bitten this project before.
 
 ---
 
+## v2.67 — 2026-11-05
+
+### Home page: "Run from:" prefix on the source tag
+
+The blue tag on each tool row now reads "Run from: <x>" instead of a bare "<x>",
+so it's clear what that value is saying. Template-only.
+
+---
+
+## v2.66 — 2026-11-05
+
+### Home page: grouped list instead of a card grid
+
+With 17 tools the auto-fill card grid had become a busy wall. Reworked the home
+page into a clean vertical list, grouped by category:
+
+- **Circuit Tracing & Triage**, **Fleet Monitoring**, **1250 Diagnostics**,
+  **GSX & Test Builders**, **Inventory** -- category headers over one list each.
+- Each tool is a full-width card-like row: name + a "runs from" tag, the **full
+  (untruncated)** description, and the **Requires** line. Space between rows so it
+  doesn't feel cramped; hover highlights the row.
+- Grouping lives in ONE place -- `TOOL_CATEGORIES` in app.py, keyed by module
+  name. A tool not listed there falls into an "Other" group rather than vanishing,
+  so adding a tool can't silently drop it off the page.
+
+Pure presentation change -- `home()` route, `home.html`, `style.css`. No tool
+logic touched.
+
+---
+
 ## v2.65 — 2026-11-05
 
 ### BCR to 1800 Check: scoped to the four US hubs
