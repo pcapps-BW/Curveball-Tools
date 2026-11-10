@@ -15,6 +15,40 @@ that's bitten this project before.
 
 ---
 
+## v2.68 — 2026-11-10
+
+### Fix: false TDM LOS flag from an unanchored alarm match (ALBQNMMA664)
+
+A forward run on ALBQNMMA664 flagged ts3/2 as "TDM Dirty (DS1LOS)" while the
+1250 showed no LOS on ts3/2. Cause: the alarm-scoping match was unanchored and
+pinned a DIFFERENT DS1's alarm to ts3/2.
+
+```
+show ne alarms | grep ds1-ts3/2  ->  ... DS1LOS-L ... port-name=ds1-ts3/23
+```
+
+`ds1-ts3/2` matched as a prefix of `ds1-ts3/2`**3**, so ts3/23's stale (June 24)
+LOS alarm read as ts3/2's. The physical status (`NoLOS`) and the PM
+(`DS1LOSS-L: 0`) were both correct; only the alarm match misfired. Same bug class
+as the CE16:112-in-CE16:1120 match the suite was bitten by before.
+
+The old check also ANDed two independent searches -- "is there a DS1LOS-L
+anywhere" AND "is there a port-name starting ds1-ts3/2 anywhere" -- so it never
+required them to be the SAME alarm.
+
+Fix: one shared, anchored helper `output_builders.alarm_on_ds1(pm, token, ds1)`:
+- alarm name and port-name must be on the **same line**, and
+- the port is **digit-bounded** (`(?!\d)`) so ds1-ts3/2 no longer matches
+  ds1-ts3/23.
+
+Replaced all four buggy call sites (3 in output_builders -- the two DS1LOS checks
+and the DS1AIS cross-hop input -- plus site_sweep). Added an off-box
+`output_builders.py --self-test` that pins the exact ALBQNMMA664 case (ts3/2 off
+ts3/23 must NOT flag; a genuine ts3/2 alarm still must). A genuine LOS on ts3/2,
+and the real alarm on ts3/23, are both unaffected.
+
+---
+
 ## v2.67 — 2026-11-05
 
 ### Home page: "Run from:" prefix on the source tag

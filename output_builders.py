@@ -106,6 +106,29 @@ def _check_counters(text, counters):
     return hits
 
 
+def alarm_on_ds1(pm, alarm_token, ds1):
+    """
+    True only if an `alarm_token` alarm (e.g. 'DS1LOS-L', 'DS1AIS') is present on
+    EXACTLY this DS1.
+
+    Anchored two ways the old `re.search(TOKEN) and re.search('port-name=ds1-'+ds1)`
+    pair was not:
+      1. the alarm name and the port-name must be on the SAME line -- the old form
+         ANDed two independent searches, so a DS1LOS-L on one port plus a
+         port-name match anywhere else both read as a hit.
+      2. the port is digit-bounded (?!\\d), so ds1-ts3/2 no longer matches
+         ds1-ts3/23 -- the unanchored substring that flagged ts3/2 LOS off
+         ts3/23's stale alarm (ALBQNMMA664, caught 2026-11-10). Same bug class as
+         the CE16:112-in-CE16:1120 match.
+
+    `show ne alarms` rows are `<sev> <ts> <AlarmName> <entity> port-name=ds1-tsX/N`,
+    so the name always precedes the port-name on the line.
+    """
+    return bool(re.search(
+        r'{}[^\n]*port-name=ds1-{}(?!\d)'.format(alarm_token, re.escape(ds1)),
+        pm or "", re.IGNORECASE))
+
+
 def _cd(dirty, tag=None):
     """Clean/Dirty tag for the Run Summary, with an optional short hint of
     which counter/alarm tripped it -- name only, never the raw value.
@@ -1722,8 +1745,7 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
         ces_hits = _check_counters(pm, CES_COUNTERS)
         tdm_hits = _check_counters(pm, TDM_COUNTERS)
         phys_los  = bool(re.search(r'ds1/\d+\s+LOS', pm))
-        alarm_los = bool(re.search(r'DS1LOS-L', pm) and
-                         re.search(r'port-name=ds1-{}'.format(re.escape(ds1)), pm, re.IGNORECASE))
+        alarm_los = alarm_on_ds1(pm, 'DS1LOS-L', ds1)
         oc12_errs = _check_counters(oc12_stat, OC12_COUNTERS)
         # Scope alarms to THIS circuit's sub-channel, not every DS1 on the OC.
         oc12_alarms = _oc12_alarms_for(oc12_stat, oc12)
@@ -1918,9 +1940,7 @@ def build_diagnostic_summary(ds1_list, ds1_map, pm_results, oc12_results,
             # Cross-hop inputs for the DS1_AIS verdict -- all collected in
             # this same run, so the tool can walk the troubleshooting logic
             # itself instead of leaving a static direction hint.
-            tdm_ais_in = bool(re.search(r'DS1AIS', pm) and
-                              re.search(r'port-name=ds1-{}'.format(re.escape(ds1)),
-                                        pm, re.IGNORECASE))
+            tdm_ais_in = alarm_on_ds1(pm, 'DS1AIS', ds1)
             mid_flags = []
             if ces_hits:
                 mid_flags.append("CES {}".format(ces_hits[0].split(":")[0].strip()))
@@ -2098,8 +2118,7 @@ def run_summary_line(ds1, ds1_map, pm_results, oc12_results,
 
     # ---- 1250: TDM / CES ----
     phys_los  = bool(re.search(r'ds1/\d+\s+LOS', pm))
-    alarm_los = bool(re.search(r'DS1LOS-L', pm) and
-                     re.search(r'port-name=ds1-{}'.format(re.escape(ds1)), pm, re.IGNORECASE))
+    alarm_los = alarm_on_ds1(pm, 'DS1LOS-L', ds1)
     tdm_hits = _check_counters(pm, TDM_COUNTERS)
     if phys_los or alarm_los:
         tdm_cd = _cd(True, "DS1LOS")
@@ -2250,3 +2269,49 @@ def run_summary_line(ds1, ds1_map, pm_results, oc12_results,
 
     return "  {}  --  The test completed successfully  |  {}".format(
         ds1.upper(), "  |  ".join(parts))
+
+
+# ── Self-test (off-box) ──────────────────────────────────────────────────────────
+# Focused regression guard for alarm_on_ds1 -- the unanchored substring bug that
+# flagged ts3/2 LOS off ts3/23's alarm (ALBQNMMA664, 2026-11-10).
+
+def self_test(verbose=True):
+    fails = []
+
+    def chk(label, got, want):
+        if got != want:
+            fails.append("{}: got {!r} want {!r}".format(label, got, want))
+        elif verbose:
+            print("  ok  {} = {!r}".format(label, got))
+
+    # The real failing case: LOS alarm is on ts3/23, must NOT flag ts3/2.
+    los_23 = "warning 2026-06-24,19:42:54 DS1LOS-L ds1-line port-name=ds1-ts3/23\n"
+    chk("ts3/2 not flagged off ts3/23", alarm_on_ds1(los_23, 'DS1LOS-L', 'ts3/2'), False)
+    chk("ts3/23 is flagged (its own alarm)", alarm_on_ds1(los_23, 'DS1LOS-L', 'ts3/23'), True)
+    # A genuine ts3/2 alarm (port at end of line) still flags.
+    los_2 = "warning 2026-11-10,01:00:00 DS1LOS-L ds1-line port-name=ds1-ts3/2\n"
+    chk("genuine ts3/2 alarm flags", alarm_on_ds1(los_2, 'DS1LOS-L', 'ts3/2'), True)
+    # Same-line requirement: a DS1LOS-L on another port + a bare ts3/2 mention
+    # elsewhere must not combine into a false hit.
+    split = ("warning DS1LOS-L ds1-line port-name=ds1-ts3/23\n"
+             "  DS1: ds1-ts3/2  (header line, no alarm)\n")
+    chk("cross-line does not combine", alarm_on_ds1(split, 'DS1LOS-L', 'ts3/2'), False)
+    # AIS uses the same helper.
+    ais_23 = "major 2026-11-10 R-DS1AIS-P ces port-name=ds1-ts3/23\n"
+    chk("AIS not flagged off ts3/23", alarm_on_ds1(ais_23, 'DS1AIS', 'ts3/2'), False)
+    chk("empty pm -> no flag", alarm_on_ds1("", 'DS1LOS-L', 'ts3/2'), False)
+
+    print()
+    if fails:
+        print("FAILED:")
+        for f in fails:
+            print("  " + f)
+        return False
+    print("All output_builders self-tests passed.")
+    return True
+
+
+if __name__ == "__main__":
+    import sys
+    if "--self-test" in sys.argv:
+        sys.exit(0 if self_test() else 1)

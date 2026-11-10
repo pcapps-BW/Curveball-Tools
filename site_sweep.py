@@ -32,7 +32,7 @@ from jira_client import post_report, valid_ticket, post_slack, load_jira_config
 from secure_config import load_config, load_config_silent
 
 from output_builders import (
-    _check_counters, _cd, _CES_DISABLED_RE,
+    _check_counters, _cd, _CES_DISABLED_RE, alarm_on_ds1,
     CES_COUNTERS, TDM_COUNTERS,
     check_fiber_health, check_evc_health,
     check_ospf_ldp_health,
@@ -174,9 +174,7 @@ def _assess_ds1(ds1, pm):
     Matches the exact same logic run_summary_line() uses for the 1250 hop.
     """
     phys_los  = bool(re.search(r'ds1/\d+\s+LOS', pm))
-    alarm_los = bool(re.search(r'DS1LOS-L', pm) and
-                     re.search(r'port-name=ds1-{}'.format(re.escape(ds1)),
-                               pm, re.IGNORECASE))
+    alarm_los = alarm_on_ds1(pm, 'DS1LOS-L', ds1)
     tdm_hits  = _check_counters(pm, TDM_COUNTERS)
 
     if phys_los or alarm_los:
